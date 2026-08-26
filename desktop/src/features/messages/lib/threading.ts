@@ -117,13 +117,10 @@ export function buildReplyTags(
     tags.push(["p", pubkey]);
   }
 
-  if (parentEventId === rootEventId) {
-    tags.push(["e", rootEventId, "", "reply"]);
-    return tags;
-  }
-
-  tags.push(["e", rootEventId, "", "root"]);
-  tags.push(["e", parentEventId, "", "reply"]);
+  // Buzz conversations are one reply level deep. Even when the user clicks
+  // Reply on an existing child, sign another direct reply to the original
+  // root rather than creating a grandchild.
+  tags.push(["e", rootEventId || parentEventId, "", "reply"]);
   return tags;
 }
 
@@ -138,13 +135,7 @@ export function buildThreadReferenceTags(
     return tags;
   }
 
-  if (!rootEventId || parentEventId === rootEventId) {
-    tags.push(["e", parentEventId, "", "reply"]);
-    return tags;
-  }
-
-  tags.push(["e", rootEventId, "", "root"]);
-  tags.push(["e", parentEventId, "", "reply"]);
+  tags.push(["e", rootEventId || parentEventId, "", "reply"]);
   return tags;
 }
 

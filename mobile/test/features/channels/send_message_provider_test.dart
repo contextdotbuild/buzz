@@ -73,6 +73,36 @@ void main() {
     expect(removedIds, [localMessages.single.id]);
   });
 
+  test('replying to a child signs another direct reply to the root', () async {
+    final session = _PendingPublishRelaySession();
+    final send = SendMessage(
+      signedEventRelay: SignedEventRelay(
+        session: session,
+        nsec: nostr.Keys.generate().nsec,
+      ),
+      fetchMembers: (_) async => const [],
+      readUserCache: () => const {},
+      addLocalMessage: (_, _) {},
+      completeLocalMessage: (_, _) {},
+      removeLocalMessage: (_, _) {},
+    );
+
+    final result = send(
+      channelId: _channelId,
+      content: 'depth one',
+      parentEventId: 'child-event',
+      rootEventId: 'root-event',
+    );
+    await session.published;
+
+    expect(session.event.tags.where((tag) => tag.first == 'e').toList(), [
+      ['e', 'root-event', '', 'reply'],
+    ]);
+
+    session.accept();
+    await result;
+  });
+
   test('final signed event addresses the current DM agent member', () async {
     final session = _PendingPublishRelaySession();
     final signingKey = nostr.Keys.generate().nsec;

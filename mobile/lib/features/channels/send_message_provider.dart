@@ -205,22 +205,16 @@ class SendMessage {
     return pubkeys.toList();
   }
 
-  /// Build `e`-tags for a thread reply, matching the desktop convention:
-  /// - Direct reply to thread head: `["e", id, "", "reply"]`
-  /// - Nested reply: `["e", rootId, "", "root"]` + `["e", parentId, "", "reply"]`
+  /// Build depth-one `e`-tags for a thread reply, matching the desktop
+  /// convention. A reply requested against any existing child becomes another
+  /// direct reply to the original thread root.
   static List<List<String>> _buildReplyTags(
     String parentEventId,
     String? rootEventId,
   ) {
     final root = rootEventId ?? parentEventId;
-    if (parentEventId == root) {
-      return [
-        ['e', root, '', 'reply'],
-      ];
-    }
     return [
-      ['e', root, '', 'root'],
-      ['e', parentEventId, '', 'reply'],
+      ['e', root, '', 'reply'],
     ];
   }
 }
