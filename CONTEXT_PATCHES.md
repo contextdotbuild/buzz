@@ -81,7 +81,15 @@ The Context build uses:
 - Bundle identifier: `xyz.contextdotbuild.buzz.client`
 - Deep-link scheme: `buzz-context`
 - Keychain namespace: `buzz-desktop-dev.context-patch`
+- Build-time relay: `wss://buildcontext.communities.buzz.xyz`
+- Bundle target: macOS `.app` only
 - Install path: `~/Applications/Buzz Context.app`
+
+The reproducible overrides are `desktop/src-tauri/tauri.context.conf.json` and
+`desktop/src-tauri/ContextInfo.plist` on the integration branch. Build with
+`BUZZ_RELAY_URL=wss://buildcontext.communities.buzz.xyz` (and the corresponding
+HTTPS base) so onboarding and phone recovery do not fall back to Buzz's OSS
+developer relay at `localhost:3000`.
 
 Never overwrite, re-sign, move or remove `/Applications/Buzz.app`. Never copy
 the official application's identity, Keychain item or private application
@@ -99,9 +107,10 @@ pairing flow.
    applying only the still-needed focused commits in the order listed above.
 4. Run each focused regression test, then the combined type-check, formatter,
    desktop unit suite and focused Playwright workflows.
-5. Build the isolated `Buzz Context` bundle with real sidecars. Verify its
-   bundle identity, URL scheme, executable sidecars and signature before
-   replacing only the prior Context build.
+5. Build the isolated `Buzz Context` bundle with the declared Build Context
+   relay and real sidecars. Verify its embedded relay, bundle identity, URL
+   scheme, executable sidecars and signature before replacing only the prior
+   Context build.
 6. Pair normally and prove the real MacBook chat-client workflows. Prove
    restart replay separately on the iMac runtime owner before enabling or
    claiming that slice there.

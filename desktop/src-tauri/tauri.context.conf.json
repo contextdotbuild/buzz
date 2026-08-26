@@ -1,0 +1,17 @@
+{
+  "productName": "Buzz Context",
+  "identifier": "xyz.contextdotbuild.buzz.client",
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["buzz-context"]
+      }
+    }
+  },
+  "bundle": {
+    "targets": ["app"],
+    "macOS": {
+      "infoPlist": "ContextInfo.plist"
+    }
+  }
+}
