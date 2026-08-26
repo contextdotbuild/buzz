@@ -810,6 +810,12 @@ pub fn spawn_agent_child(
         command.env(key, value);
     }
 
+    // Pair-scoped durable replay state. Set this after the user environment
+    // and reserve the key so neither saved configuration nor an ambient parent
+    // value can redirect one agent onto another agent/community's watermark.
+    let seen_state_path = super::managed_agent_seen_state_path(app, &runtime_key)?;
+    command.env("BUZZ_ACP_SEEN_STATE_FILE", seen_state_path);
+
     // B5: carry persisted effort; harness resolves thought_level configId at first session.
     // Written AFTER descriptor.env so the canonical persisted value wins over any
     // user-supplied BUZZ_ACP_EFFORT_LEVEL entry, mirroring the A1 model-authority pattern

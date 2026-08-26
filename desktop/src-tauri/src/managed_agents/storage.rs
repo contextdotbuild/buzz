@@ -93,6 +93,20 @@ pub fn managed_agent_runtime_log_path(
     Ok(managed_agents_logs_dir(app)?.join(format!("{}.log", key.runtime_id())))
 }
 
+/// Pair-scoped durable replay watermark for a managed harness. The filename is
+/// derived from the same canonical `(agent pubkey, relay URL)` key as runtime
+/// logs and receipts, so moving between communities cannot cross-contaminate
+/// replay state.
+pub fn managed_agent_seen_state_path(
+    app: &AppHandle,
+    key: &ManagedAgentRuntimeKey,
+) -> Result<PathBuf, String> {
+    let dir = managed_agents_base_dir(app)?.join("seen-state");
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("failed to create agent seen-state dir: {error}"))?;
+    Ok(dir.join(format!("{}.json", key.runtime_id())))
+}
+
 /// Log path to surface for an agent whose runtime is not tracked in memory:
 /// the most recently written of its pair-scoped logs, falling back to the
 /// legacy single-runtime path when the agent has not run since harnesses
