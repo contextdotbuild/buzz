@@ -81,6 +81,12 @@ record with its current owner unless the work is deliberately reconciled.
   the mention picker, sent a DM mention without a local runtime, and received
   the exact iMac-agent reply `MACBOOK-MENTION-826B`. No `No runtime available`
   notice appeared.
+- After replacing that first build with the final no-keyring build, Timi paired
+  it through Buzz's supported phone-to-desktop recovery. The recovered client
+  showed the `buildcontext` account, existing DMs and the canonical online iMac
+  agents. Its PM mention picker again offered the existing PM Bot; the message
+  received the exact reply `FINAL-CONTEXT-826C`. No runtime error appeared,
+  the MacBook had zero `buzz-acp` processes, and official Buzz remained closed.
 
 The side-by-side application build is a separate release proof. A successful
 build alone does not prove the paired live MacBook-to-iMac workflows.
@@ -135,9 +141,11 @@ pairing flow.
    Verify its embedded relay, bundle identity, URL scheme, executable sidecars,
    local-file identity mode and signature before replacing only the prior
    Context build.
-6. Pair normally and prove the real MacBook chat-client workflows. Prove
-   restart replay separately on the iMac runtime owner before enabling or
-   claiming that slice there.
+6. Pair normally and prove the real MacBook chat-client workflows. The final
+   no-keyring build passed the DM mention proof with `FINAL-CONTEXT-826C` and
+   zero MacBook runtimes. Prove channel attachment separately before claiming
+   that workflow live, and prove restart replay separately on the iMac runtime
+   owner before enabling or claiming that slice there.
 7. Update this file with the new upstream base, focused commit IDs, combined
    head, test evidence and upstream pull-request state.
 
