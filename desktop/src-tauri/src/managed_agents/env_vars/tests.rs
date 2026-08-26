@@ -198,6 +198,13 @@ fn reserved_keys_include_relay_url() {
     assert!(merged.is_empty());
 }
 
+#[test]
+fn reserved_keys_include_pair_scoped_seen_state() {
+    assert!(is_reserved_env_key("BUZZ_ACP_SEEN_STATE_FILE"));
+    let agent = map(&[("BUZZ_ACP_SEEN_STATE_FILE", "/tmp/shared-watermark")]);
+    assert!(merged_user_env(&BTreeMap::new(), &agent).is_empty());
+}
+
 // ── validate_user_env_keys ─────────────────────────────────────────
 
 #[test]

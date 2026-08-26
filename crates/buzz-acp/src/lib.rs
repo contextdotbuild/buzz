@@ -1892,22 +1892,89 @@ mod idle_pool_sleep_tests {
     }
 }
 
-/// Read the persisted newest-event timestamp. An absent file, an unreadable
-/// file, or non-numeric content all mean "no watermark": the harness starts
-/// live-only, exactly as it did before persistence existed.
-fn read_seen_state(path: Option<&std::path::Path>) -> Option<u64> {
-    let text = std::fs::read_to_string(path?).ok()?;
-    text.trim().parse::<u64>().ok()
+/// Durable replay boundary for one managed harness.
+///
+/// Nostr timestamps have one-second resolution and relay delivery may be out
+/// of order. Keeping a bounded recent ID window lets a restarted harness use
+/// the relay's inclusive clock-skew replay without either repeating an old
+/// event or losing a distinct event created in the same second while down.
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+struct SeenState {
+    newest_created_at: u64,
+    events: Vec<SeenEvent>,
 }
 
-/// Persist the newest received event timestamp, atomically (tmp + rename), so
-/// a crash mid-write can never leave a corrupt watermark behind.
-fn write_seen_state(path: &std::path::Path, ts: u64) {
+#[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+struct SeenEvent {
+    created_at: u64,
+    event_id: String,
+}
+
+/// Larger than relay::SINCE_SKEW_SECS (currently 5s), leaving headroom for a
+/// future increase without changing the on-disk shape.
+const SEEN_STATE_WINDOW_SECS: u64 = 60;
+const SEEN_STATE_MAX_EVENTS: usize = 4096;
+
+impl SeenState {
+    fn contains(&self, event_id: &str) -> bool {
+        self.events.iter().any(|seen| seen.event_id == event_id)
+    }
+
+    /// Record a newly received event. Returns whether the durable state moved.
+    fn record(&mut self, created_at: u64, event_id: String) -> bool {
+        if self.contains(&event_id) {
+            return false;
+        }
+
+        self.newest_created_at = self.newest_created_at.max(created_at);
+        self.events.push(SeenEvent {
+            created_at,
+            event_id,
+        });
+        let oldest_retained = self
+            .newest_created_at
+            .saturating_sub(SEEN_STATE_WINDOW_SECS);
+        self.events
+            .retain(|seen| seen.created_at >= oldest_retained);
+        self.events.sort_unstable_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.event_id.cmp(&right.event_id))
+        });
+        if self.events.len() > SEEN_STATE_MAX_EVENTS {
+            self.events
+                .drain(..self.events.len() - SEEN_STATE_MAX_EVENTS);
+        }
+        true
+    }
+}
+
+/// Read the persisted replay boundary. An absent file, an unreadable file, or
+/// invalid JSON all mean "no watermark": the harness starts live-only,
+/// exactly as it did before persistence existed.
+fn read_seen_state(path: Option<&std::path::Path>) -> Option<SeenState> {
+    let text = std::fs::read_to_string(path?).ok()?;
+    let mut state: SeenState = serde_json::from_str(&text).ok()?;
+    state.events.sort_unstable_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+    state
+        .events
+        .dedup_by(|left, right| left.event_id == right.event_id);
+    Some(state)
+}
+
+/// Persist the replay boundary atomically (tmp + rename), so a crash
+/// mid-write can never leave a partially written watermark behind.
+fn write_seen_state(path: &std::path::Path, state: &SeenState) {
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, ts.to_string())
-        .and_then(|_| std::fs::rename(&tmp, path))
-        .is_err()
-    {
+    let result = serde_json::to_vec(state)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(&tmp, bytes))
+        .and_then(|_| std::fs::rename(&tmp, path));
+    if result.is_err() {
         tracing::warn!(path = %path.display(), "failed to persist seen-state watermark");
     }
 }
@@ -2013,20 +2080,23 @@ async fn tokio_main() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    // When a seen-state file holds the newest timestamp a previous process
-    // received, resume replay just after it instead of from now: mentions
-    // posted while the process was down or hung are re-delivered by the
-    // relay's `since` replay instead of being lost forever. `+1` skips the
-    // boundary event the previous process already handled; `min(now)` guards
-    // against a future timestamp from a skewed clock or corrupt file.
-    let startup_watermark: u64 = match read_seen_state(config.seen_state_file.as_deref()) {
-        Some(saved) => {
-            tracing::info!(saved, "resuming event replay after persisted watermark");
-            (saved + 1).min(now_secs)
-        }
-        None => now_secs,
+    // Resume inclusively from the newest persisted second. The relay applies
+    // its normal clock-skew window, and SeenState rejects older/already-seen
+    // frames while still admitting a distinct event with the same timestamp.
+    // Discard a future watermark rather than letting clock skew suppress new
+    // events indefinitely.
+    let mut seen_state = read_seen_state(config.seen_state_file.as_deref())
+        .filter(|state| state.newest_created_at <= now_secs)
+        .unwrap_or_default();
+    let startup_watermark = if seen_state.newest_created_at == 0 {
+        now_secs
+    } else {
+        tracing::info!(
+            saved = seen_state.newest_created_at,
+            "resuming event replay from persisted watermark"
+        );
+        seen_state.newest_created_at
     };
-    let mut newest_seen: u64 = 0;
 
     let pubkey_hex = config.keys.public_key().to_hex();
 
@@ -2662,14 +2732,23 @@ async fn tokio_main() -> Result<()> {
                     let _ = result_rx; // end split borrow before relay handling
                     match buzz_event {
                         Some(buzz_event) => {
-                            // Persist the newest event timestamp so a future
-                            // process resumes replay from here instead of
-                            // losing whatever arrives while it is down.
+                            // Drop frames already covered by the durable replay
+                            // boundary. The relay deliberately replays a small
+                            // clock-skew window, so timestamp-only dedup would
+                            // either repeat old work or lose same-second work.
+                            let event_created_at = buzz_event.event.created_at.as_secs();
+                            let event_id = buzz_event.event.id.to_hex();
+                            if seen_state.contains(&event_id) {
+                                tracing::debug!(
+                                    event_id,
+                                    event_created_at,
+                                    "skipping event already covered by persisted replay watermark"
+                                );
+                                continue;
+                            }
                             if let Some(path) = config.seen_state_file.as_deref() {
-                                let ts = buzz_event.event.created_at.as_secs();
-                                if ts > newest_seen {
-                                    newest_seen = ts;
-                                    write_seen_state(path, ts);
+                                if seen_state.record(event_created_at, event_id) {
+                                    write_seen_state(path, &seen_state);
                                 }
                             }
                             let kind_u32 = buzz_event.event.kind.as_u16() as u32;
@@ -8759,14 +8838,18 @@ mod observer_payload_trim_tests {
 
     #[test]
     fn seen_state_round_trips_and_survives_rewrite() {
-        let path =
-            std::env::temp_dir().join(format!("acp-seen-roundtrip-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("acp-seen-roundtrip-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        assert_eq!(read_seen_state(Some(&path)), None, "absent file = no watermark");
-        write_seen_state(&path, 1_787_415_033);
-        assert_eq!(read_seen_state(Some(&path)), Some(1_787_415_033));
-        write_seen_state(&path, 1_787_415_100);
-        assert_eq!(read_seen_state(Some(&path)), Some(1_787_415_100));
+        assert_eq!(
+            read_seen_state(Some(&path)),
+            None,
+            "absent file = no watermark"
+        );
+        let mut state = SeenState::default();
+        assert!(state.record(1_787_415_033, "bbb".into()));
+        assert!(state.record(1_787_415_033, "aaa".into()));
+        write_seen_state(&path, &state);
+        assert_eq!(read_seen_state(Some(&path)), Some(state));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -8774,8 +8857,37 @@ mod observer_payload_trim_tests {
     fn seen_state_ignores_garbage_and_unset_path() {
         let path = std::env::temp_dir().join(format!("acp-seen-garbage-{}", std::process::id()));
         std::fs::write(&path, "not a number\n").unwrap();
-        assert_eq!(read_seen_state(Some(&path)), None, "corrupt file = no watermark");
+        assert_eq!(
+            read_seen_state(Some(&path)),
+            None,
+            "corrupt file = no watermark"
+        );
         assert_eq!(read_seen_state(None), None, "unconfigured = no watermark");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn seen_state_admits_distinct_events_created_in_the_same_second() {
+        let mut state = SeenState::default();
+        assert!(state.record(1_000, "first".into()));
+
+        assert!(state.contains("first"));
+        assert!(!state.contains("second"));
+
+        assert!(state.record(1_000, "second".into()));
+        assert!(state.contains("second"));
+        assert!(!state.record(1_000, "second".into()));
+    }
+
+    #[test]
+    fn seen_state_dedups_replay_without_dropping_out_of_order_live_events() {
+        let mut state = SeenState::default();
+        assert!(state.record(1_000, "newest".into()));
+        assert!(state.record(999, "late-but-distinct".into()));
+        assert!(state.contains("late-but-distinct"));
+
+        assert!(state.record(1_100, "much-newer".into()));
+        assert!(!state.contains("newest"), "old replay IDs are pruned");
+        assert!(state.contains("much-newer"));
     }
 }
