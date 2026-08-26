@@ -51,18 +51,21 @@ fn thread_ref_from_parent_tags(
 
     Ok(ThreadRef {
         root_event_id: root_eid,
-        parent_event_id: parent_eid,
+        // Buzz conversations are intentionally one reply level deep. When the
+        // requested parent is already a reply, attach the new message to the
+        // original root instead of creating a grandchild.
+        parent_event_id: root_eid,
     })
 }
 
-/// Build a `ThreadRef` for a reply, given the immediate parent's event ID.
+/// Build a depth-one `ThreadRef` for a requested reply target.
 ///
-/// Fetches the parent event from the relay and inspects its NIP-10 `e` tags to
+/// Fetches the target event from the relay and inspects its NIP-10 `e` tags to
 /// determine the thread root:
-/// - Direct reply (parent is top-level): `root == parent`.
-/// - Nested reply: `root` is the parent's own root marker; `parent` is unchanged.
+/// - Top-level target: `root == parent == target`.
+/// - Reply target: `root == parent == target's original root`.
 ///
-/// Ensures CLI-sent replies thread correctly using the same NIP-10 logic.
+/// This canonicalizes every CLI-sent reply to maximum depth one.
 async fn fetch_event(client: &BuzzClient, event_id: &str) -> Result<serde_json::Value, CliError> {
     let filter = serde_json::json!({ "ids": [event_id], "limit": 1 });
     let raw = client.query(&filter).await?;
@@ -1114,13 +1117,9 @@ mod tests {
             channel_id_from_event(ID_B, &event).unwrap().to_string(),
             channel
         );
-        assert_eq!(
-            thread_ref_from_event(ID_B, &event)
-                .unwrap()
-                .root_event_id
-                .to_hex(),
-            ID_A
-        );
+        let thread_ref = thread_ref_from_event(ID_B, &event).unwrap();
+        assert_eq!(thread_ref.root_event_id.to_hex(), ID_A);
+        assert_eq!(thread_ref.parent_event_id.to_hex(), ID_A);
     }
 
     #[test]
@@ -1193,11 +1192,37 @@ mod tests {
     }
 
     #[test]
+    fn reply_to_child_collapses_to_original_root() {
+        let tags = json!([
+            ["e", ID_A, "", "root"],
+            ["e", ID_B, "", "reply"],
+            ["p", PUBKEY],
+        ]);
+        let requested_child = nostr::EventId::from_hex(ID_B).expect("valid child id");
+        let original_root = nostr::EventId::from_hex(ID_A).expect("valid root id");
+
+        let thread_ref = thread_ref_from_parent_tags(requested_child, ID_B, &tags)
+            .expect("depth-one thread ref");
+
+        assert_eq!(thread_ref.root_event_id, original_root);
+        assert_eq!(thread_ref.parent_event_id, original_root);
+    }
+
+    #[test]
     fn reply_only_falls_back_to_reply_target() {
         // Direct reply to a top-level message — the parent's only e-tag is a
-        // "reply" marker pointing at it; treat the reply target as the root.
+        // "reply" marker pointing at it. A reply requested against that child
+        // must become another child of the same root.
         let tags = json!([["e", ID_B, "", "reply"], ["p", PUBKEY],]);
         assert_eq!(find_root_from_tags(&tags).as_deref(), Some(ID_B));
+
+        let requested_child = nostr::EventId::from_hex(ID_A).expect("valid child id");
+        let original_root = nostr::EventId::from_hex(ID_B).expect("valid root id");
+        let thread_ref = thread_ref_from_parent_tags(requested_child, ID_A, &tags)
+            .expect("depth-one thread ref");
+
+        assert_eq!(thread_ref.root_event_id, original_root);
+        assert_eq!(thread_ref.parent_event_id, original_root);
     }
 
     #[test]
