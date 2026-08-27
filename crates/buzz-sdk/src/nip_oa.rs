@@ -23,7 +23,7 @@ use nostr::hashes::sha256::Hash as Sha256Hash;
 use nostr::hashes::Hash;
 use nostr::secp256k1::schnorr::Signature;
 use nostr::secp256k1::Message;
-use nostr::{Keys, PublicKey, Tag, SECP256K1};
+use nostr::{Event, Keys, PublicKey, Tag, SECP256K1};
 use serde_json::Value;
 
 use crate::SdkError;
@@ -235,6 +235,64 @@ pub fn verify_auth_tag(
     Ok(owner_pubkey)
 }
 
+/// Verify a NIP-OA `auth` tag and require all signed conditions to match
+/// `event`.
+///
+/// This binds the attestation to the exact event being admitted. A valid
+/// owner signature is not sufficient when its `kind` or `created_at`
+/// conditions exclude that event.
+pub fn verify_auth_tag_for_event(
+    auth_tag_json: &str,
+    event: &Event,
+) -> Result<PublicKey, SdkError> {
+    // Admission uses the canonical wire shape, including lowercase fixed-width
+    // owner/signature hex, rather than accepting every equivalent parser form.
+    parse_auth_tag(auth_tag_json)?;
+    let arr = parse_json_array(auth_tag_json)?;
+    if arr.len() != 4 {
+        return Err(SdkError::InvalidInput(format!(
+            "auth tag must have 4 elements, got {}",
+            arr.len()
+        )));
+    }
+    let conditions = arr[2]
+        .as_str()
+        .ok_or_else(|| SdkError::InvalidInput("element 2 (conditions) must be a string".into()))?;
+
+    let owner = verify_auth_tag(auth_tag_json, &event.pubkey)?;
+    require_conditions_match_event(conditions, event)?;
+    Ok(owner)
+}
+
+fn require_conditions_match_event(conditions: &str, event: &Event) -> Result<(), SdkError> {
+    validate_conditions(conditions)?;
+    for clause in conditions.split('&').filter(|clause| !clause.is_empty()) {
+        let matches = if let Some(value) = clause.strip_prefix("kind=") {
+            parse_condition_value(value, "kind")? == u64::from(event.kind.as_u16())
+        } else if let Some(value) = clause.strip_prefix("created_at<") {
+            event.created_at.as_secs() < parse_condition_value(value, "created_at<")?
+        } else if let Some(value) = clause.strip_prefix("created_at>") {
+            event.created_at.as_secs() > parse_condition_value(value, "created_at>")?
+        } else {
+            return Err(SdkError::InvalidInput(format!(
+                "unsupported clause: {clause:?}"
+            )));
+        };
+        if !matches {
+            return Err(SdkError::InvalidInput(format!(
+                "auth condition does not match event: {clause}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_condition_value(value: &str, label: &str) -> Result<u64, SdkError> {
+    value.parse::<u64>().map_err(|error| {
+        SdkError::InvalidInput(format!("{label} value is not a valid decimal: {error}"))
+    })
+}
+
 /// Parse a NIP-OA `auth` tag JSON string into a [`Tag`] without verifying the
 /// signature.
 ///
@@ -345,6 +403,54 @@ mod tests {
             verify_auth_tag(&tag_json, &agent_pubkey).expect("verify_auth_tag must succeed");
 
         assert_eq!(recovered, owner_keys.public_key());
+    }
+
+    #[test]
+    fn test_verify_for_event_enforces_every_signed_condition() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let matching = compute_auth_tag(
+            &owner,
+            &agent.public_key(),
+            "kind=9&created_at>99&created_at<101",
+        )
+        .expect("compute matching auth");
+        let tag = parse_auth_tag(&matching).expect("parse matching auth");
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "work")
+            .tags([tag])
+            .custom_created_at(nostr::Timestamp::from(100))
+            .sign_with_keys(&agent)
+            .expect("sign matching event");
+
+        assert_eq!(
+            verify_auth_tag_for_event(&matching, &event).expect("conditions match"),
+            owner.public_key()
+        );
+
+        for conditions in ["kind=1", "created_at>100", "created_at<100"] {
+            let auth = compute_auth_tag(&owner, &agent.public_key(), conditions)
+                .expect("compute mismatching auth");
+            assert!(
+                verify_auth_tag_for_event(&auth, &event).is_err(),
+                "condition {conditions} must reject the event"
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_for_event_binds_attestation_to_event_author() {
+        let owner = Keys::generate();
+        let first_agent = Keys::generate();
+        let second_agent = Keys::generate();
+        let copied = compute_auth_tag(&owner, &first_agent.public_key(), "kind=9")
+            .expect("compute first-agent auth");
+        let copied_tag = parse_auth_tag(&copied).expect("parse copied auth");
+        let second_event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "work")
+            .tags([copied_tag])
+            .sign_with_keys(&second_agent)
+            .expect("sign second-agent event");
+
+        assert!(verify_auth_tag_for_event(&copied, &second_event).is_err());
     }
 
     /// Empty conditions string is valid.

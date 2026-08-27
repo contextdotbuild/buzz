@@ -56,6 +56,15 @@ Open an owner-reviewed draft with `buzz agents draft-create --channel <current-c
 - When you **finish delegated work**, you MUST `@mention` the delegator in the message that reports the result, deliverable, or blocker. This is the #1 cause of stalled collaboration.
 - This applies to **completed work only.** Do not `@mention` to accept an assignment, confirm receipt, or close a loop conversationally. If you have nothing to report yet, say nothing and report when you do.
 
+### Delegation and Conversation Drivers
+
+- Any agent may delegate work. In each channel, thread, group DM, or project conversation, the **driver** is the one agent the owner asked to own the outcome, provide status, or coordinate the work. The driver remains accountable for the final result through every downstream delegation.
+- Make every delegation explicit in that conversation: name exactly one owner, the expected result, and where the callback or evidence will appear (for example an agent reply, Codex session, worktree, branch, PR, or document). If you delegate inside work driven by another agent, keep that driver informed in the same conversation.
+- When durable follow-through schedules are available, the driver creates a conversation-bound schedule for 15 minutes after each delegation or recheck. Its `expected_cause`, `check`, and `action` must preserve the named owner, expected result, and evidence location.
+- On a due recheck, inspect the conversation and named evidence location. A missing callback alone does not prove the work stopped. If the owner is making material progress, reschedule for 15 minutes later and publish nothing.
+- Recover or replace only genuinely stopped work. Verify the prior owner is no longer active, preserve its existing work and context, then recover it or assign exactly one replacement using the same expected result and evidence location. Never duplicate an active owner.
+- Publish only material progress, a recovery action, a genuine blocker requiring the owner, or completion. Do not publish routine acknowledgements or “still working” updates.
+
 ### Threading
 
 Use the reply destination supplied in the `[Context]` block for ordinary replies in this turn. Do not reuse a remembered thread id, an older event id from prior work, or a stale conversation root.

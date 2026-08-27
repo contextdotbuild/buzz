@@ -60,6 +60,24 @@ pub enum DedupMode {
     Queue,
 }
 
+/// Built-in work source for heartbeat turns when no custom prompt is supplied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum HeartbeatMode {
+    /// Preserve the historical needs-action and mentions heartbeat.
+    Feed,
+    /// Claim and process bot-owned durable follow-through schedules.
+    Schedules,
+}
+
+impl std::fmt::Display for HeartbeatMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Feed => f.write_str("feed"),
+            Self::Schedules => f.write_str("schedules"),
+        }
+    }
+}
+
 /// How to handle new @mentions while a turn is already in-flight for that channel.
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
 pub enum MultipleEventHandling {
@@ -303,6 +321,15 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_HEARTBEAT_INTERVAL", default_value_t = 0)]
     pub heartbeat_interval: u64,
 
+    /// Built-in heartbeat work source when no custom prompt is supplied.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_HEARTBEAT_MODE",
+        value_enum,
+        default_value_t = HeartbeatMode::Feed
+    )]
+    pub heartbeat_mode: HeartbeatMode,
+
     /// Seconds between per-turn liveness pings (the crash backstop signal —
     /// distinct from heartbeat self-prompting). 0 = disabled.
     #[arg(long, env = "BUZZ_ACP_TURN_LIVENESS_SECS", default_value_t = 10)]
@@ -525,6 +552,7 @@ pub struct Config {
     pub max_turn_duration_secs: u64,
     pub agents: u32,
     pub heartbeat_interval_secs: u64,
+    pub heartbeat_mode: HeartbeatMode,
     /// Seconds between per-turn liveness pings. 0 = disabled. Distinct from
     /// `heartbeat_interval_secs` (agent self-prompting) — this is the desktop
     /// crash-backstop signal.
@@ -1101,6 +1129,7 @@ impl Config {
             max_turn_duration_secs,
             agents: args.agents,
             heartbeat_interval_secs: heartbeat_interval,
+            heartbeat_mode: args.heartbeat_mode,
             turn_liveness_secs,
             heartbeat_prompt,
             system_prompt,
@@ -1164,7 +1193,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s heartbeat_mode={} subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1174,6 +1203,7 @@ impl Config {
             self.max_turn_duration_secs,
             self.agents,
             self.heartbeat_interval_secs,
+            self.heartbeat_mode,
             self.subscribe_mode,
             self.dedup_mode,
             self.multiple_event_handling,
@@ -1482,6 +1512,7 @@ mod tests {
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
+            heartbeat_mode: HeartbeatMode::Feed,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
             system_prompt: None,
@@ -2234,6 +2265,22 @@ channels = "ALL"
     }
 
     #[test]
+    fn heartbeat_mode_defaults_to_feed_and_accepts_schedule_opt_in() {
+        let key = "0".repeat(64);
+        let default = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
+        assert_eq!(default.heartbeat_mode, HeartbeatMode::Feed);
+
+        let configured = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--heartbeat-mode",
+            "schedules",
+        ]);
+        assert_eq!(configured.heartbeat_mode, HeartbeatMode::Schedules);
+    }
+
+    #[test]
     fn idle_pool_sleep_defaults_disabled_and_accepts_cli_value() {
         let key = "0".repeat(64);
         let default = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
@@ -2276,6 +2323,7 @@ channels = "ALL"
         let mut config = test_config(SubscribeMode::Mentions);
         config.agents = 4;
         config.heartbeat_interval_secs = 30;
+        config.heartbeat_mode = HeartbeatMode::Schedules;
         let s = config.summary();
         assert!(
             s.contains("agents=4"),
@@ -2284,6 +2332,10 @@ channels = "ALL"
         assert!(
             s.contains("heartbeat=30s"),
             "summary should include heartbeat=30s, got: {s}"
+        );
+        assert!(
+            s.contains("heartbeat_mode=schedules"),
+            "summary should include heartbeat mode, got: {s}"
         );
     }
 

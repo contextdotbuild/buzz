@@ -28,6 +28,17 @@ pub(super) struct DeployProjections {
     pub owner_only_access: bool,
 }
 
+fn apply_driver_follow_through_policy(
+    policy_env: &mut BTreeMap<String, String>,
+    internal_managed_build: bool,
+) {
+    policy_env.extend(
+        crate::managed_agents::driver_follow_through_env_with_policy(internal_managed_build)
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value)),
+    );
+}
+
 /// Resolve the deploy-specific structured model/provider for a managed agent.
 #[cfg(test)]
 pub(crate) fn resolve_deploy_model_provider(
@@ -54,6 +65,26 @@ pub(super) fn build_launch_block(
     effective_model: Option<&str>,
     owner_pubkey: &str,
 ) -> serde_json::Value {
+    build_launch_block_with_policy(
+        record,
+        descriptor,
+        teams,
+        effective_prompt,
+        effective_model,
+        owner_pubkey,
+        crate::managed_agents::owner_only_access_build(),
+    )
+}
+
+fn build_launch_block_with_policy(
+    record: &ManagedAgentRecord,
+    descriptor: &crate::managed_agents::readiness::EffectiveHarnessDescriptor,
+    teams: &[crate::managed_agents::TeamRecord],
+    effective_prompt: Option<&str>,
+    effective_model: Option<&str>,
+    owner_pubkey: &str,
+    internal_managed_build: bool,
+) -> serde_json::Value {
     use crate::managed_agents::{
         known_acp_runtime, resolve_session_title, DISPLAY_NAME_ENV_VAR, SESSION_TITLE_ENV_VAR,
     };
@@ -74,6 +105,8 @@ pub(super) fn build_launch_block(
     }
     policy_env.insert("BUZZ_ACP_RELAY_OBSERVER".into(), "true".into());
     policy_env.insert("BUZZ_ACP_LAZY_POOL".into(), "true".into());
+    let driver_follow_through = internal_managed_build;
+    apply_driver_follow_through_policy(&mut policy_env, driver_follow_through);
     policy_env.insert(
         "BUZZ_ACP_AGENTS".into(),
         crate::managed_agents::acp_agents_value(&descriptor.command, record.parallelism),
@@ -142,6 +175,9 @@ pub(super) fn build_launch_block(
             || (is_claude
                 && (k.eq_ignore_ascii_case("BUZZ_ACP_MODEL")
                     || k.eq_ignore_ascii_case("ANTHROPIC_MODEL")))
+            || (driver_follow_through
+                && (k.eq_ignore_ascii_case("BUZZ_ACP_HEARTBEAT_INTERVAL")
+                    || k.eq_ignore_ascii_case("BUZZ_ACP_HEARTBEAT_MODE")))
     };
     let launch_env: BTreeMap<String, String> = descriptor
         .env
@@ -343,6 +379,50 @@ mod tests {
         assert_eq!(launch["policy_env"]["BUZZ_ACP_MAX_TURN_DURATION"], "23");
         assert_eq!(launch["policy_env"]["BUZZ_ACP_AGENTS"], "4");
         assert_eq!(launch["owner_pubkey"], "owner-hex");
+    }
+
+    #[test]
+    fn provider_heartbeat_clamps_internal_overrides_and_preserves_oss_passthrough() {
+        let record = record();
+        let descriptor = EffectiveHarnessDescriptor {
+            command: "goose".into(),
+            args: vec![],
+            env: BTreeMap::from([
+                ("BUZZ_ACP_HEARTBEAT_INTERVAL".into(), "60".into()),
+                ("BUZZ_ACP_HEARTBEAT_MODE".into(), "feed".into()),
+            ]),
+        };
+
+        let internal = build_launch_block_with_policy(
+            &record,
+            &descriptor,
+            &[],
+            None,
+            None,
+            "owner-hex",
+            true,
+        );
+        assert_eq!(internal["policy_env"]["BUZZ_ACP_HEARTBEAT_INTERVAL"], "900");
+        assert_eq!(
+            internal["policy_env"]["BUZZ_ACP_HEARTBEAT_MODE"],
+            "schedules"
+        );
+        assert!(internal["env"]["BUZZ_ACP_HEARTBEAT_INTERVAL"].is_null());
+        assert!(internal["env"]["BUZZ_ACP_HEARTBEAT_MODE"].is_null());
+
+        let oss = build_launch_block_with_policy(
+            &record,
+            &descriptor,
+            &[],
+            None,
+            None,
+            "owner-hex",
+            false,
+        );
+        assert!(oss["policy_env"]["BUZZ_ACP_HEARTBEAT_INTERVAL"].is_null());
+        assert!(oss["policy_env"]["BUZZ_ACP_HEARTBEAT_MODE"].is_null());
+        assert_eq!(oss["env"]["BUZZ_ACP_HEARTBEAT_INTERVAL"], "60");
+        assert_eq!(oss["env"]["BUZZ_ACP_HEARTBEAT_MODE"], "feed");
     }
 
     #[test]

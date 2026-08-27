@@ -28,9 +28,15 @@ use nostr::PublicKey;
 use crate::client::BuzzClient;
 use crate::error::CliError;
 
+#[path = "mem_pagination.rs"]
+mod pagination;
+
 /// Resolve the agent's owner pubkey: explicit `--owner` flag wins, otherwise
 /// fall back to the NIP-OA `auth_tag` (which carries owner pubkey in slot 1).
-fn resolve_owner(client: &BuzzClient, owner_flag: Option<&str>) -> Result<PublicKey, CliError> {
+pub(crate) fn resolve_owner(
+    client: &BuzzClient,
+    owner_flag: Option<&str>,
+) -> Result<PublicKey, CliError> {
     if let Some(s) = owner_flag {
         return PublicKey::from_hex(s)
             .map_err(|e| CliError::Usage(format!("--owner must be a 64-hex pubkey: {e}")));
@@ -78,7 +84,7 @@ fn resolve_reader(
     Ok((agent, owner, owner))
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -86,13 +92,19 @@ fn now_secs() -> u64 {
 }
 
 /// Submit a signed engram event and confirm the relay treated it as
-/// authoritative. The relay returns `{accepted, message}` where the
-/// `message` field starts with `"duplicate:"` when the write was rejected
-/// as already-superseded by a later head (NIP-33 LWW). In that case we
-/// surface a `Conflict` so callers don't lie about success.
-async fn submit_engram(client: &BuzzClient, event: nostr::Event) -> Result<(), CliError> {
+/// authoritative. Atomic revision conflicts and duplicate/dominated writes
+/// are surfaced as `Conflict` so callers never act on a lease they did not
+/// acquire.
+pub(crate) async fn submit_engram(
+    client: &BuzzClient,
+    event: nostr::Event,
+) -> Result<(), CliError> {
     let raw = client.submit_event(event).await?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw)
+    parse_submit_engram_response(&raw)
+}
+
+fn parse_submit_engram_response(raw: &str) -> Result<(), CliError> {
+    let parsed: serde_json::Value = serde_json::from_str(raw)
         .map_err(|e| CliError::Other(format!("relay response is not JSON: {e} ({raw})")))?;
     let accepted = parsed
         .get("accepted")
@@ -100,6 +112,9 @@ async fn submit_engram(client: &BuzzClient, event: nostr::Event) -> Result<(), C
         .unwrap_or(false);
     let message = parsed.get("message").and_then(|v| v.as_str()).unwrap_or("");
     if !accepted {
+        if let Some(detail) = message.strip_prefix("conflict:") {
+            return Err(CliError::Conflict(detail.trim_start().to_string()));
+        }
         return Err(CliError::Other(format!("relay rejected event: {message}")));
     }
     if message.starts_with("duplicate:") || message == "duplicate" {
@@ -133,7 +148,7 @@ fn parse_events(json: &str) -> Result<Vec<nostr::Event>, CliError> {
 }
 
 /// Fetch the head event for `slug`, returning `(Option<Event>, Option<Body>)`.
-async fn fetch_head(
+pub(crate) async fn fetch_head(
     client: &BuzzClient,
     agent: &PublicKey,
     owner: &PublicKey,
@@ -183,6 +198,183 @@ async fn fetch_head(
         .find(|(e, _)| e.id == head.id)
         .map(|(_, b)| b);
     Ok((Some(head), body))
+}
+
+/// One decrypted, non-tombstoned NIP-AE memory head.
+#[derive(Debug, Clone)]
+pub(crate) struct StoredMemory {
+    pub slug: String,
+    pub event: nostr::Event,
+    pub value: String,
+}
+
+/// The exact head a structured memory write expects to replace. The expectation
+/// is signed into the event and enforced atomically by the relay's NIP-33
+/// replacement transaction.
+pub(crate) enum ExpectedMemoryHead<'a> {
+    Missing,
+    Event(&'a str),
+}
+
+/// List decrypted memory heads whose normalized slug starts with `prefix`.
+/// Tombstones and `core` are excluded.
+pub(crate) async fn list_stored_memories(
+    client: &BuzzClient,
+    owner_flag: Option<&str>,
+    prefix: &str,
+) -> Result<Vec<StoredMemory>, CliError> {
+    let agent = client.keys().public_key();
+    let owner = resolve_owner(client, owner_flag)?;
+    let events = pagination::query_all_agent_engrams(client, &agent, &owner).await?;
+
+    use std::collections::HashMap;
+    let mut groups: HashMap<String, Vec<(nostr::Event, Body)>> = HashMap::new();
+    for event in events {
+        if event.verify().is_err() {
+            continue;
+        }
+        let Some(d_value) = event
+            .tags
+            .iter()
+            .find(|tag| tag.kind().to_string() == "d")
+            .and_then(|tag| tag.content())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let body = match validate_and_decrypt(
+            &event,
+            &agent,
+            &owner,
+            client.keys().secret_key(),
+            &owner,
+        ) {
+            Ok(body) => body,
+            Err(_) => continue,
+        };
+        groups.entry(d_value).or_default().push((event, body));
+    }
+
+    let mut out = Vec::new();
+    for members in groups.into_values() {
+        let events = members.iter().map(|(event, _)| event.clone());
+        let Some(head) = select_head(events) else {
+            continue;
+        };
+        let Some((_, body)) = members.into_iter().find(|(event, _)| event.id == head.id) else {
+            continue;
+        };
+        if let Body::Memory {
+            slug,
+            value: Some(value),
+        } = body
+        {
+            if slug.starts_with(prefix) {
+                out.push(StoredMemory {
+                    slug,
+                    event: head,
+                    value,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.slug.cmp(&b.slug));
+    Ok(out)
+}
+
+/// Read one decrypted structured memory value, if it exists and is not
+/// tombstoned.
+pub(crate) async fn get_stored_memory(
+    client: &BuzzClient,
+    owner_flag: Option<&str>,
+    raw_slug: &str,
+) -> Result<(PublicKey, Option<StoredMemory>), CliError> {
+    let slug = normalize_slug(raw_slug)
+        .map_err(|error| CliError::Usage(format!("invalid slug: {error}")))?;
+    let owner = resolve_owner(client, owner_flag)?;
+    let agent = client.keys().public_key();
+    let (head, body) = fetch_head(client, &agent, &owner, &slug).await?;
+    let stored = match (head, body) {
+        (
+            Some(event),
+            Some(Body::Memory {
+                value: Some(value), ..
+            }),
+        ) => Some(StoredMemory { slug, event, value }),
+        _ => None,
+    };
+    Ok((owner, stored))
+}
+
+/// Write one structured memory value against an exact expected head and prove
+/// the submitted event is the authoritative readback.
+pub(crate) async fn put_stored_memory(
+    client: &BuzzClient,
+    owner: &PublicKey,
+    raw_slug: &str,
+    value: String,
+    expected: ExpectedMemoryHead<'_>,
+) -> Result<String, CliError> {
+    let slug = normalize_slug(raw_slug)
+        .map_err(|error| CliError::Usage(format!("invalid slug: {error}")))?;
+    let agent_pubkey = client.keys().public_key();
+    let (head, _) = fetch_head(client, &agent_pubkey, owner, &slug).await?;
+    match (&expected, head.as_ref()) {
+        (ExpectedMemoryHead::Missing, None) => {}
+        (ExpectedMemoryHead::Missing, Some(actual)) => {
+            return Err(CliError::Conflict(format!(
+                "memory `{slug}` already exists at revision {}",
+                actual.id.to_hex()
+            )));
+        }
+        (ExpectedMemoryHead::Event(expected_id), Some(actual))
+            if actual.id.to_hex() == *expected_id => {}
+        (ExpectedMemoryHead::Event(expected_id), Some(actual)) => {
+            return Err(CliError::Conflict(format!(
+                "memory `{slug}` changed (expected revision {expected_id}, got {})",
+                actual.id.to_hex()
+            )));
+        }
+        (ExpectedMemoryHead::Event(expected_id), None) => {
+            return Err(CliError::Conflict(format!(
+                "memory `{slug}` disappeared (expected revision {expected_id})"
+            )));
+        }
+    }
+
+    let prior_created_at = head.as_ref().map(|event| event.created_at.as_secs());
+    let created_at = engram::monotonic_created_at(now_secs(), prior_created_at);
+    let body = Body::Memory {
+        slug: slug.clone(),
+        value: Some(value.clone()),
+    };
+    let expected_revision = match expected {
+        ExpectedMemoryHead::Missing => "missing",
+        ExpectedMemoryHead::Event(event_id) => event_id,
+    };
+    let event = engram::build_event_with_expected_revision(
+        client.keys(),
+        owner,
+        &body,
+        created_at,
+        Some(expected_revision),
+    )
+    .map_err(|error| CliError::Other(format!("build event failed: {error}")))?;
+    let event_id = event.id.to_hex();
+    submit_engram(client, event).await?;
+
+    let (readback, readback_body) = fetch_head(client, &agent_pubkey, owner, &slug).await?;
+    let readback_matches = matches!(
+        (readback, readback_body),
+        (Some(event), Some(Body::Memory { value: Some(body), .. }))
+            if event.id.to_hex() == event_id && body == value
+    );
+    if !readback_matches {
+        return Err(CliError::Conflict(format!(
+            "memory `{slug}` write lost authoritative readback; re-read before retrying"
+        )));
+    }
+    Ok(event_id)
 }
 
 /// `buzz mem ls` — list non-tombstoned memory entries.
@@ -849,6 +1041,21 @@ mod tests {
             sha256_hex(""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn atomic_revision_rejection_is_an_explicit_non_retryable_conflict() {
+        let error = parse_submit_engram_response(
+            r#"{"accepted":false,"message":"conflict: agent engram changed since it was loaded"}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CliError::Conflict(_)));
+        assert_eq!(
+            error.to_string(),
+            "conflict: agent engram changed since it was loaded"
+        );
+        assert_eq!(crate::error::exit_code(&error), 5);
+        assert!(!crate::error::is_retryable_error(&error));
     }
 
     #[test]

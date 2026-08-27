@@ -30,7 +30,7 @@ use buzz_core::observer::{
 };
 use clap::Parser;
 use config::{
-    AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, Config, DedupMode, ModelsArgs,
+    AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, Config, DedupMode, HeartbeatMode, ModelsArgs,
     MultipleEventHandling, RespondTo, SubscribeMode,
 };
 use filter::SubscriptionRule;
@@ -130,105 +130,117 @@ fn emit_runtime_lifecycle(
     }
 }
 
-/// Resolve the agent's owner pubkey at startup.
+/// Resolve the agent's owner pubkey and relay attestation at startup.
 ///
 /// Priority:
 /// 1. `BUZZ_AUTH_TAG` env var — NIP-OA attestation signed by the owner.
 ///    Verified against the agent's own pubkey to extract the owner pubkey.
 /// 2. `--agent-owner` CLI flag / `BUZZ_ACP_AGENT_OWNER` env var.
-fn resolve_agent_owner(config: &Config) -> Option<String> {
-    // Try BUZZ_AUTH_TAG first (NIP-OA attestation).
-    if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
-        if !auth_tag.is_empty() {
-            let agent_pk = config.keys.public_key();
-            match buzz_sdk::nip_oa::verify_auth_tag(&auth_tag, &agent_pk) {
-                Ok(owner_pk) => {
-                    let owner_hex = owner_pk.to_hex().to_ascii_lowercase();
-                    tracing::info!("owner resolved from BUZZ_AUTH_TAG: {owner_hex}");
-                    return Some(owner_hex);
-                }
-                Err(e) => {
-                    tracing::warn!("BUZZ_AUTH_TAG verification failed: {e} — falling back");
-                }
-            }
-        }
-    }
-
-    // Fall back to --agent-owner config.
-    config.agent_owner.clone()
+fn resolve_agent_owner(config: &Config) -> Result<(Option<String>, Option<nostr::Tag>)> {
+    resolve_agent_owner_from_env(
+        config.keys.public_key(),
+        config.agent_owner.clone(),
+        std::env::var("BUZZ_AUTH_TAG"),
+    )
 }
 
-/// Cache for the agent's owner pubkey.
+fn resolve_agent_owner_from_env(
+    agent_pk: PublicKey,
+    legacy_owner: Option<String>,
+    auth_tag: std::result::Result<String, std::env::VarError>,
+) -> Result<(Option<String>, Option<nostr::Tag>)> {
+    match auth_tag {
+        Ok(auth_tag_json) => {
+            let owner_pk = buzz_sdk::nip_oa::verify_auth_tag(&auth_tag_json, &agent_pk)
+                .context("present BUZZ_AUTH_TAG failed verification")?;
+            let relay_tag = buzz_sdk::nip_oa::parse_auth_tag(&auth_tag_json)
+                .context("present BUZZ_AUTH_TAG failed canonical parsing")?;
+            let owner_hex = owner_pk.to_hex().to_ascii_lowercase();
+            tracing::info!("owner resolved from BUZZ_AUTH_TAG: {owner_hex}");
+            Ok((Some(owner_hex), Some(relay_tag)))
+        }
+        Err(std::env::VarError::NotPresent) => Ok((legacy_owner, None)),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(anyhow::anyhow!("present BUZZ_AUTH_TAG is not valid UTF-8"))
+        }
+    }
+}
+
+/// Startup-resolved owner identity for the inbound author gate.
 ///
-/// Owner is now provided via `--agent-owner` config flag (no REST lookup).
-/// Cache for the agent's owner pubkey + sibling lookups.
-///
-/// Siblings are other agents whose NIP-OA auth tag proves the same owner.
-/// Lookup results are cached for the process lifetime (attestations are immutable).
+/// Sibling decisions are deliberately not cached: kind-0 profile replacement
+/// must invalidate both prior positive and prior negative results.
 struct OwnerCache {
     pubkey: Option<String>,
-    /// author_hex → is_sibling (true = same owner, false = not)
-    siblings: std::sync::Mutex<HashMap<String, bool>>,
 }
 
 impl OwnerCache {
     fn new(initial: Option<String>) -> Self {
-        Self {
-            pubkey: initial,
-            siblings: std::sync::Mutex::new(HashMap::new()),
-        }
+        Self { pubkey: initial }
     }
 
     /// Return the cached owner pubkey.
     fn get(&self) -> Option<&str> {
         self.pubkey.as_deref()
     }
-
-    /// Check if author is a known sibling (cached result).
-    fn is_known_sibling(&self, author: &str) -> Option<bool> {
-        self.siblings.lock().ok()?.get(author).copied()
-    }
-
-    /// Cache a sibling lookup result.
-    fn cache_sibling(&self, author: String, is_sibling: bool) {
-        if let Ok(mut map) = self.siblings.lock() {
-            // Cap at 256 entries to prevent unbounded growth.
-            if map.len() >= 256 {
-                map.clear();
-            }
-            map.insert(author, is_sibling);
-        }
-    }
 }
 
-/// Check if `author` is the owner OR a sibling (same owner via NIP-OA).
+/// Check if `event` is from the owner OR a sibling (same owner via NIP-OA).
 ///
-/// For unknown authors, queries their kind:0 profile to extract the NIP-OA
-/// auth tag and verify the owner matches. Result is cached.
+/// A sibling event with a direct `auth` tag must have exactly one canonical
+/// tag and pass completely. Only an event with zero direct `auth` tags may use
+/// the latest verified kind:0 profile as a compatibility fallback.
 async fn is_owner_or_sibling(
-    author: &str,
+    event: &nostr::Event,
     owner_cache: &OwnerCache,
     rest_client: &relay::RestClient,
 ) -> bool {
-    let my_owner = match owner_cache.get() {
-        Some(o) => o,
+    let my_owner_hex = match owner_cache.get() {
+        Some(owner) => owner,
         None => return false, // no owner configured — fail closed
+    };
+    let my_owner = match PublicKey::from_hex(my_owner_hex) {
+        Ok(owner) => owner,
+        Err(_) => return false,
     };
 
     // Direct owner check.
-    if author == my_owner {
+    if event.pubkey == my_owner {
         return true;
     }
 
-    // Check sibling cache.
-    if let Some(cached) = owner_cache.is_known_sibling(author) {
-        return cached;
+    // A present direct tag is authoritative: invalid, ambiguous, or foreign
+    // tags reject without consulting an older profile attestation.
+    if let Some(verified) = direct_same_owner_attestation(event, &my_owner) {
+        return verified;
     }
 
-    // Query the author's kind:0 profile to check for NIP-OA auth tag.
-    let is_sibling = check_sibling_via_profile(author, my_owner, rest_client).await;
-    owner_cache.cache_sibling(author.to_string(), is_sibling);
-    is_sibling
+    check_sibling_via_profile(&event.pubkey, &my_owner, rest_client).await
+}
+
+/// `None` means no direct `auth` tag was present and profile fallback is
+/// permitted. `Some(false)` means a tag was present but failed closed.
+fn direct_same_owner_attestation(event: &nostr::Event, expected_owner: &PublicKey) -> Option<bool> {
+    let auth_tags: Vec<&nostr::Tag> = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("auth"))
+        .collect();
+    if auth_tags.is_empty() {
+        return None;
+    }
+    if auth_tags.len() != 1 {
+        return Some(false);
+    }
+
+    let tag_json = match serde_json::to_string(auth_tags[0].as_slice()) {
+        Ok(json) => json,
+        Err(_) => return Some(false),
+    };
+    Some(matches!(
+        buzz_sdk::nip_oa::verify_auth_tag_for_event(&tag_json, event),
+        Ok(owner) if owner == *expected_owner
+    ))
 }
 
 /// Inbound author gate decision: does this author's event fire a turn?
@@ -251,24 +263,25 @@ async fn is_owner_or_sibling(
 async fn author_allowed(
     respond_to: &RespondTo,
     allowlist: &HashSet<String>,
-    author: &str,
+    event: &nostr::Event,
     is_dm: bool,
     owner_cache: &OwnerCache,
     rest_client: &relay::RestClient,
 ) -> bool {
+    let author = event.pubkey.to_hex();
     if is_dm {
         return match respond_to {
             RespondTo::Nobody => false,
-            _ => is_owner_or_sibling(author, owner_cache, rest_client).await,
+            _ => is_owner_or_sibling(event, owner_cache, rest_client).await,
         };
     }
     match respond_to {
         RespondTo::Anyone => true,
         RespondTo::Nobody => false,
-        RespondTo::OwnerOnly => is_owner_or_sibling(author, owner_cache, rest_client).await,
+        RespondTo::OwnerOnly => is_owner_or_sibling(event, owner_cache, rest_client).await,
         RespondTo::Allowlist => {
-            allowlist.contains(author)
-                || is_owner_or_sibling(author, owner_cache, rest_client).await
+            allowlist.contains(&author)
+                || is_owner_or_sibling(event, owner_cache, rest_client).await
         }
     }
 }
@@ -305,16 +318,13 @@ pub(crate) async fn is_dm_channel(
 /// Query an author's kind:0 profile and check if their NIP-OA auth tag
 /// proves the same owner as us.
 async fn check_sibling_via_profile(
-    author: &str,
-    expected_owner: &str,
+    author: &PublicKey,
+    expected_owner: &PublicKey,
     rest_client: &relay::RestClient,
 ) -> bool {
     let filter = nostr::Filter::new()
         .kind(nostr::Kind::Metadata)
-        .author(match nostr::PublicKey::from_hex(author) {
-            Ok(pk) => pk,
-            Err(_) => return false,
-        })
+        .author(*author)
         .limit(1);
 
     let resp = match tokio::time::timeout(Duration::from_millis(2000), rest_client.query(&[filter]))
@@ -329,52 +339,32 @@ async fn check_sibling_via_profile(
         Some(arr) => arr,
         None => return false,
     };
-    let event = match events.first() {
-        Some(e) => e,
+    // The newest head is authoritative. Never search older profile rows after
+    // a malformed or invalid latest head.
+    let profile = match events.first() {
+        Some(value) => match serde_json::from_value::<nostr::Event>(value.clone()) {
+            Ok(event) => event,
+            Err(_) => return false,
+        },
         None => return false,
     };
-    let tags = match event.get("tags").and_then(|t| t.as_array()) {
-        Some(t) => t,
-        None => return false,
-    };
 
-    // Find ["auth", owner_pk, conditions, sig] and verify the Schnorr signature.
-    // Don't trust the relay — verify ourselves.
-    let agent_pk = match nostr::PublicKey::from_hex(author) {
-        Ok(pk) => pk,
-        Err(_) => return false,
-    };
-
-    for tag in tags {
-        let parts = match tag.as_array() {
-            Some(p) if p.len() >= 4 => p,
-            _ => continue,
-        };
-        if parts[0].as_str() != Some("auth") {
-            continue;
+    let author = *author;
+    let expected_owner = *expected_owner;
+    tokio::task::spawn_blocking(move || {
+        if profile.pubkey != author || profile.kind != nostr::Kind::Metadata {
+            return false;
         }
-        let tag_owner = match parts[1].as_str() {
-            Some(o) => o,
-            None => continue,
-        };
-        // Only verify if the owner field matches ours.
-        if !tag_owner.eq_ignore_ascii_case(expected_owner) {
-            continue;
+        if buzz_core::verify_event(&profile).is_err() {
+            return false;
         }
-        // Cryptographically verify the NIP-OA attestation signature.
-        let tag_json = serde_json::to_string(tag).unwrap_or_default();
-        match buzz_sdk::nip_oa::verify_auth_tag(&tag_json, &agent_pk) {
-            Ok(_) => {
-                tracing::debug!(author, expected_owner, "sibling verified via NIP-OA");
-                return true;
-            }
-            Err(e) => {
-                tracing::debug!(author, "NIP-OA auth tag verification failed: {e}");
-            }
-        }
-    }
-
-    false
+        matches!(
+            direct_same_owner_attestation(&profile, &expected_owner),
+            Some(true)
+        )
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Observer frames are published at a global rate of AT MOST ONE relay frame
@@ -1648,6 +1638,25 @@ fn inactivity_expired(
     !bound.is_zero() && !turn_in_flight && now.duration_since(last_activity) >= bound
 }
 
+/// Preserve the historical inactivity clock for routine feed heartbeats.
+///
+/// Only opted-in schedule heartbeats may keep the runtime awake: they are the
+/// continuation mechanism that can wake a lazy pool without an incoming
+/// event. A legacy feed heartbeat is background polling, not user activity,
+/// and must not extend either whole-process reaping or lazy-pool lifetime.
+fn activity_after_heartbeat_dispatch(
+    mode: HeartbeatMode,
+    dispatched: bool,
+    last_activity: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    if dispatched && matches!(mode, HeartbeatMode::Schedules) {
+        now
+    } else {
+        last_activity
+    }
+}
+
 /// Whether a woken lazy pool may be torn back down to the empty-slot state.
 ///
 /// True only when the pool is ready, the idle bound has elapsed with no
@@ -1739,6 +1748,63 @@ mod idle_pool_sleep_tests {
         let (last, now, bound) = ready_after_bound();
         assert!(idle_pool_sleep_due(
             true, last, now, bound, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn legacy_feed_heartbeat_does_not_extend_reaping_or_idle_pool_lifetime() {
+        let started = tokio::time::Instant::now();
+        let heartbeat_at = started + Duration::from_secs(30);
+        let after_bound = started + Duration::from_secs(61);
+        let bound = Duration::from_secs(60);
+
+        let last =
+            activity_after_heartbeat_dispatch(HeartbeatMode::Feed, true, started, heartbeat_at);
+
+        assert_eq!(last, started);
+        assert!(inactivity_expired(last, after_bound, bound, false));
+        assert!(idle_pool_sleep_due(
+            true,
+            last,
+            after_bound,
+            bound,
+            false,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn opted_in_schedule_heartbeat_refreshes_the_activity_clock() {
+        let started = tokio::time::Instant::now();
+        let heartbeat_at = started + Duration::from_secs(30);
+        let after_original_bound = started + Duration::from_secs(61);
+        let bound = Duration::from_secs(60);
+
+        let last = activity_after_heartbeat_dispatch(
+            HeartbeatMode::Schedules,
+            true,
+            started,
+            heartbeat_at,
+        );
+
+        assert_eq!(last, heartbeat_at);
+        assert!(!inactivity_expired(
+            last,
+            after_original_bound,
+            bound,
+            false
+        ));
+        assert!(!idle_pool_sleep_due(
+            true,
+            last,
+            after_original_bound,
+            bound,
+            false,
+            false,
+            false,
+            false,
         ));
     }
 
@@ -1958,6 +2024,11 @@ async fn tokio_main() -> Result<()> {
 
     tracing::info!("buzz-acp starting: {}", config.summary());
 
+    // Resolve credentials before starting any ACP child or relay work. A
+    // present invalid BUZZ_AUTH_TAG is a startup error, never a reason to run
+    // under the legacy owner configuration.
+    let (startup_owner, relay_auth_tag) = resolve_agent_owner(&config)?;
+
     let observer = config
         .relay_observer
         .then(observer::ObserverHandle::in_process);
@@ -1996,12 +2067,6 @@ async fn tokio_main() -> Result<()> {
 
     let pubkey_hex = config.keys.public_key().to_hex();
 
-    // Parse BUZZ_AUTH_TAG into a nostr::Tag for NIP-OA relay membership delegation.
-    let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
-
     let mut relay =
         HarnessRelay::connect(&config.relay_url, &config.keys, &pubkey_hex, relay_auth_tag)
             .await
@@ -2027,7 +2092,6 @@ async fn tokio_main() -> Result<()> {
     let presence_keys = config.keys.clone();
 
     // Priority: BUZZ_AUTH_TAG (NIP-OA attestation) → --agent-owner flag.
-    let startup_owner: Option<String> = resolve_agent_owner(&config);
     if let Some(ref owner) = startup_owner {
         tracing::info!("agent owner: {owner}");
     } else {
@@ -2240,6 +2304,10 @@ async fn tokio_main() -> Result<()> {
         None
     };
     let mut heartbeat_in_flight = false;
+    // A schedules heartbeat must wake a sleeping lazy pool. The flag survives
+    // the asynchronous pool-start boundary and is cleared only after the
+    // heartbeat turn is actually dispatched.
+    let mut heartbeat_wake_pending = false;
 
     let mut presence_heartbeat = if config.presence_enabled {
         let interval = Duration::from_secs(60);
@@ -2409,7 +2477,7 @@ async fn tokio_main() -> Result<()> {
         // busy spin — whenever the queued work drained after a failed wake.
         let mut lazy_wake_work_pending = false;
         if config.lazy_pool && !pool_ready {
-            lazy_wake_work_pending = queue.has_flushable_work();
+            lazy_wake_work_pending = queue.has_flushable_work() || heartbeat_wake_pending;
             if let Some(attempt) = pool_lifecycle
                 .start_wake_if_due(lazy_wake_work_pending, tokio::time::Instant::now())
             {
@@ -2436,6 +2504,21 @@ async fn tokio_main() -> Result<()> {
                     }
                 });
             }
+        }
+
+        if pool_ready
+            && heartbeat_wake_pending
+            && !queue.has_flushable_work()
+            && pool.any_idle()
+            && dispatch_heartbeat(
+                &mut pool,
+                &ctx,
+                &mut heartbeat_in_flight,
+                config.heartbeat_mode,
+            )
+        {
+            heartbeat_wake_pending = false;
+            last_activity = tokio::time::Instant::now();
         }
 
         if pool_ready && last_maintenance.elapsed() >= maintenance_interval {
@@ -2866,7 +2949,6 @@ async fn tokio_main() -> Result<()> {
                             // explicit pubkey list on top, for external people;
                             // it never revokes same-owner team bots.
                             {
-                                let author = buzz_event.event.pubkey.to_hex();
                                 // DM hardening: resolve channel type (fail-closed
                                 // to DM) so allowlist/anyone modes cannot be
                                 // exercised by non-owner authors inside DMs.
@@ -2875,7 +2957,7 @@ async fn tokio_main() -> Result<()> {
                                 let allowed = author_allowed(
                                     &config.respond_to,
                                     &config.respond_to_allowlist,
-                                    &author,
+                                    &buzz_event.event,
                                     is_dm,
                                     &owner_cache,
                                     &ctx.rest_client,
@@ -3077,7 +3159,12 @@ async fn tokio_main() -> Result<()> {
                 } => {
                     let _ = result_rx;
                     if !pool_ready {
-                        tracing::debug!("heartbeat_skipped_pool_not_ready");
+                        if config.lazy_pool && heartbeat_wakes_lazy_pool(config.heartbeat_mode) {
+                            heartbeat_wake_pending = true;
+                            tracing::info!("heartbeat_waking_lazy_pool");
+                        } else {
+                            tracing::debug!("heartbeat_skipped_pool_not_ready");
+                        }
                     } else if queue.has_flushable_work() {
                         tracing::debug!("heartbeat_skipped_events");
                         for (channel_id, thread_tags) in
@@ -3086,7 +3173,18 @@ async fn tokio_main() -> Result<()> {
                             typing_channels.insert(channel_id, thread_tags);
                         }
                     } else if pool.any_idle() {
-                        dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
+                        let dispatched = dispatch_heartbeat(
+                            &mut pool,
+                            &ctx,
+                            &mut heartbeat_in_flight,
+                            config.heartbeat_mode,
+                        );
+                        last_activity = activity_after_heartbeat_dispatch(
+                            config.heartbeat_mode,
+                            dispatched,
+                            last_activity,
+                            tokio::time::Instant::now(),
+                        );
                     } else {
                         tracing::debug!("heartbeat_skipped_busy");
                     }
@@ -4394,19 +4492,20 @@ fn dispatch_heartbeat(
     pool: &mut AgentPool,
     ctx: &Arc<PromptContext>,
     heartbeat_in_flight: &mut bool,
-) {
+    heartbeat_mode: HeartbeatMode,
+) -> bool {
     if *heartbeat_in_flight {
-        return;
+        return false;
     }
     let agent = match pool.try_claim(None) {
         Some(a) => a,
-        None => return,
+        None => return false,
     };
 
     let prompt_text = ctx
         .heartbeat_prompt
         .clone()
-        .unwrap_or_else(default_heartbeat_prompt);
+        .unwrap_or_else(|| built_in_heartbeat_prompt(heartbeat_mode));
     let result_tx = pool.result_tx();
     let ctx_clone = Arc::clone(ctx);
     let agent_index = agent.index;
@@ -4440,6 +4539,7 @@ fn dispatch_heartbeat(
     );
     *heartbeat_in_flight = true;
     tracing::info!(agent = agent_index, "heartbeat_fired");
+    true
 }
 
 #[cfg(test)]
@@ -4493,6 +4593,22 @@ mod agent_draft_prompt_tests {
             .contains("add them explicitly with `buzz channels add-member` only when authorized"));
         assert!(prompt.contains("never changes membership automatically"));
     }
+
+    #[test]
+    fn shared_base_prompt_teaches_driver_neutral_delegation_follow_through() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("Any agent may delegate work"));
+        assert!(prompt.contains("the **driver** is the one agent"));
+        assert!(prompt.contains("name exactly one owner, the expected result"));
+        assert!(prompt.contains("where the callback or evidence will appear"));
+        assert!(prompt.contains("15 minutes after each delegation or recheck"));
+        assert!(prompt.contains("A missing callback alone does not prove the work stopped"));
+        assert!(prompt.contains("publish nothing"));
+        assert!(prompt.contains("Verify the prior owner is no longer active"));
+        assert!(prompt.contains("assign exactly one replacement"));
+        assert!(prompt.contains("Never duplicate an active owner"));
+        assert!(!prompt.contains("PM Bot is the driver"));
+    }
 }
 
 fn default_heartbeat_prompt() -> String {
@@ -4512,6 +4628,136 @@ fn default_heartbeat_prompt() -> String {
          Do not run `buzz channels list` or `buzz messages search` unless you have a specific reason.\n\
          Do not invent work — only act on items surfaced by the feed commands."
     )
+}
+
+fn schedule_heartbeat_prompt() -> String {
+    let now = chrono::Utc::now().to_rfc3339();
+    format!(
+        "[System: Follow-through heartbeat]\nTime: {now}\n\n\
+         You have NO incoming message, active channel context, or automatically injected core\n\
+         memory. This opted-in heartbeat preserves the routine feed checks and adds only your\n\
+         private due follow-through schedule.\n\n\
+         Follow-through tasks:\n\
+         1. Run `buzz schedules claim-due`. This claims only due items owned by this agent. A due\n\
+            item means you are the designated driver for that conversation; this behavior is not\n\
+            specific to PM or to any agent persona.\n\
+         2. For each claimed item, use its channel_id and thread_id with\n\
+            `buzz messages thread --channel <channel_id> --event <thread_id>`. Find the explicit\n\
+            delegation naming one owner, its expected result, and the callback/evidence location.\n\
+            Follow the item's `check` before its `action`, and inspect that named location.\n\
+         3. Distinguish material progress from genuinely stopped work. A missing callback alone is\n\
+            not evidence of a stop. If the owner is active or has made material progress, use\n\
+            `buzz schedules reschedule` for 15 minutes later and publish nothing.\n\
+         4. Only for genuinely stopped work, verify the prior owner is no longer active before\n\
+            recovering its existing work or assigning exactly one replacement. Preserve the\n\
+            existing context, expected result, and callback/evidence location. Publish only the\n\
+            material recovery action or a genuine blocker requiring the owner.\n\
+         5. If the expected result is complete, publish the material completion and run\n\
+            `buzz schedules complete --id <id> --claim <claim.token>`. Otherwise retain the item\n\
+            with `buzz schedules reschedule --id <id> --claim <claim.token> --due-at <RFC3339>`.\n\
+            Inspect only the claimed due items, and never blindly replay an external effect whose\n\
+            outcome is unknown.\n\n\
+         Routine tasks (preserved from the standard heartbeat):\n\
+         6. Run `buzz feed get --types needs_action` for pending approvals or high-priority requests.\n\
+         7. Run `buzz feed get --types mentions` for unanswered @mentions.\n\
+         8. Address any actionable feed items with the appropriate CLI commands.\n\
+         9. If the schedule result is `[]` and both feed queries are empty, end immediately and\n\
+            publish nothing.\n\n\
+         Do not scan channels, search for unrelated work, or invent tasks."
+    )
+}
+
+fn built_in_heartbeat_prompt(mode: HeartbeatMode) -> String {
+    match mode {
+        HeartbeatMode::Feed => default_heartbeat_prompt(),
+        HeartbeatMode::Schedules => schedule_heartbeat_prompt(),
+    }
+}
+
+fn heartbeat_wakes_lazy_pool(mode: HeartbeatMode) -> bool {
+    matches!(mode, HeartbeatMode::Schedules)
+}
+
+#[cfg(test)]
+mod heartbeat_prompt_tests {
+    use super::{default_heartbeat_prompt, heartbeat_wakes_lazy_pool, schedule_heartbeat_prompt};
+    use crate::config::HeartbeatMode;
+    use crate::pool_lifecycle::PoolLifecycle;
+
+    #[test]
+    fn default_prompt_preserves_feed_heartbeat_behavior() {
+        let prompt = default_heartbeat_prompt();
+        assert!(prompt.contains("buzz feed get --types needs_action"));
+        assert!(prompt.contains("buzz feed get --types mentions"));
+        assert!(!prompt.contains("buzz schedules claim-due"));
+    }
+
+    #[test]
+    fn opted_in_schedule_prompt_composes_feed_and_due_work() {
+        let prompt = schedule_heartbeat_prompt();
+        assert!(prompt.contains("buzz schedules claim-due"));
+        assert!(prompt.contains("buzz messages thread --channel"));
+        assert!(prompt.contains("designated driver"));
+        assert!(prompt.contains("specific to PM"));
+        assert!(prompt.contains("delegation naming one owner"));
+        assert!(prompt.contains("expected result"));
+        assert!(prompt.contains("callback/evidence location"));
+        assert!(prompt.contains("Follow the item's `check` before its `action`"));
+        assert!(prompt.contains("A missing callback alone"));
+        assert!(prompt.contains("has made material progress"));
+        assert!(prompt.contains("15 minutes later and publish nothing"));
+        assert!(prompt.contains("verify the prior owner is no longer active"));
+        assert!(prompt.contains("assigning exactly one replacement"));
+        assert!(prompt.contains("Preserve the"));
+        assert!(prompt.contains("material recovery action"));
+        assert!(prompt.contains("buzz schedules complete"));
+        assert!(prompt.contains("buzz schedules reschedule"));
+        assert!(prompt.contains("buzz feed get --types needs_action"));
+        assert!(prompt.contains("buzz feed get --types mentions"));
+        assert!(prompt.contains("publish nothing"));
+    }
+
+    #[test]
+    fn only_opted_in_schedule_heartbeats_wake_a_lazy_pool() {
+        assert!(!heartbeat_wakes_lazy_pool(HeartbeatMode::Feed));
+        assert!(heartbeat_wakes_lazy_pool(HeartbeatMode::Schedules));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn schedule_heartbeat_wakes_after_restart_and_idle_resleep() {
+        let now = tokio::time::Instant::now();
+        let mut lifecycle = PoolLifecycle::listening();
+
+        // A legacy feed heartbeat leaves a restarted lazy pool asleep.
+        assert_eq!(
+            lifecycle.start_wake_if_due(heartbeat_wakes_lazy_pool(HeartbeatMode::Feed), now),
+            None
+        );
+
+        // An opted-in schedule heartbeat wakes it and survives the async
+        // transition until the pool becomes ready.
+        assert_eq!(
+            lifecycle.start_wake_if_due(heartbeat_wakes_lazy_pool(HeartbeatMode::Schedules), now),
+            Some(1)
+        );
+        lifecycle.complete_wake(1, Ok(()), now).unwrap();
+        assert!(lifecycle.take_ready().is_some());
+
+        // The event loop returns the lifecycle to Listening when the idle
+        // timeout puts the pool back to sleep. The next due heartbeat must
+        // wake it again without any incoming message callback.
+        assert_eq!(
+            lifecycle.start_wake_if_due(
+                heartbeat_wakes_lazy_pool(HeartbeatMode::Schedules),
+                now + std::time::Duration::from_secs(1)
+            ),
+            Some(1)
+        );
+        lifecycle
+            .complete_wake(1, Ok(()), now + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(lifecycle.take_ready().is_some());
+    }
 }
 
 /// Spawn a background respawn task for a crashed agent slot.
@@ -5328,15 +5574,58 @@ mod owner_cache_tests {
         let cache = OwnerCache::new(Some("ab".repeat(32)));
         assert_eq!(cache.get(), Some("ab".repeat(32)).as_deref());
     }
+
+    #[test]
+    fn startup_auth_present_and_valid_overrides_legacy_owner() {
+        let owner = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let auth = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "")
+            .expect("compute startup auth");
+        let (resolved, relay_tag) =
+            resolve_agent_owner_from_env(agent.public_key(), Some("legacy".into()), Ok(auth))
+                .expect("valid startup auth resolves");
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some(owner.public_key().to_hex().as_str())
+        );
+        assert!(relay_tag.is_some());
+    }
+
+    #[test]
+    fn startup_auth_absence_alone_allows_legacy_owner() {
+        let agent = nostr::Keys::generate();
+        let (resolved, relay_tag) = resolve_agent_owner_from_env(
+            agent.public_key(),
+            Some("legacy".into()),
+            Err(std::env::VarError::NotPresent),
+        )
+        .expect("absent startup auth permits legacy owner");
+        assert_eq!(resolved.as_deref(), Some("legacy"));
+        assert!(relay_tag.is_none());
+    }
+
+    #[test]
+    fn startup_auth_present_invalid_fails_closed_without_legacy_fallback() {
+        let agent = nostr::Keys::generate();
+        for invalid in [String::new(), "malformed".to_string()] {
+            assert!(
+                resolve_agent_owner_from_env(
+                    agent.public_key(),
+                    Some("legacy".into()),
+                    Ok(invalid),
+                )
+                .is_err(),
+                "present invalid startup auth must fail closed"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod author_gate_tests {
     use super::*;
 
-    /// A `RestClient` for tests. The author-gate decisions exercised here all
-    /// resolve from the owner pubkey or sibling cache before any HTTP call, so
-    /// this client is never actually used to make a request.
     fn dummy_rest_client() -> relay::RestClient {
         relay::RestClient {
             http: reqwest::Client::new(),
@@ -5346,29 +5635,95 @@ mod author_gate_tests {
         }
     }
 
-    const OWNER: &str = "00";
-    const SIBLING: &str = "11";
-    const EXTERNAL: &str = "22";
-    const STRANGER: &str = "33";
+    fn owner_cache(owner: &nostr::Keys) -> OwnerCache {
+        OwnerCache::new(Some(owner.public_key().to_hex()))
+    }
 
-    /// Owner + a known sibling, none of them on the explicit allowlist.
-    fn cache_with_sibling() -> OwnerCache {
-        let cache = OwnerCache::new(Some(OWNER.into()));
-        cache.cache_sibling(SIBLING.into(), true);
-        cache.cache_sibling(STRANGER.into(), false);
-        cache.cache_sibling(EXTERNAL.into(), false);
-        cache
+    fn auth_tag(owner: &nostr::Keys, author: &nostr::Keys, conditions: &str) -> nostr::Tag {
+        let json = buzz_sdk::nip_oa::compute_auth_tag(owner, &author.public_key(), conditions)
+            .expect("compute test auth tag");
+        buzz_sdk::nip_oa::parse_auth_tag(&json).expect("parse test auth tag")
+    }
+
+    fn event(author: &nostr::Keys, tags: Vec<nostr::Tag>) -> nostr::Event {
+        nostr::EventBuilder::new(nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16), "work")
+            .tags(tags)
+            .custom_created_at(nostr::Timestamp::from(1_700_000_000))
+            .sign_with_keys(author)
+            .expect("sign test event")
+    }
+
+    fn same_owner_event(owner: &nostr::Keys, sibling: &nostr::Keys) -> nostr::Event {
+        event(sibling, vec![auth_tag(owner, sibling, "kind=9")])
+    }
+
+    fn profile_event(
+        author: &nostr::Keys,
+        attesting_owner: Option<&nostr::Keys>,
+        created_at: u64,
+    ) -> nostr::Event {
+        let tags = attesting_owner
+            .map(|owner| vec![auth_tag(owner, author, "kind=0")])
+            .unwrap_or_default();
+        nostr::EventBuilder::new(nostr::Kind::Metadata, "{}")
+            .tags(tags)
+            .custom_created_at(nostr::Timestamp::from(created_at))
+            .sign_with_keys(author)
+            .expect("sign profile event")
+    }
+
+    async fn rest_client_with_responses(
+        responses: Vec<serde_json::Value>,
+    ) -> (relay::RestClient, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind profile test server");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("profile server address")
+        );
+        let server = tokio::spawn(async move {
+            for body in responses.into_iter().map(|value| value.to_string()) {
+                let (mut socket, _) = listener.accept().await.expect("accept profile query");
+                let mut request = vec![0; 8192];
+                let _ = socket.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write profile response");
+            }
+        });
+        (
+            relay::RestClient {
+                http: reqwest::Client::new(),
+                base_url,
+                keys: nostr::Keys::generate(),
+                auth_tag_json: None,
+            },
+            server,
+        )
     }
 
     #[tokio::test]
     async fn test_allowlist_accepts_sibling_not_in_allowlist() {
-        let cache = cache_with_sibling();
-        let allowlist = HashSet::from([EXTERNAL.to_string()]);
+        let owner = nostr::Keys::generate();
+        let sibling = nostr::Keys::generate();
+        let external = nostr::Keys::generate();
+        let cache = owner_cache(&owner);
+        let sibling_event = same_owner_event(&owner, &sibling);
+        let allowlist = HashSet::from([external.public_key().to_hex()]);
         assert!(
             author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
-                SIBLING,
+                &sibling_event,
                 false,
                 &cache,
                 &dummy_rest_client()
@@ -5380,13 +5735,16 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_allowlist_accepts_explicit_external_pubkey() {
-        let cache = cache_with_sibling();
-        let allowlist = HashSet::from([EXTERNAL.to_string()]);
+        let owner = nostr::Keys::generate();
+        let external = nostr::Keys::generate();
+        let cache = owner_cache(&owner);
+        let external_event = event(&external, vec![]);
+        let allowlist = HashSet::from([external.public_key().to_hex()]);
         assert!(
             author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
-                EXTERNAL,
+                &external_event,
                 false,
                 &cache,
                 &dummy_rest_client()
@@ -5398,13 +5756,21 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_allowlist_rejects_non_sibling_not_in_allowlist() {
-        let cache = cache_with_sibling();
-        let allowlist = HashSet::from([EXTERNAL.to_string()]);
+        let owner = nostr::Keys::generate();
+        let foreign_owner = nostr::Keys::generate();
+        let stranger = nostr::Keys::generate();
+        let external = nostr::Keys::generate();
+        let cache = owner_cache(&owner);
+        let stranger_event = event(
+            &stranger,
+            vec![auth_tag(&foreign_owner, &stranger, "kind=9")],
+        );
+        let allowlist = HashSet::from([external.public_key().to_hex()]);
         assert!(
             !author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
-                STRANGER,
+                &stranger_event,
                 false,
                 &cache,
                 &dummy_rest_client()
@@ -5416,13 +5782,15 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_allowlist_accepts_owner() {
-        let cache = cache_with_sibling();
+        let owner = nostr::Keys::generate();
+        let cache = owner_cache(&owner);
+        let owner_event = event(&owner, vec![]);
         let allowlist = HashSet::new();
         assert!(
             author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
-                OWNER,
+                &owner_event,
                 false,
                 &cache,
                 &dummy_rest_client()
@@ -5438,12 +5806,19 @@ mod author_gate_tests {
     // pin that invariant against the default mode.
     #[tokio::test]
     async fn test_owner_only_rejects_stranger_so_no_steer() {
-        let cache = cache_with_sibling();
+        let owner = nostr::Keys::generate();
+        let foreign_owner = nostr::Keys::generate();
+        let stranger = nostr::Keys::generate();
+        let cache = owner_cache(&owner);
+        let stranger_event = event(
+            &stranger,
+            vec![auth_tag(&foreign_owner, &stranger, "kind=9")],
+        );
         assert!(
             !author_allowed(
                 &RespondTo::OwnerOnly,
                 &HashSet::new(),
-                STRANGER,
+                &stranger_event,
                 false,
                 &cache,
                 &dummy_rest_client()
@@ -5455,13 +5830,17 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_owner_only_admits_owner_and_sibling_to_steer() {
-        let cache = cache_with_sibling();
-        for (who, label) in [(OWNER, "owner"), (SIBLING, "sibling")] {
+        let owner = nostr::Keys::generate();
+        let sibling = nostr::Keys::generate();
+        let cache = owner_cache(&owner);
+        let owner_event = event(&owner, vec![]);
+        let sibling_event = same_owner_event(&owner, &sibling);
+        for (candidate, label) in [(&owner_event, "owner"), (&sibling_event, "sibling")] {
             assert!(
                 author_allowed(
                     &RespondTo::OwnerOnly,
                     &HashSet::new(),
-                    who,
+                    candidate,
                     false,
                     &cache,
                     &dummy_rest_client()
@@ -5470,6 +5849,153 @@ mod author_gate_tests {
                 "under default OwnerOnly, the {label} must be admitted so steering can fire"
             );
         }
+    }
+
+    #[test]
+    fn direct_auth_cardinality_shape_owner_binding_and_conditions_fail_closed() {
+        let owner = nostr::Keys::generate();
+        let foreign_owner = nostr::Keys::generate();
+        let sibling = nostr::Keys::generate();
+        let copied_to = nostr::Keys::generate();
+        let expected_owner = owner.public_key();
+
+        let valid = same_owner_event(&owner, &sibling);
+        assert_eq!(
+            direct_same_owner_attestation(&valid, &expected_owner),
+            Some(true)
+        );
+
+        let multiple = event(
+            &sibling,
+            vec![
+                auth_tag(&owner, &sibling, "kind=9"),
+                auth_tag(&owner, &sibling, "kind=9"),
+            ],
+        );
+        assert_eq!(
+            direct_same_owner_attestation(&multiple, &expected_owner),
+            Some(false)
+        );
+
+        let malformed = event(
+            &sibling,
+            vec![nostr::Tag::parse(["auth", "malformed"]).expect("parse malformed tag")],
+        );
+        assert_eq!(
+            direct_same_owner_attestation(&malformed, &expected_owner),
+            Some(false)
+        );
+
+        let copied = event(&copied_to, vec![auth_tag(&owner, &sibling, "kind=9")]);
+        assert_eq!(
+            direct_same_owner_attestation(&copied, &expected_owner),
+            Some(false),
+            "an attestation copied from another agent must not verify against this author"
+        );
+
+        let foreign = event(&sibling, vec![auth_tag(&foreign_owner, &sibling, "kind=9")]);
+        assert_eq!(
+            direct_same_owner_attestation(&foreign, &expected_owner),
+            Some(false)
+        );
+
+        let wrong_kind = event(&sibling, vec![auth_tag(&owner, &sibling, "kind=1")]);
+        assert_eq!(
+            direct_same_owner_attestation(&wrong_kind, &expected_owner),
+            Some(false)
+        );
+
+        let wrong_time = event(
+            &sibling,
+            vec![auth_tag(&owner, &sibling, "created_at<1700000000")],
+        );
+        assert_eq!(
+            direct_same_owner_attestation(&wrong_time, &expected_owner),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_direct_auth_rejects_without_profile_fallback() {
+        let owner = nostr::Keys::generate();
+        let foreign_owner = nostr::Keys::generate();
+        let sibling = nostr::Keys::generate();
+        let candidate = event(&sibling, vec![auth_tag(&foreign_owner, &sibling, "kind=9")]);
+        assert!(
+            !is_owner_or_sibling(&candidate, &owner_cache(&owner), &dummy_rest_client()).await,
+            "a present invalid direct tag must not consult profile fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_fallback_uses_fresh_latest_verified_head_without_boolean_cache() {
+        let owner = nostr::Keys::generate();
+        let sibling = nostr::Keys::generate();
+        let foreign_owner = nostr::Keys::generate();
+        let valid = profile_event(&sibling, Some(&owner), 100);
+        let replaced_negative = profile_event(&sibling, Some(&foreign_owner), 101);
+        let replaced_positive = profile_event(&sibling, Some(&owner), 102);
+        let older_valid = profile_event(&sibling, Some(&owner), 99);
+        let (rest, server) = rest_client_with_responses(vec![
+            serde_json::json!([valid]),
+            serde_json::json!([replaced_negative]),
+            serde_json::json!([replaced_positive]),
+            serde_json::json!([profile_event(&sibling, None, 103), older_valid]),
+        ])
+        .await;
+
+        let profile_only_event = event(&sibling, vec![]);
+        assert!(
+            author_allowed(
+                &RespondTo::OwnerOnly,
+                &HashSet::new(),
+                &profile_only_event,
+                false,
+                &owner_cache(&owner),
+                &rest,
+            )
+            .await,
+            "zero direct auth tags may use the latest fully verified profile"
+        );
+        assert!(
+            !check_sibling_via_profile(&sibling.public_key(), &owner.public_key(), &rest).await,
+            "a newer foreign-owner head must invalidate a prior positive"
+        );
+        assert!(
+            check_sibling_via_profile(&sibling.public_key(), &owner.public_key(), &rest).await,
+            "a newer valid head must invalidate a prior negative"
+        );
+        assert!(
+            !check_sibling_via_profile(&sibling.public_key(), &owner.public_key(), &rest).await,
+            "an unusable newest head must not fall back to an older valid profile"
+        );
+        server.await.expect("profile server completed");
+    }
+
+    #[tokio::test]
+    async fn profile_fallback_rejects_tampered_profile_signature_and_wrong_author() {
+        let owner = nostr::Keys::generate();
+        let sibling = nostr::Keys::generate();
+        let other = nostr::Keys::generate();
+        let profile = profile_event(&sibling, Some(&owner), 100);
+        let mut tampered_json = serde_json::to_value(&profile).expect("serialize profile");
+        tampered_json["sig"] = serde_json::json!("0".repeat(128));
+        let tampered: nostr::Event =
+            serde_json::from_value(tampered_json).expect("parse tampered profile");
+        let wrong_author = profile_event(&other, Some(&owner), 101);
+        let (rest, server) = rest_client_with_responses(vec![
+            serde_json::json!([tampered]),
+            serde_json::json!([wrong_author]),
+        ])
+        .await;
+
+        assert!(
+            !check_sibling_via_profile(&sibling.public_key(), &owner.public_key(), &rest).await
+        );
+        assert!(
+            !check_sibling_via_profile(&sibling.public_key(), &owner.public_key(), &rest).await
+        );
+        server.await.expect("profile server completed");
     }
 
     // ── DM hardening ──────────────────────────────────────────────────────
@@ -5481,13 +6007,20 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_dm_rejects_allowlisted_external_pubkey() {
-        let cache = cache_with_sibling();
-        let allowlist = HashSet::from([EXTERNAL.to_string()]);
+        let owner = nostr::Keys::generate();
+        let foreign_owner = nostr::Keys::generate();
+        let external = nostr::Keys::generate();
+        let cache = owner_cache(&owner);
+        let external_event = event(
+            &external,
+            vec![auth_tag(&foreign_owner, &external, "kind=9")],
+        );
+        let allowlist = HashSet::from([external.public_key().to_hex()]);
         assert!(
             !author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
-                EXTERNAL,
+                &external_event,
                 true,
                 &cache,
                 &dummy_rest_client()
@@ -5499,12 +6032,19 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_dm_rejects_stranger_under_anyone() {
-        let cache = cache_with_sibling();
+        let owner = nostr::Keys::generate();
+        let foreign_owner = nostr::Keys::generate();
+        let stranger = nostr::Keys::generate();
+        let cache = owner_cache(&owner);
+        let stranger_event = event(
+            &stranger,
+            vec![auth_tag(&foreign_owner, &stranger, "kind=9")],
+        );
         assert!(
             !author_allowed(
                 &RespondTo::Anyone,
                 &HashSet::new(),
-                STRANGER,
+                &stranger_event,
                 true,
                 &cache,
                 &dummy_rest_client()
@@ -5516,18 +6056,22 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_dm_admits_owner_and_sibling_in_every_responding_mode() {
-        let cache = cache_with_sibling();
+        let owner = nostr::Keys::generate();
+        let sibling = nostr::Keys::generate();
+        let cache = owner_cache(&owner);
+        let owner_event = event(&owner, vec![]);
+        let sibling_event = same_owner_event(&owner, &sibling);
         for mode in [
             RespondTo::OwnerOnly,
             RespondTo::Allowlist,
             RespondTo::Anyone,
         ] {
-            for (who, label) in [(OWNER, "owner"), (SIBLING, "sibling")] {
+            for (candidate, label) in [(&owner_event, "owner"), (&sibling_event, "sibling")] {
                 assert!(
                     author_allowed(
                         &mode,
                         &HashSet::new(),
-                        who,
+                        candidate,
                         true,
                         &cache,
                         &dummy_rest_client()
@@ -5541,12 +6085,14 @@ mod author_gate_tests {
 
     #[tokio::test]
     async fn test_dm_nobody_rejects_even_owner() {
-        let cache = cache_with_sibling();
+        let owner = nostr::Keys::generate();
+        let cache = owner_cache(&owner);
+        let owner_event = event(&owner, vec![]);
         assert!(
             !author_allowed(
                 &RespondTo::Nobody,
                 &HashSet::new(),
-                OWNER,
+                &owner_event,
                 true,
                 &cache,
                 &dummy_rest_client()
@@ -5677,8 +6223,15 @@ mod author_gate_tests {
         let id = Uuid::new_v4();
         let discovered = relay::merge_discovered_channels(vec![id], &serde_json::json!([]));
         let channel_info = resolver(discovered);
-        let owner_cache = cache_with_sibling();
-        let allowlist = HashSet::from([EXTERNAL.to_string()]);
+        let owner = nostr::Keys::generate();
+        let foreign_owner = nostr::Keys::generate();
+        let external = nostr::Keys::generate();
+        let owner_cache = owner_cache(&owner);
+        let external_event = event(
+            &external,
+            vec![auth_tag(&foreign_owner, &external, "kind=9")],
+        );
+        let allowlist = HashSet::from([external.public_key().to_hex()]);
 
         let is_dm = is_dm_channel(id, &channel_info).await;
         assert!(is_dm, "unknown startup metadata must fail closed as DM");
@@ -5686,7 +6239,7 @@ mod author_gate_tests {
             !author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
-                EXTERNAL,
+                &external_event,
                 is_dm,
                 &owner_cache,
                 &dummy_rest_client(),
@@ -6764,6 +7317,7 @@ mod build_mcp_servers_tests {
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
+            heartbeat_mode: config::HeartbeatMode::Feed,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
             system_prompt: None,
@@ -6988,6 +7542,7 @@ mod error_outcome_emission_tests {
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
+            heartbeat_mode: config::HeartbeatMode::Feed,
             turn_liveness_secs: 10,
             heartbeat_prompt: None,
             system_prompt: None,

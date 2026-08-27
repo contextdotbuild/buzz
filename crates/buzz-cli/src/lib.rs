@@ -234,6 +234,9 @@ enum Cmd {
     /// Agent engram management — persistent memory per NIP-AE
     #[command(subcommand)]
     Mem(MemCmd),
+    /// Durable bot-owned follow-through schedules
+    #[command(subcommand)]
+    Schedules(SchedulesCmd),
     /// Persona pack operations (local, no relay connection needed)
     #[command(subcommand)]
     Pack(PackCmd),
@@ -1850,6 +1853,112 @@ pub enum MemCmd {
     },
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum ScheduleStatusArg {
+    Pending,
+    Claimed,
+    Completed,
+}
+
+/// Subcommands for `buzz schedules`.
+#[derive(Subcommand)]
+pub enum SchedulesCmd {
+    /// Create a durable follow-through schedule
+    Create {
+        /// Stable lowercase schedule identifier (1..=64 chars)
+        #[arg(long)]
+        id: String,
+        /// First wake time as RFC3339
+        #[arg(long)]
+        due_at: String,
+        /// Buzz channel UUID containing the work
+        #[arg(long)]
+        channel: String,
+        /// Root Buzz event ID for the work thread
+        #[arg(long)]
+        thread: String,
+        /// Named owner/result/callback event or absence that makes this follow-up due
+        #[arg(long)]
+        expected_cause: String,
+        /// What the driver should do after checking active versus stopped work
+        #[arg(long)]
+        action: String,
+        /// How to inspect the named evidence location before any recovery or replay
+        #[arg(long)]
+        check: String,
+        /// Owner pubkey (hex). Overrides BUZZ_AUTH_TAG.
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// List schedules in this bot's private namespace
+    List {
+        /// Filter by lifecycle status
+        #[arg(long, value_enum)]
+        status: Option<ScheduleStatusArg>,
+        /// Owner pubkey (hex). Overrides BUZZ_AUTH_TAG.
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// List schedules that are due without claiming them
+    Due {
+        /// Evaluate at this RFC3339 time instead of now
+        #[arg(long)]
+        at: Option<String>,
+        /// Owner pubkey (hex). Overrides BUZZ_AUTH_TAG.
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Atomically claim due schedules before acting on them
+    ClaimDue {
+        /// Evaluate at this RFC3339 time instead of now
+        #[arg(long)]
+        at: Option<String>,
+        /// Seconds before an abandoned claim can be recovered
+        #[arg(long, default_value_t = 1800)]
+        lease_seconds: u64,
+        /// Maximum schedules to claim in one heartbeat
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Owner pubkey (hex). Overrides BUZZ_AUTH_TAG.
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Mark a claimed schedule complete
+    Complete {
+        #[arg(long)]
+        id: String,
+        /// Claim token returned by `claim-due`
+        #[arg(long)]
+        claim: String,
+        /// Owner pubkey (hex). Overrides BUZZ_AUTH_TAG.
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Release a claimed schedule back to pending with a new due time
+    Reschedule {
+        #[arg(long)]
+        id: String,
+        /// Claim token returned by `claim-due`
+        #[arg(long)]
+        claim: String,
+        /// New wake time as RFC3339
+        #[arg(long)]
+        due_at: String,
+        /// Replace the expected next cause
+        #[arg(long)]
+        expected_cause: Option<String>,
+        /// Replace the action instructions
+        #[arg(long)]
+        action: Option<String>,
+        /// Replace the reconciliation check
+        #[arg(long)]
+        check: Option<String>,
+        /// Owner pubkey (hex). Overrides BUZZ_AUTH_TAG.
+        #[arg(long)]
+        owner: Option<String>,
+    },
+}
+
 /// Subcommands for `buzz pack`.
 #[derive(Subcommand)]
 pub enum PackCmd {
@@ -2065,6 +2174,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Media(sub) => commands::upload::dispatch_media(sub, &client).await,
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
+        Cmd::Schedules(sub) => commands::schedules::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
         Cmd::Pack(_) => unreachable!("handled above"),
     }
@@ -2212,6 +2322,7 @@ mod tests {
             "projects",
             "reactions",
             "repos",
+            "schedules",
             "social",
             "upload",
             "users",
@@ -2385,6 +2496,17 @@ mod tests {
         assert_eq!(names(&cmd, "upload"), vec!["file"]);
         assert_eq!(names(&cmd, "pack"), vec!["inspect", "validate"]);
         assert_eq!(
+            names(&cmd, "schedules"),
+            vec![
+                "claim-due",
+                "complete",
+                "create",
+                "due",
+                "list",
+                "reschedule"
+            ]
+        );
+        assert_eq!(
             names(&cmd, "moderation"),
             vec![
                 "audit",
@@ -2417,6 +2539,7 @@ mod tests {
             ("projects", 7),
             ("reactions", 3),
             ("repos", 5),
+            ("schedules", 6),
             ("social", 7),
             ("upload", 1),
             ("users", 5),

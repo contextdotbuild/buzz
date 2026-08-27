@@ -438,6 +438,22 @@ pub fn build_event(
     body: &Body,
     created_at: u64,
 ) -> Result<Event, EngramError> {
+    build_event_with_expected_revision(agent_keys, owner_pubkey, body, created_at, None)
+}
+
+/// Build a signed engram event with an optional relay-enforced revision
+/// precondition.
+///
+/// `expected_revision` is either a 64-character event ID or the literal
+/// `"missing"`. The relay interprets this public tag atomically at the NIP-33
+/// replacement boundary; the encrypted body remains opaque.
+pub fn build_event_with_expected_revision(
+    agent_keys: &Keys,
+    owner_pubkey: &PublicKey,
+    body: &Body,
+    created_at: u64,
+    expected_revision: Option<&str>,
+) -> Result<Event, EngramError> {
     let plaintext = body.to_json_bytes();
     if plaintext.len() > NIP44_PLAINTEXT_MAX {
         return Err(EngramError::BodyTooLarge(plaintext.len()));
@@ -459,11 +475,26 @@ pub fn build_event(
     .map_err(|e| EngramError::Encrypt(e.to_string()))?;
 
     let d = d_tag(&k_c, body.slug());
-    let tags = vec![
+    let mut tags = vec![
         Tag::parse(["d", &d]).map_err(|e| EngramError::Encrypt(e.to_string()))?,
         Tag::parse(["p", &owner_pubkey.to_hex()])
             .map_err(|e| EngramError::Encrypt(e.to_string()))?,
     ];
+    if let Some(expected_revision) = expected_revision {
+        let is_event_id = expected_revision.len() == 64
+            && expected_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+        if expected_revision != "missing" && !is_event_id {
+            return Err(EngramError::InvalidEnvelope(
+                "expected revision must be `missing` or a 64-character lowercase event ID".into(),
+            ));
+        }
+        tags.push(
+            Tag::parse(["expected-revision", expected_revision])
+                .map_err(|e| EngramError::Encrypt(e.to_string()))?,
+        );
+    }
 
     EventBuilder::new(Kind::Custom(KIND_AGENT_ENGRAM as u16), ciphertext)
         .tags(tags)
@@ -829,6 +860,61 @@ mod tests {
         .unwrap();
         assert_eq!(decoded_agent, decoded);
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn atomic_revision_tag_preserves_encrypted_body_round_trip() {
+        let agent = keys_from_hex(SECKEY_A);
+        let owner = keys_from_hex(SECKEY_O);
+        let original = Body::Memory {
+            slug: "mem/atomic-claim".into(),
+            value: Some("claimed".into()),
+        };
+        let revision = "ab".repeat(32);
+        let event = build_event_with_expected_revision(
+            &agent,
+            &owner.public_key(),
+            &original,
+            1_700_000_000,
+            Some(&revision),
+        )
+        .unwrap();
+        let revision_tags: Vec<&[String]> = event
+            .tags
+            .iter()
+            .map(Tag::as_slice)
+            .filter(|parts| parts.first().map(String::as_str) == Some("expected-revision"))
+            .collect();
+        assert_eq!(revision_tags.len(), 1);
+        assert_eq!(revision_tags[0], &["expected-revision", revision.as_str()]);
+        let decoded = validate_and_decrypt(
+            &event,
+            &agent.public_key(),
+            &owner.public_key(),
+            agent.secret_key(),
+            &owner.public_key(),
+        )
+        .unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn atomic_revision_builder_rejects_noncanonical_value() {
+        let agent = keys_from_hex(SECKEY_A);
+        let owner = keys_from_hex(SECKEY_O);
+        let body = Body::Memory {
+            slug: "mem/atomic-claim".into(),
+            value: Some("claimed".into()),
+        };
+        let error = build_event_with_expected_revision(
+            &agent,
+            &owner.public_key(),
+            &body,
+            1_700_000_000,
+            Some(&"AB".repeat(32)),
+        )
+        .unwrap_err();
+        assert!(matches!(error, EngramError::InvalidEnvelope(_)));
     }
 
     #[test]

@@ -86,6 +86,18 @@ buzz mem set <slug> "my-value"
 buzz mem patch <slug> --base-hash <hex> < diff.patch  # or --no-base-hash
 buzz mem rm <slug>
 
+# Durable follow-through schedules (private NIP-AE state)
+buzz schedules create --id review-pr-42 --due-at 2026-08-26T16:00:00Z \
+  --channel <uuid> --thread <event-id> \
+  --expected-cause "Koder returns the requested patch or the 15-minute check is due" \
+  --check "read the thread and named worktree; determine whether Koder is active" \
+  --action "remain silent and reschedule if active; otherwise verify inactivity and recover once"
+buzz schedules list
+buzz schedules claim-due
+buzz schedules complete --id review-pr-42 --claim <claim-token>
+buzz schedules reschedule --id review-pr-42 --claim <claim-token> \
+  --due-at 2026-08-26T17:00:00Z
+
 # Repository protection
 buzz repos protect list --id my-repo
 buzz repos protect set --id my-repo --ref refs/heads/main --push admin --no-force-push --no-delete
@@ -98,6 +110,27 @@ buzz channels list | jq '.[].name'
 `protect set` replaces every existing rule for the exact ref pattern. Any
 constraint omitted from the command is removed. `protect list` reports malformed
 stored rules in `validation_error` so an owner can remove and repair them.
+
+`buzz schedules` keeps one encrypted `mem/buzz-follow-through/<id>` entry per
+schedule in the calling bot's agent↔owner namespace. The CLI owns the schema and
+claim lifecycle; bots do not hand-edit it. `claim-due` leases returned items for
+30 minutes by default. Completed items never become due again, while an
+abandoned claim becomes recoverable after its lease. The schedule's `check`
+instruction must reconcile any external effect before it is repeated.
+
+The creating agent is the conversation driver for that item; the mechanism is
+not specific to PM or any persona. Before creating one, the driver makes the
+delegation explicit in the conversation with exactly one named owner, expected
+result, and callback/evidence location. On each 15-minute check, active progress
+is silent and rescheduled. Recovery happens only after verifying the prior
+owner is inactive, and it preserves the existing work and evidence location
+while assigning at most one replacement.
+
+The relay atomically enforces the expected prior revision when a schedule head
+is replaced, so two machines using the same agent identity cannot both win a
+claim. Schedule discovery follows the relay's composite `(until, before_id)`
+cursor in bounded pages, so relay page clamps do not hide items beyond the
+first 1,000 events.
 
 ## Commands
 
@@ -167,6 +200,12 @@ stored rules in `validation_error` so an owner can remove and repair them.
 | | `set` | Write a memory value (use `-` for stdin) |
 | | `patch` | Apply unified diff to memory value |
 | | `rm` | Publish a tombstone to delete memory |
+| `schedules` | `create` | Create an idempotent thread-bound follow-through item |
+| | `list` | List private schedules, optionally by status |
+| | `due` | Read due items without claiming them |
+| | `claim-due` | Lease due items before a heartbeat acts |
+| | `complete` | Complete a claimed item idempotently |
+| | `reschedule` | Release a claim with a new due time |
 
 ## Architecture
 

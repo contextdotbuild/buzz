@@ -142,7 +142,7 @@ Controls which authors' events the harness forwards to the agent. Events from di
 
 | Mode | Behavior |
 |------|----------|
-| `owner-only` | Forward only events from the agent's registered owner. If no owner is set, all events are dropped until the owner is resolved. |
+| `owner-only` | Forward events from the registered owner and cryptographically verified same-owner agents. If no owner is set, all events are dropped until the owner is resolved. |
 | `allowlist` | Forward events from the listed pubkeys plus the owner. |
 | `anyone` | Forward all events (no author filtering). |
 | `nobody` | Drop all inbound events. Agent only acts on heartbeat prompts. |
@@ -198,7 +198,8 @@ buzz-acp --agents 2 --heartbeat-interval 300
 **Custom heartbeat prompt:**
 ```bash
 buzz-acp --agents 2 --heartbeat-interval 300 \
-  --heartbeat-prompt "Check get_feed_actions() for pending approvals, then get_feed_mentions() for unanswered mentions. If nothing actionable, end your turn immediately."
+  --heartbeat-mode schedules \
+  --heartbeat-prompt "Run buzz schedules claim-due. Process only claimed items and complete or reschedule each claim. If none are due, publish nothing."
 ```
 
 ### Shared Identity
@@ -212,7 +213,24 @@ When `--heartbeat-interval` is set, the harness fires a prompt on an idle agent 
 - **Lower priority than queued events** — if events are pending, they are dispatched first.
 - **Skipped when all agents are busy** — no queuing; the tick is simply dropped.
 - **At most one heartbeat in flight globally** — the next tick is suppressed until the current one completes.
-- **Default prompt** (when `--heartbeat-prompt` is not set) calls `get_feed_actions()` and `get_feed_mentions()` to surface pending work.
+- **Default mode is unchanged** — `--heartbeat-mode feed` runs the historical needs-action and mentions checks.
+- **Schedule mode is opt-in** — `--heartbeat-mode schedules` adds `buzz schedules claim-due` and thread reconciliation before the same feed checks. On a lazy managed-agent pool, only this opted-in mode wakes the pool after restart or idle re-sleep.
+- **Custom prompts still replace the built-in prompt** — set `--heartbeat-mode schedules` as well when a custom schedule prompt must wake a lazy pool.
+
+Schedule mode is driver-neutral. Any managed agent that the owner designated to
+own an outcome, provide status, or coordinate a conversation can create the
+conversation-bound item. The delegation in that conversation names exactly one
+owner, the expected result, and the callback/evidence location. At each
+15-minute check, the driver stays silent and reschedules when work is active;
+it verifies the prior owner is inactive before recovering existing work or
+assigning exactly one replacement. The owner-only internal build applies this
+schedule mode and interval to every managed agent; OSS deployments continue to
+opt in explicitly.
+
+Schedules are private NIP-AE entries owned by the bot that created them. They
+survive process and app restarts. A claim lease prevents overlapping heartbeat
+work; an abandoned claim becomes due again after the lease, so the schedule's
+`check` instruction must reconcile any external effect before repeating it.
 
 Heartbeat is designed for idle periods. Under sustained event load it will rarely fire — that's expected.
 

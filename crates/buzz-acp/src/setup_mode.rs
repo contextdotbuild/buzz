@@ -315,11 +315,9 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
 
     let pubkey_hex = config.keys.public_key().to_hex();
 
-    // Parse BUZZ_AUTH_TAG for relay membership / NIP-OA.
-    let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
+    // Resolve once so a present invalid startup attestation fails closed in
+    // setup mode exactly as it does in the normal harness.
+    let (startup_owner, relay_auth_tag) = crate::resolve_agent_owner(&config)?;
 
     let startup_watermark: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -343,7 +341,6 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
     tracing::info!("setup-mode: connected and subscribed to membership notifications");
 
     // Resolve owner for author-gate (same priority as normal mode).
-    let startup_owner = crate::resolve_agent_owner(&config);
     let owner_cache = crate::OwnerCache::new(startup_owner);
 
     // Discover channels and subscribe (using a "mentions" rule so we get
@@ -428,12 +425,11 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
         // Apply the same author gate as normal mode so the nudge only goes
         // to authors the real agent would have answered. Same DM hardening:
         // in DMs only owner/siblings get a nudge (fail-closed on unknown type).
-        let author_hex = buzz_event.event.pubkey.to_hex();
         let is_dm = crate::is_dm_channel(buzz_event.channel_id, &channel_info).await;
         let allowed = author_allowed(
             &config.respond_to,
             &config.respond_to_allowlist,
-            &author_hex,
+            &buzz_event.event,
             is_dm,
             &owner_cache,
             &rest_client,

@@ -485,6 +485,56 @@ buzz notes get --name dco-check   # exits non-zero: not found
 buzz notes rm --name does-not-exist   # exits non-zero
 ```
 
+### 6.13 Durable follow-through schedules (NIP-AE)
+
+Schedules are encrypted in the calling bot's agent↔owner namespace. Use a
+synthetic agent identity with a valid owner attestation or pass the synthetic
+owner's hex pubkey explicitly.
+
+```bash
+SCHEDULE_ID="cli-follow-through"
+THREAD_ID="$(printf 'a%.0s' {1..64})"
+OWNER_PUBKEY="$(buzz-admin generate-key | awk '/Public key:/ {print $3}')"
+test -n "$OWNER_PUBKEY"
+
+buzz schedules create \
+  --id "$SCHEDULE_ID" \
+  --due-at 2026-08-26T15:00:00Z \
+  --channel "$CHANNEL_ID" \
+  --thread "$THREAD_ID" \
+  --expected-cause "synthetic timeout" \
+  --check "read the synthetic thread first" \
+  --action "record the harmless synthetic check" \
+  --owner "$OWNER_PUBKEY" | jq .
+
+buzz schedules list --owner "$OWNER_PUBKEY" | jq .
+buzz schedules due \
+  --at 2026-08-26T15:01:00Z --owner "$OWNER_PUBKEY" | jq .
+
+CLAIMED=$(buzz schedules claim-due \
+  --at 2026-08-26T15:01:00Z --owner "$OWNER_PUBKEY")
+CLAIM=$(echo "$CLAIMED" | jq -r '.[0].claim.token')
+test -n "$CLAIM"
+
+# An active lease prevents a duplicate wake action.
+buzz schedules claim-due \
+  --at 2026-08-26T15:02:00Z --owner "$OWNER_PUBKEY" | jq -e 'length == 0'
+
+buzz schedules reschedule \
+  --id "$SCHEDULE_ID" --claim "$CLAIM" \
+  --due-at 2026-08-26T16:00:00Z --owner "$OWNER_PUBKEY" | jq .
+
+CLAIM=$(buzz schedules claim-due \
+  --at 2026-08-26T16:01:00Z --owner "$OWNER_PUBKEY" \
+  | jq -r '.[0].claim.token')
+buzz schedules complete \
+  --id "$SCHEDULE_ID" --claim "$CLAIM" --owner "$OWNER_PUBKEY" | jq .
+
+# A completed schedule never becomes due again.
+buzz schedules due \
+  --at 2026-08-27T00:00:00Z --owner "$OWNER_PUBKEY" | jq -e 'length == 0'
+```
+
 ---
 
 ## 7. Error Path Testing

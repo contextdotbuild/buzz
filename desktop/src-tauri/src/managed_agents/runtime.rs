@@ -805,11 +805,11 @@ pub fn spawn_agent_child(
     }
 
     // User env (descriptor.env): fully-layered floor→runtime→definition→global→persona→agent,
-    // reserved-key filtered. Written last so user-explicit values win over Buzz-set env.
+    // reserved-key filtered. User-explicit values win unless internal policy clamps them below.
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
-
+    super::enforce_driver_heartbeat(&mut command, super::owner_only());
     // B5: carry persisted effort; harness resolves thought_level configId at first session.
     // Written AFTER descriptor.env so the canonical persisted value wins over any
     // user-supplied BUZZ_ACP_EFFORT_LEVEL entry, mirroring the A1 model-authority pattern

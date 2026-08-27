@@ -1268,6 +1268,11 @@ impl BuzzClient {
                         .map(|s| s.to_string())
                 })
                 .unwrap_or(body);
+            if status == 400 {
+                if let Some(detail) = message.strip_prefix("conflict:") {
+                    return Err(CliError::Conflict(detail.trim_start().to_string()));
+                }
+            }
             if status == 403 && std::env::var("BUZZ_AUTH_TAG").is_ok() {
                 let message = format!(
                     "{message} (BUZZ_AUTH_TAG is set — it may be stale or revoked; try unsetting it)"
@@ -1656,6 +1661,41 @@ mod retry_policy_tests {
         EventBuilder::new(Kind::TextNote, "hi")
             .sign_with_keys(keys)
             .unwrap()
+    }
+
+    fn make_engram_event(keys: &Keys) -> nostr::Event {
+        EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_AGENT_ENGRAM as u16),
+            "ciphertext",
+        )
+        .sign_with_keys(keys)
+        .unwrap()
+    }
+
+    /// The relay's atomic expected-revision rejection crosses the HTTP bridge as
+    /// a 400 JSON error. It must remain the CLI's explicit non-retryable conflict
+    /// contract so a losing schedule claimer exits before reporting an action lease.
+    #[tokio::test]
+    async fn stored_engram_revision_rejection_is_conflict_exit_5() {
+        let (url, attempts) = test_server(|_n| {
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"conflict: agent engram changed since it was loaded"}"#.to_string(),
+            )
+        })
+        .await;
+        let client = test_client(&url);
+        let event = make_engram_event(client.keys());
+        let error = client.submit_event(event).await.unwrap_err();
+
+        assert!(matches!(error, CliError::Conflict(_)));
+        assert_eq!(
+            error.to_string(),
+            "conflict: agent engram changed since it was loaded"
+        );
+        assert_eq!(crate::error::exit_code(&error), 5);
+        assert!(!crate::error::is_retryable_error(&error));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     /// A moderation command (kind 9040) that fails the first attempt with HTTP 429

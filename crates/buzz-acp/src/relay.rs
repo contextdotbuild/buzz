@@ -2097,8 +2097,15 @@ async fn handle_ws_message(
                     subscription_id,
                     event,
                 } => {
+                    // The relay and transport are not trust boundaries. Verify
+                    // canonical ID and Schnorr signature before any exact-event
+                    // deduplication, authorization, or control dispatch.
+                    let event = match verify_incoming_event(*event).await {
+                        Some(event) => event,
+                        None => return true,
+                    };
                     if subscription_id == OBSERVER_CONTROL_SUB_ID {
-                        match observer_control_tx.try_send(*event) {
+                        match observer_control_tx.try_send(event) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 warn!("observer control event dropped because control channel is full");
@@ -2132,7 +2139,7 @@ async fn handle_ws_message(
                         let ts = event.created_at.as_secs();
                         let buzz_event = BuzzEvent {
                             channel_id: channel_uuid,
-                            event: *event,
+                            event,
                         };
                         let cap = event_tx.max_capacity();
                         let used = cap - event_tx.capacity();
@@ -2168,13 +2175,18 @@ async fn handle_ws_message(
                             Err(mpsc::error::TrySendError::Closed(_)) => return false,
                         }
                     } else if let Some(channel_id) = channel_id_from_sub_id(&subscription_id) {
+                        if !has_exact_channel_binding(&event, channel_id) {
+                            warn!(
+                                channel_id = %channel_id,
+                                event_id = %event.id.to_hex(),
+                                "channel event has missing, ambiguous, or mismatched canonical h tag — dropping"
+                            );
+                            return true;
+                        }
                         let ts = event.created_at.as_secs();
                         let event_id_hex = event.id.to_hex();
                         if state.record_event(channel_id, &event) {
-                            let buzz_event = BuzzEvent {
-                                channel_id,
-                                event: *event,
-                            };
+                            let buzz_event = BuzzEvent { channel_id, event };
                             // Warn at 80% capacity.
                             let cap = event_tx.max_capacity();
                             let used = cap - event_tx.capacity();
@@ -3445,6 +3457,41 @@ async fn dns_flat_sleep(
     }
 }
 
+/// Verify an untrusted relay event off the async runtime.
+async fn verify_incoming_event(event: nostr::Event) -> Option<nostr::Event> {
+    let event_id = event.id.to_hex();
+    match tokio::task::spawn_blocking(move || buzz_core::verify_event(&event).map(|()| event)).await
+    {
+        Ok(Ok(event)) => Some(event),
+        Ok(Err(error)) => {
+            warn!(event_id, %error, "dropping relay event that failed cryptographic verification");
+            None
+        }
+        Err(error) => {
+            warn!(event_id, %error, "dropping relay event after verification task failed");
+            None
+        }
+    }
+}
+
+/// Require exactly one canonical channel tag matching the channel encoded in
+/// the subscription id. The signed event, not any relay-side routing claim,
+/// is the authorization input.
+fn has_exact_channel_binding(event: &nostr::Event, expected: Uuid) -> bool {
+    let mut h_tags = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("h"));
+    let Some(tag) = h_tags.next() else {
+        return false;
+    };
+    if h_tags.next().is_some() {
+        return false;
+    }
+    let parts = tag.as_slice();
+    parts.len() == 2 && parts[0] == "h" && parts[1] == expected.to_string()
+}
+
 /// Extract a channel UUID from the h tag of a Nostr event.
 fn extract_h_tag_uuid(event: &nostr::Event) -> Option<Uuid> {
     event.tags.iter().find_map(|tag| {
@@ -4406,6 +4453,88 @@ mod tests {
             .custom_created_at(ts)
             .sign_with_keys(keys)
             .expect("signing should succeed")
+    }
+
+    fn make_channel_event(keys: &nostr::Keys, channel_id: Uuid) -> Event {
+        EventBuilder::new(nostr::Kind::TextNote, "test")
+            .tags([Tag::parse(["h", &channel_id.to_string()]).expect("valid h tag")])
+            .sign_with_keys(keys)
+            .expect("signing should succeed")
+    }
+
+    #[tokio::test]
+    async fn incoming_verification_rejects_tampered_id_and_signature_before_dedup() {
+        let channel_id = Uuid::new_v4();
+        let event = make_channel_event(&nostr::Keys::generate(), channel_id);
+        let state = BgState::new();
+
+        let mut tampered_id_json = serde_json::to_value(&event).expect("serialize event");
+        tampered_id_json["content"] = json!("tampered after signing");
+        let tampered_id: Event =
+            serde_json::from_value(tampered_id_json).expect("parse tampered event");
+        assert!(verify_incoming_event(tampered_id).await.is_none());
+        assert!(
+            state.seen_ids.current.is_empty() && state.seen_ids.previous.is_empty(),
+            "invalid ID reached exact-event dedup"
+        );
+
+        let mut tampered_sig_json = serde_json::to_value(&event).expect("serialize event");
+        tampered_sig_json["sig"] = json!("0".repeat(128));
+        let tampered_sig: Event =
+            serde_json::from_value(tampered_sig_json).expect("parse tampered signature");
+        assert!(verify_incoming_event(tampered_sig).await.is_none());
+        assert!(
+            state.seen_ids.current.is_empty() && state.seen_ids.previous.is_empty(),
+            "invalid signature reached exact-event dedup"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_replay_reaches_dedup_and_wakes_at_most_once() {
+        let channel_id = Uuid::new_v4();
+        let event = make_channel_event(&nostr::Keys::generate(), channel_id);
+        let mut state = BgState::new();
+
+        let first = verify_incoming_event(event.clone())
+            .await
+            .expect("valid event verifies");
+        assert!(state.record_event(channel_id, &first));
+
+        let replay = verify_incoming_event(event)
+            .await
+            .expect("valid replay verifies");
+        assert!(!state.record_event(channel_id, &replay));
+    }
+
+    #[test]
+    fn channel_binding_requires_one_exact_canonical_h_tag() {
+        let keys = nostr::Keys::generate();
+        let expected = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let valid = make_channel_event(&keys, expected);
+        assert!(has_exact_channel_binding(&valid, expected));
+        assert!(!has_exact_channel_binding(&valid, other));
+
+        let missing = EventBuilder::new(nostr::Kind::TextNote, "missing")
+            .tags([])
+            .sign_with_keys(&keys)
+            .expect("sign missing-h event");
+        assert!(!has_exact_channel_binding(&missing, expected));
+
+        let duplicate = EventBuilder::new(nostr::Kind::TextNote, "duplicate")
+            .tags([
+                Tag::parse(["h", &expected.to_string()]).expect("first h tag"),
+                Tag::parse(["h", &expected.to_string()]).expect("second h tag"),
+            ])
+            .sign_with_keys(&keys)
+            .expect("sign duplicate-h event");
+        assert!(!has_exact_channel_binding(&duplicate, expected));
+
+        let noncanonical = EventBuilder::new(nostr::Kind::TextNote, "extra")
+            .tags([Tag::parse(["h", &expected.to_string(), "extra"]).expect("extra h tag")])
+            .sign_with_keys(&keys)
+            .expect("sign noncanonical-h event");
+        assert!(!has_exact_channel_binding(&noncanonical, expected));
     }
 
     async fn test_ws_pair() -> (WsStream, WebSocketStream<tokio::net::TcpStream>) {

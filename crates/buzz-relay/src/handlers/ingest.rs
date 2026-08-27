@@ -1338,9 +1338,17 @@ fn validate_diff_event(event: &Event) -> Result<(), String> {
 /// * exactly one `p` tag with a 64-hex pubkey (the owner counterparty).
 ///
 /// Content is opaque NIP-44 ciphertext; we do not parse it.
-fn validate_engram_envelope(event: &Event) -> Result<(), String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngramExpectedRevision {
+    Unconditional,
+    Missing,
+    Event([u8; 32]),
+}
+
+fn validate_engram_envelope(event: &Event) -> Result<EngramExpectedRevision, String> {
     let mut d_tags: Vec<&str> = Vec::new();
     let mut p_tags: Vec<&str> = Vec::new();
+    let mut expected_revision_tags: Vec<&[String]> = Vec::new();
     for tag in event.tags.iter() {
         let parts = tag.as_slice();
         if parts.len() < 2 {
@@ -1349,9 +1357,41 @@ fn validate_engram_envelope(event: &Event) -> Result<(), String> {
         match parts[0].as_str() {
             "d" => d_tags.push(&parts[1]),
             "p" => p_tags.push(&parts[1]),
+            "expected-revision" => expected_revision_tags.push(parts),
             _ => {}
         }
     }
+    let expected_revision = match expected_revision_tags.as_slice() {
+        [] => EngramExpectedRevision::Unconditional,
+        [parts] if parts.len() == 2 && parts[1] == "missing" => {
+            EngramExpectedRevision::Missing
+        }
+        [parts]
+            if parts.len() == 2
+                && parts[1].len() == 64
+                && parts[1]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) =>
+        {
+            let decoded = hex::decode(&parts[1])
+                .map_err(|_| "agent-engram expected revision must be lowercase hex".to_string())?;
+            let revision: [u8; 32] = decoded.try_into().map_err(|_| {
+                "agent-engram expected revision must be a 64-character event ID".to_string()
+            })?;
+            EngramExpectedRevision::Event(revision)
+        }
+        [_] => {
+            return Err(
+                "agent-engram `expected-revision` must be exactly `missing` or a 64-character lowercase event ID"
+                    .to_string(),
+            )
+        }
+        _ => {
+            return Err(
+                "agent-engram event must have at most one `expected-revision` tag".to_string(),
+            )
+        }
+    };
     if d_tags.len() != 1 {
         return Err(format!(
             "agent-engram event must have exactly one `d` tag (got {})",
@@ -1389,7 +1429,7 @@ fn validate_engram_envelope(event: &Event) -> Result<(), String> {
     // garbage so a malformed event cannot supersede a valid head via NIP-33
     // replacement and then be silently discarded by readers.
     validate_engram_nip44_content(&event.content)?;
-    Ok(())
+    Ok(expected_revision)
 }
 
 /// Enforce the `shared`-tag shape shared by every kind in
@@ -2725,10 +2765,14 @@ async fn ingest_event_inner(
         validate_diff_event(&event).map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
-    if kind_u32 == KIND_AGENT_ENGRAM {
-        validate_engram_envelope(&event)
-            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
-    }
+    let engram_expected_revision = if kind_u32 == KIND_AGENT_ENGRAM {
+        Some(
+            validate_engram_envelope(&event)
+                .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?,
+        )
+    } else {
+        None
+    };
 
     if kind_u32 == KIND_AGENT_TURN_METRIC {
         validate_agent_turn_metric_envelope(&event)
@@ -3148,11 +3192,56 @@ async fn ingest_event_inner(
                 buzz_db::event::D_TAG_MAX_LEN,
             )));
         }
-        state
-            .db
-            .replace_parameterized_event(tenant.community(), &event, &d_tag, channel_id)
-            .await
-            .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+        if let Some(expected_revision) = engram_expected_revision {
+            use buzz_db::replaceable::{
+                ParameterizedReplacePrecondition, ParameterizedReplaceStatus,
+            };
+
+            let precondition = match &expected_revision {
+                EngramExpectedRevision::Unconditional => {
+                    ParameterizedReplacePrecondition::Unconditional
+                }
+                EngramExpectedRevision::Missing => {
+                    ParameterizedReplacePrecondition::ExpectedMissing
+                }
+                EngramExpectedRevision::Event(revision) => {
+                    ParameterizedReplacePrecondition::ExpectedRevision(revision)
+                }
+            };
+            let result = state
+                .db
+                .replace_parameterized_event_with_precondition(
+                    tenant.community(),
+                    &event,
+                    &d_tag,
+                    channel_id,
+                    precondition,
+                )
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: {e}")))?;
+            match result.status {
+                ParameterizedReplaceStatus::Inserted => (result.event, true),
+                ParameterizedReplaceStatus::Duplicate => (result.event, false),
+                ParameterizedReplaceStatus::Superseded
+                | ParameterizedReplaceStatus::RevisionMissing
+                | ParameterizedReplaceStatus::RevisionMismatch => {
+                    return Err(IngestError::Rejected(
+                        "conflict: agent engram changed since it was loaded".into(),
+                    ));
+                }
+                ParameterizedReplaceStatus::ReplayOnlyMiss => {
+                    return Err(IngestError::Internal(
+                        "error: agent engram replacement unexpectedly used replay-only mode".into(),
+                    ));
+                }
+            }
+        } else {
+            state
+                .db
+                .replace_parameterized_event(tenant.community(), &event, &d_tag, channel_id)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+        }
     } else {
         let thread_params = thread_meta.as_ref().map(|m| m.as_params());
         match state
@@ -4292,6 +4381,63 @@ mod tests {
         let p = "b".repeat(64);
         let ev = make_engram(&[&["d", &d], &["p", &p]], &fake_nip44_v2());
         assert!(validate_engram_envelope(&ev).is_ok());
+    }
+
+    #[test]
+    fn engram_envelope_accepts_atomic_revision_preconditions() {
+        let d = "a".repeat(64);
+        let p = "b".repeat(64);
+        let revision = "c".repeat(64);
+        let missing = make_engram(
+            &[&["d", &d], &["p", &p], &["expected-revision", "missing"]],
+            &fake_nip44_v2(),
+        );
+        assert_eq!(
+            validate_engram_envelope(&missing),
+            Ok(EngramExpectedRevision::Missing)
+        );
+        let expected = make_engram(
+            &[&["d", &d], &["p", &p], &["expected-revision", &revision]],
+            &fake_nip44_v2(),
+        );
+        assert_eq!(
+            validate_engram_envelope(&expected),
+            Ok(EngramExpectedRevision::Event([0xcc; 32]))
+        );
+    }
+
+    #[test]
+    fn engram_envelope_rejects_noncanonical_revision_preconditions() {
+        let d = "a".repeat(64);
+        let p = "b".repeat(64);
+        let lowercase = "c".repeat(64);
+        let uppercase = "C".repeat(64);
+        for tags in [
+            vec![
+                &["d", &d][..],
+                &["p", &p][..],
+                &["expected-revision", &lowercase][..],
+                &["expected-revision", &lowercase][..],
+            ],
+            vec![
+                &["d", &d][..],
+                &["p", &p][..],
+                &["expected-revision", &uppercase][..],
+            ],
+            vec![
+                &["d", &d][..],
+                &["p", &p][..],
+                &["expected-revision", "not-an-event-id"][..],
+            ],
+            vec![
+                &["d", &d][..],
+                &["p", &p][..],
+                &["expected-revision", "missing", "extra"][..],
+            ],
+        ] {
+            let event = make_engram(&tags, &fake_nip44_v2());
+            assert!(validate_engram_envelope(&event).is_err());
+        }
     }
 
     #[test]

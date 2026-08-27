@@ -484,6 +484,29 @@ fn refresh_skill_md_writes_version_file() {
 }
 
 #[test]
+fn refreshed_skill_md_includes_follow_through_schedule_guidance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join(".buzz");
+    ensure_nest_at(&root).unwrap();
+
+    let skill = fs::read_to_string(root.join(".agents/skills/buzz-cli/SKILL.md")).unwrap();
+    assert!(skill.contains("## Durable Follow-Through Schedules"));
+    assert!(skill.contains("buzz schedules claim-due"));
+    assert!(skill.contains("buzz schedules complete"));
+    assert!(skill.contains("buzz schedules reschedule"));
+    assert!(skill.contains("Any agent may be the driver"));
+    assert!(skill.contains("name exactly one owner, the expected result"));
+    assert!(skill.contains("callback/evidence location"));
+    assert!(skill.contains("A missing callback alone does"));
+    assert!(skill.contains("not prove the work stopped"));
+    assert!(skill.contains("verify the prior owner is no longer active"));
+    assert!(skill.contains("assign exactly one replacement"));
+    assert!(skill.contains("atomic expected-revision precondition"));
+    assert!(skill.contains("at a 15-minute"));
+    assert!(skill.contains("interval to every managed agent"));
+}
+
+#[test]
 fn refresh_agents_md_preserves_managed_section() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join(".buzz");

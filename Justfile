@@ -350,6 +350,12 @@ test-unit:
 test-integration:
     ./scripts/run-tests.sh integration
 
+# Prove relay-atomic schedule claiming on a supported Postgres instance. The
+# test creates and drops its own migrated scratch database; TEST_DATABASE_URL
+# must identify an admin database whose user may create databases.
+test-db-atomic-revision-claim:
+    cargo test -p buzz-db --lib tests::concurrent_revision_claim_has_one_winner_and_fences_stale_followups -- --ignored --exact --nocapture
+
 # Regenerate the model-capability normative corpus from the production Rust
 # resolver. The corpus is a golden snapshot, never hand-edited: this runs the
 # `#[ignore]`d writer test in buzz-agent, which serializes `resolve()` over the

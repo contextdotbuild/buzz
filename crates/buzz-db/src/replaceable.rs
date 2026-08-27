@@ -31,6 +31,8 @@ pub enum ParameterizedReplaceStatus {
 pub enum ParameterizedReplacePrecondition<'a> {
     /// Apply normal NIP-33 ordering without a revision precondition.
     Unconditional,
+    /// Require the coordinate to have no live head.
+    ExpectedMissing,
     /// Require the live head to match this validated event ID.
     ExpectedRevision(&'a [u8]),
     /// Accept only an exact live-head replay and perform no mutation otherwise.
@@ -234,6 +236,14 @@ async fn replace_parameterized_event_in_transaction_impl(
             ));
         }
     }
+    if precondition == ParameterizedReplacePrecondition::ExpectedMissing && existing.is_some() {
+        return Ok(ParameterizedReplaceResult::new(
+            event,
+            received_at,
+            channel_id,
+            ParameterizedReplaceStatus::RevisionMismatch,
+        ));
+    }
 
     let dominated = existing
         .iter()
@@ -399,6 +409,29 @@ impl Db {
         d_tag: &str,
         channel_id: Option<Uuid>,
     ) -> Result<(StoredEvent, bool)> {
+        let result = self
+            .replace_parameterized_event_with_precondition(
+                community_id,
+                event,
+                d_tag,
+                channel_id,
+                ParameterizedReplacePrecondition::Unconditional,
+            )
+            .await?;
+        let was_inserted = result.status == ParameterizedReplaceStatus::Inserted;
+        Ok((result.event, was_inserted))
+    }
+
+    /// Atomically replace a NIP-33 event while enforcing the supplied live-head
+    /// precondition across every relay client and runtime machine.
+    pub async fn replace_parameterized_event_with_precondition(
+        &self,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        d_tag: &str,
+        channel_id: Option<Uuid>,
+        precondition: ParameterizedReplacePrecondition<'_>,
+    ) -> Result<ParameterizedReplaceResult> {
         let (mut tx, transaction_timer) = observability::begin_transaction(
             &self.pool,
             TransactionOperation::ReplaceParameterizedEvent,
@@ -413,16 +446,15 @@ impl Db {
                         event,
                         d_tag,
                         channel_id,
-                        ParameterizedReplacePrecondition::Unconditional,
+                        precondition,
                     )
                     .await?;
-                let was_inserted = result.status == ParameterizedReplaceStatus::Inserted;
-                if was_inserted {
+                if result.status == ParameterizedReplaceStatus::Inserted {
                     tx.commit().await?;
                 } else {
                     tx.rollback().await?;
                 }
-                Ok((result.event, was_inserted))
+                Ok(result)
             })
             .await
     }

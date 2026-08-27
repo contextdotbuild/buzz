@@ -5719,6 +5719,182 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn concurrent_revision_claim_has_one_winner_and_fences_stale_followups() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        use replaceable::{ParameterizedReplacePrecondition, ParameterizedReplaceStatus};
+
+        let admin = PgPool::connect(&admin_url().await)
+            .await
+            .expect("connect admin");
+        let (pool, scratch_name) = create_scratch_db(&admin, "atomic_revision_claim").await;
+        let db = Db::from_pool(pool.clone());
+        // Separate handles model relay processes on distinct machines. Their
+        // only shared serialization boundary is Postgres.
+        let first_machine = db.clone();
+        let second_machine = db.clone();
+        let community = CommunityId::from_uuid(make_community(&db.pool).await);
+        let keys = Keys::generate();
+        let d_tag = format!("atomic-claim-{}", Uuid::new_v4().simple());
+        let base = Timestamp::now().as_secs();
+        let event = |content: &str, timestamp: u64| {
+            EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_AGENT_ENGRAM as u16),
+                content,
+            )
+            .tags(vec![Tag::parse(["d", d_tag.as_str()]).expect("d tag")])
+            .custom_created_at(Timestamp::from(timestamp))
+            .sign_with_keys(&keys)
+            .expect("sign agent state")
+        };
+
+        let prior = event("due", base);
+        assert_eq!(
+            db.replace_parameterized_event_with_precondition(
+                community,
+                &prior,
+                &d_tag,
+                None,
+                ParameterizedReplacePrecondition::ExpectedMissing,
+            )
+            .await
+            .expect("seed prior head")
+            .status,
+            ParameterizedReplaceStatus::Inserted
+        );
+
+        let first_claim = event("claimed-by-first-machine", base + 1);
+        let second_claim = event("claimed-by-second-machine", base + 2);
+        let expected_prior = prior.id.as_bytes().as_slice();
+        let (first_result, second_result) = tokio::join!(
+            first_machine.replace_parameterized_event_with_precondition(
+                community,
+                &first_claim,
+                &d_tag,
+                None,
+                ParameterizedReplacePrecondition::ExpectedRevision(expected_prior),
+            ),
+            second_machine.replace_parameterized_event_with_precondition(
+                community,
+                &second_claim,
+                &d_tag,
+                None,
+                ParameterizedReplacePrecondition::ExpectedRevision(expected_prior),
+            ),
+        );
+        let first_status = first_result.expect("first machine claim").status;
+        let second_status = second_result.expect("second machine claim").status;
+        let statuses = [first_status, second_status];
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == ParameterizedReplaceStatus::Inserted)
+                .count(),
+            1,
+            "exactly one machine must acquire the action lease"
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == ParameterizedReplaceStatus::RevisionMismatch)
+                .count(),
+            1,
+            "the losing machine must receive an explicit revision conflict"
+        );
+
+        let winner = if first_status == ParameterizedReplaceStatus::Inserted {
+            &first_claim
+        } else {
+            &second_claim
+        };
+        let loser = if winner.id == first_claim.id {
+            &second_claim
+        } else {
+            &first_claim
+        };
+        let live_ids: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT id FROM events WHERE community_id=$1 AND kind=$2 AND pubkey=$3 \
+             AND d_tag=$4 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(buzz_core::kind::KIND_AGENT_ENGRAM as i32)
+        .bind(keys.public_key().to_bytes())
+        .bind(&d_tag)
+        .fetch_all(&db.pool)
+        .await
+        .expect("load claimed head");
+        assert_eq!(live_ids, vec![winner.id.as_bytes().to_vec()]);
+        let loser_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE community_id=$1 AND id=$2")
+                .bind(community.as_uuid())
+                .bind(loser.id.as_bytes().as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .expect("count losing action rows");
+        assert_eq!(loser_rows, 0, "the losing claimer must perform no action");
+
+        assert_eq!(
+            db.replace_parameterized_event_with_precondition(
+                community,
+                winner,
+                &d_tag,
+                None,
+                ParameterizedReplacePrecondition::ExpectedRevision(expected_prior),
+            )
+            .await
+            .expect("replay winning revision")
+            .status,
+            ParameterizedReplaceStatus::Duplicate,
+            "replaying the winning signed revision must be idempotent"
+        );
+
+        let completed = event("completed-and-rescheduled", base + 3);
+        assert_eq!(
+            db.replace_parameterized_event_with_precondition(
+                community,
+                &completed,
+                &d_tag,
+                None,
+                ParameterizedReplacePrecondition::ExpectedRevision(
+                    winner.id.as_bytes().as_slice(),
+                ),
+            )
+            .await
+            .expect("install later completion state")
+            .status,
+            ParameterizedReplaceStatus::Inserted
+        );
+        let stale = event("stale-claimer-action", base + 4);
+        assert_eq!(
+            db.replace_parameterized_event_with_precondition(
+                community,
+                &stale,
+                &d_tag,
+                None,
+                ParameterizedReplacePrecondition::ExpectedRevision(expected_prior),
+            )
+            .await
+            .expect("reject stale follow-up")
+            .status,
+            ParameterizedReplaceStatus::RevisionMismatch
+        );
+        let final_live_id: Vec<u8> = sqlx::query_scalar(
+            "SELECT id FROM events WHERE community_id=$1 AND kind=$2 AND pubkey=$3 \
+             AND d_tag=$4 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(buzz_core::kind::KIND_AGENT_ENGRAM as i32)
+        .bind(keys.public_key().to_bytes())
+        .bind(&d_tag)
+        .fetch_one(&db.pool)
+        .await
+        .expect("load final state");
+        assert_eq!(final_live_id, completed.id.as_bytes().to_vec());
+
+        drop_scratch_db(&admin, pool, &scratch_name).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn mesh_status_replacement_keeps_one_physical_row() {
         use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 

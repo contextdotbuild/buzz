@@ -176,6 +176,21 @@ fn reserved_keys_include_remote_lifetime_policy() {
 }
 
 #[test]
+fn driver_continuation_policy_remains_user_configurable_for_oss() {
+    let agent = map(&[
+        ("BUZZ_ACP_HEARTBEAT_INTERVAL", "60"),
+        ("BUZZ_ACP_HEARTBEAT_MODE", "feed"),
+    ]);
+
+    assert!(validate_user_env_keys(&agent).is_ok());
+    let merged = merged_user_env(&BTreeMap::new(), &agent);
+    assert_eq!(merged, agent, "OSS heartbeat configuration was stripped");
+    for key in agent.keys() {
+        assert!(!is_reserved_env_key(key), "{key} must remain an OSS knob");
+    }
+}
+
+#[test]
 fn reserved_keys_include_code_execution_surface() {
     // The agent/MCP command + args are what Buzz actually exec's.
     // Overriding lets the user run arbitrary code as the agent.

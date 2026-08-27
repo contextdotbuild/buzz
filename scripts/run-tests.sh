@@ -92,10 +92,9 @@ run_unit_tests() {
 
   # buzz-db migrator/lint unit tests (no infra): guard the embedded-migrator
   # invariant (exactly the consolidated 0001; cutover/backfill stays an operator
-  # script, not startup state) and the tenant-scoping lints. The Postgres-backed
-  # buzz-db tests are #[ignore]d; nothing here (or in integration mode below,
-  # which runs `cargo test -p buzz-db` without --ignored) runs them — they need a
-  # separate isolated-DB gate, so --lib keeps this step infra-free.
+  # script, not startup state) and the tenant-scoping lints. Postgres-backed
+  # tests stay #[ignore]d here; the schedule-claim CAS regression is selected
+  # explicitly by the integration lane below.
   run_test_step "buzz-db unit tests" \
     cargo test -p buzz-db --lib -- --nocapture
 
@@ -131,6 +130,14 @@ run_integration_tests() {
 
   run_test_step "buzz-db tests" \
     cargo test -p buzz-db -- --nocapture
+
+  # Cross-process/machine schedule claim safety is a database contract, not an
+  # in-process unit property. Run the exact ignored regression on the supported
+  # Postgres integration lane so it cannot silently compile without executing.
+  run_test_step "buzz-db atomic revision claim test" \
+    cargo test -p buzz-db --lib \
+      tests::concurrent_revision_claim_has_one_winner_and_fences_stale_followups \
+      -- --ignored --exact --nocapture
 
   if find crates/buzz-auth/tests -maxdepth 1 -name '*.rs' -print -quit 2>/dev/null | grep -q .; then
     run_test_step "buzz-auth integration tests" \

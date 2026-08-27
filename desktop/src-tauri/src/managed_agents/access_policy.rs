@@ -40,6 +40,39 @@
 use super::{validate_respond_to_allowlist, ManagedAgentRecord, RespondTo};
 
 pub(crate) type RespondToEnv = (Vec<(&'static str, String)>, Vec<&'static str>);
+pub(crate) const DRIVER_CONTINUATION_INTERVAL_SECONDS: &str = "900";
+
+/// Internal managed agents all receive the same driver-neutral continuation
+/// heartbeat. The schedule is still empty unless that agent is the designated
+/// driver and explicitly records a delegation, so enabling the timer does not
+/// create a universal supervisor or cross-agent work queue.
+pub(crate) fn driver_follow_through_env_with_policy(
+    internal_managed_build: bool,
+) -> Vec<(&'static str, String)> {
+    if internal_managed_build {
+        vec![
+            (
+                "BUZZ_ACP_HEARTBEAT_INTERVAL",
+                DRIVER_CONTINUATION_INTERVAL_SECONDS.to_string(),
+            ),
+            ("BUZZ_ACP_HEARTBEAT_MODE", "schedules".to_string()),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Apply the internal continuation policy after the fully layered local
+/// descriptor environment so an internal record cannot shadow it. OSS builds
+/// intentionally leave any user-supplied heartbeat configuration untouched.
+pub(crate) fn enforce_driver_heartbeat(
+    command: &mut std::process::Command,
+    internal_managed_build: bool,
+) {
+    for (key, value) in driver_follow_through_env_with_policy(internal_managed_build) {
+        command.env(key, value);
+    }
+}
 
 /// Release packaging sets `BUZZ_BUILD_AGENT_ACCESS_OWNER_ONLY`; OSS/custom
 /// builds do not.
@@ -174,7 +207,6 @@ mod tests {
                 Some("owner-only"),
                 "owner-only runtime env omitted the {label} agent guard",
             );
-
             let (respond_to, allowlist) = projected_access_with_policy(&record, true);
             assert_eq!(
                 respond_to,
@@ -186,5 +218,62 @@ mod tests {
                 "owner-only provider payload retained {label} agent allowlist",
             );
         }
+    }
+
+    #[test]
+    fn internal_build_enables_driver_neutral_fifteen_minute_continuation() {
+        let env: std::collections::HashMap<_, _> = driver_follow_through_env_with_policy(true)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            env.get("BUZZ_ACP_HEARTBEAT_INTERVAL").map(String::as_str),
+            Some("900")
+        );
+        assert_eq!(
+            env.get("BUZZ_ACP_HEARTBEAT_MODE").map(String::as_str),
+            Some("schedules")
+        );
+        for key in env.keys() {
+            assert!(!super::super::env_vars::is_reserved_env_key(key));
+        }
+        assert!(driver_follow_through_env_with_policy(false).is_empty());
+    }
+
+    #[test]
+    fn local_internal_heartbeat_clamps_after_user_env_while_oss_passes_through() {
+        let mut internal = std::process::Command::new("unused");
+        internal
+            .env("BUZZ_ACP_HEARTBEAT_INTERVAL", "60")
+            .env("BUZZ_ACP_HEARTBEAT_MODE", "feed");
+        enforce_driver_heartbeat(&mut internal, true);
+        let internal_env: std::collections::BTreeMap<_, _> = internal
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+            .collect();
+        assert_eq!(
+            internal_env[std::ffi::OsStr::new("BUZZ_ACP_HEARTBEAT_INTERVAL")],
+            "900"
+        );
+        assert_eq!(
+            internal_env[std::ffi::OsStr::new("BUZZ_ACP_HEARTBEAT_MODE")],
+            "schedules"
+        );
+
+        let mut oss = std::process::Command::new("unused");
+        oss.env("BUZZ_ACP_HEARTBEAT_INTERVAL", "60")
+            .env("BUZZ_ACP_HEARTBEAT_MODE", "feed");
+        enforce_driver_heartbeat(&mut oss, false);
+        let oss_env: std::collections::BTreeMap<_, _> = oss
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+            .collect();
+        assert_eq!(
+            oss_env[std::ffi::OsStr::new("BUZZ_ACP_HEARTBEAT_INTERVAL")],
+            "60"
+        );
+        assert_eq!(
+            oss_env[std::ffi::OsStr::new("BUZZ_ACP_HEARTBEAT_MODE")],
+            "feed"
+        );
     }
 }
