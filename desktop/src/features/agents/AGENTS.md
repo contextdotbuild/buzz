@@ -250,6 +250,15 @@ with a TypeScript lookup table or an id comparison in a component.
     refresh only local persona/team/managed-agent caches; they must never
     invalidate the remote relay directory.
 
+15. **The global preferred ACP command is a spawn-time inheritance default.**
+    A blank or bundled-default (`buzz-acp`) per-agent command inherits
+    `GlobalAgentConfig.preferred_acp_command`; a non-default per-agent command
+    remains an explicit override. Spawn, prospective restart snapshots, model
+    discovery, prerequisite discovery, and global-config restart eligibility
+    must all use the same Rust resolver. Frontend creation paths may keep
+    writing `buzz-acp` as the inheritance marker and must not copy the global
+    path into every agent record.
+
 ## The tests that enforce this
 
 - `lib/agentConfigCore.test.mjs` — field model per harness × scope, clearing

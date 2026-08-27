@@ -69,6 +69,7 @@ export const EMPTY_GLOBAL_CONFIG: GlobalAgentConfig = {
   provider: null,
   model: null,
   preferred_runtime: null,
+  preferred_acp_command: null,
 };
 
 const BAKED_STRUCTURED_KEYS = new Set([
@@ -743,6 +744,31 @@ export function AgentConfigFields({
 
   const advancedEditorBlock = (
     <>
+      <div className="space-y-1.5">
+        <label
+          className="text-sm font-medium"
+          htmlFor="global-agent-acp-command"
+        >
+          ACP command
+        </label>
+        <AgentConfigTextInput
+          autoCorrect="off"
+          id="global-agent-acp-command"
+          onChange={(event) =>
+            onConfigChange({
+              ...config,
+              preferred_acp_command: event.target.value || null,
+            })
+          }
+          placeholder="buzz-acp"
+          usePersonaInputStyle={progressiveDefaults}
+          value={config.preferred_acp_command ?? ""}
+        />
+        <p className="text-xs text-muted-foreground">
+          Used when an agent keeps the default Buzz ACP command. Explicit custom
+          commands still win.
+        </p>
+      </div>
       <EnvVarsEditor
         fileSatisfiedKeys={advancedFileSatisfiedEnvKeys}
         hiddenKeys={[

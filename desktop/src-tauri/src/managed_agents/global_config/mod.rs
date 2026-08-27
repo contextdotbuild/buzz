@@ -31,7 +31,7 @@ use crate::managed_agents::env_vars::{
     validate_user_env_keys, DERIVED_PROVIDER_MODEL_ENV_KEYS, MAX_ENV_VALUE_BYTES,
 };
 use crate::managed_agents::storage::{atomic_write_json_restricted, managed_agents_base_dir};
-use crate::managed_agents::types::{AgentDefinition, ManagedAgentRecord};
+use crate::managed_agents::types::{AgentDefinition, ManagedAgentRecord, DEFAULT_ACP_COMMAND};
 
 /// The global agent configuration record.
 ///
@@ -70,6 +70,13 @@ pub struct GlobalAgentConfig {
     /// Preferred ACP runtime for definitions without an explicit runtime.
     #[serde(default)]
     pub preferred_runtime: Option<String>,
+
+    /// Preferred ACP harness command for agents that keep the bundled default.
+    ///
+    /// A blank record command or [`DEFAULT_ACP_COMMAND`] means "inherit".
+    /// Any other per-agent command remains an explicit override.
+    #[serde(default)]
+    pub preferred_acp_command: Option<String>,
 }
 
 /// Validate a `GlobalAgentConfig` before persisting it.
@@ -118,8 +125,12 @@ pub fn validate_global_config(config: &GlobalAgentConfig) -> Result<(), String> 
         ));
     }
 
-    // Validate the structured provider and model fields.
-    for (field, value) in [("provider", &config.provider), ("model", &config.model)] {
+    // Validate the structured string fields.
+    for (field, value) in [
+        ("provider", &config.provider),
+        ("model", &config.model),
+        ("preferred_acp_command", &config.preferred_acp_command),
+    ] {
         if let Some(v) = value {
             // Reject interior NUL bytes — they truncate C-string env injection.
             if v.contains('\0') {
@@ -172,6 +183,32 @@ pub fn normalize_global_config_fields(config: &mut GlobalAgentConfig) {
             config.model = None;
         }
     }
+    if let Some(v) = &config.preferred_acp_command {
+        if v.trim().is_empty() {
+            config.preferred_acp_command = None;
+        }
+    }
+}
+
+/// Resolve the ACP harness command an agent should use.
+///
+/// Existing explicit per-agent commands win. Blank commands and the bundled
+/// default are inheritance markers, so a global preferred command can replace
+/// them without rewriting every managed-agent record. With no global default,
+/// the bundled `buzz-acp` command remains the fallback.
+pub(crate) fn effective_acp_command(record_command: &str, global: &GlobalAgentConfig) -> String {
+    let record_command = record_command.trim();
+    if !record_command.is_empty() && record_command != DEFAULT_ACP_COMMAND {
+        return record_command.to_string();
+    }
+
+    global
+        .preferred_acp_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_ACP_COMMAND)
+        .to_string()
 }
 
 fn global_config_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {

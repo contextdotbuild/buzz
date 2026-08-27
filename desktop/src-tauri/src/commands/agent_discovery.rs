@@ -999,14 +999,18 @@ use managed_node::{
 #[tauri::command]
 pub async fn discover_managed_agent_prereqs(
     input: DiscoverManagedAgentPrereqsRequest,
+    app: tauri::AppHandle,
 ) -> Result<ManagedAgentPrereqsInfo, String> {
+    let global = crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
     tokio::task::spawn_blocking(move || {
-        let acp_command = input
+        let requested_acp_command = input
             .acp_command
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or(DEFAULT_ACP_COMMAND);
+        let acp_command =
+            crate::managed_agents::effective_acp_command(requested_acp_command, &global);
         let mcp_command = input
             .mcp_command
             .as_deref()
@@ -1015,7 +1019,7 @@ pub async fn discover_managed_agent_prereqs(
             .unwrap_or("");
 
         ManagedAgentPrereqsInfo {
-            acp: command_availability(acp_command),
+            acp: command_availability(&acp_command),
             mcp: command_availability(mcp_command),
         }
     })

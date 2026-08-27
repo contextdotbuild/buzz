@@ -1008,6 +1008,8 @@ export type GlobalAgentConfig = {
   model: string | null;
   /** Preferred ACP runtime for agents without a persona-specific runtime. */
   preferred_runtime: string | null;
+  /** Preferred ACP harness command for agents that keep the bundled default. */
+  preferred_acp_command: string | null;
 };
 
 /**

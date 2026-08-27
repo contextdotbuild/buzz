@@ -4,11 +4,11 @@
 //! around the `global_config` module with the standard save-time validation.
 //!
 //! `set_global_agent_config` additionally auto-restarts any running local agent
-//! whose effective env changes under the new global config — including agents
+//! whose effective spawn config changes under the new global config — including agents
 //! that were in setup-listener mode (`NotReady`) but become `Ready`, and agents
-//! already running whose provider/model/env vars change.  This is the only
-//! honest way to deliver new env vars to a running process — the env is baked
-//! at spawn time and cannot be mutated in place.
+//! already running whose provider/model/env vars or inherited ACP command
+//! change. This is the only honest way to deliver spawn-time changes to a
+//! running process.
 
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
@@ -49,7 +49,7 @@ pub fn get_global_agent_config(app: AppHandle) -> Result<GlobalAgentConfig, Stri
 }
 
 /// Validate and persist a new global agent configuration, then auto-restart
-/// any running local agent whose effective env changes under the new config
+/// any running local agent whose effective spawn config changes under the new config
 /// (including setup-listener agents whose readiness flips to `Ready`).
 ///
 /// Strips empty env values before writing (empty = "inherit" semantics), then
@@ -153,8 +153,7 @@ enum RestartOutcome {
 /// - its readiness transitions `NotReady → Ready` (was blocked on missing
 ///   provider/model key, now unblocked), OR
 /// - it was already `Ready`, its process is currently alive, and its effective
-///   env changed (provider, model, or env var update that needs a restart to
-///   take effect, since env is baked at spawn time).
+///   env or inherited ACP command changed (both require a restart).
 fn collect_restart_candidates(
     app: &AppHandle,
     old_global: &GlobalAgentConfig,
@@ -212,8 +211,13 @@ fn collect_restart_candidates(
             // scan and Phase 2.  NotReady→Ready bypasses the alive check
             // because Phase 2 will stop-then-start unconditionally.
             let env_changed = old_ready && old_effective.env != new_effective.env;
-
-            should_restart_on_config_change(old_ready, new_ready, env_changed)
+            let acp_command_changed =
+                crate::managed_agents::effective_acp_command(&record.acp_command, old_global)
+                    != crate::managed_agents::effective_acp_command(
+                        &record.acp_command,
+                        new_global,
+                    );
+            should_restart_on_config_change(old_ready, new_ready, env_changed, acp_command_changed)
         })
         .map(|r| r.pubkey.clone())
         .collect();
@@ -301,7 +305,7 @@ async fn restart_local_agent_on_config_change(
         }
 
         // Re-check the eligibility predicate under lock:
-        //   (old NotReady && new Ready)  OR  (old Ready && env changed)
+        //   (old NotReady && new Ready)  OR  (old Ready && spawn config changed)
         // TODO: busy/mid-turn deferral would slot in here
         //
         // Reuse personas_snapshot from Phase 1 — avoids loading personas again
@@ -316,7 +320,14 @@ async fn restart_local_agent_on_config_change(
         let new_ready = matches!(agent_readiness(&new_effective), AgentReadiness::Ready);
         // Under lock, the alive check was already done above via process_is_running.
         let env_changed = old_ready && old_effective.env != new_effective.env;
-        if !should_restart_on_config_change(old_ready, new_ready, env_changed) {
+        let acp_command_changed =
+            crate::managed_agents::effective_acp_command(&record.acp_command, &old_global_clone)
+                != crate::managed_agents::effective_acp_command(
+                    &record.acp_command,
+                    &new_global_clone,
+                );
+        if !should_restart_on_config_change(old_ready, new_ready, env_changed, acp_command_changed)
+        {
             return Err(format!(
                 "agent {pubkey_owned} restart condition no longer valid under lock"
             ));
@@ -401,6 +412,8 @@ fn persist_last_error(app: &AppHandle, pubkey: &str, error: &str) -> Result<(), 
 /// - `NotReady → Ready`: blocked on missing key, now unblocked.
 /// - `Ready + env changed`: running with stale env; env is baked at spawn time.
 ///   Also covers `Ready → NotReady` when the env changed (key removed).
+/// - ACP command changed: every running process, including a setup listener,
+///   must relaunch under the newly inherited harness command.
 ///
 /// **Readiness invariant (T,F,F):** For `buzz-agent` and `goose`, readiness is
 /// derived purely from `EffectiveAgentEnv` — it cannot flip without an env delta.
@@ -411,8 +424,13 @@ fn persist_last_error(app: &AppHandle, pubkey: &str, error: &str) -> Result<(), 
 /// restart would not repair the missing auth token. If the binary disappears,
 /// the process would already be dead and the PID alive-check in the candidate
 /// scan would have excluded it.
-fn should_restart_on_config_change(old_ready: bool, new_ready: bool, env_changed: bool) -> bool {
-    (!old_ready && new_ready) || (old_ready && env_changed)
+fn should_restart_on_config_change(
+    old_ready: bool,
+    new_ready: bool,
+    env_changed: bool,
+    acp_command_changed: bool,
+) -> bool {
+    (!old_ready && new_ready) || (old_ready && env_changed) || acp_command_changed
 }
 
 #[cfg(test)]
@@ -424,7 +442,7 @@ mod tests {
     fn env_changed_running_agent_is_candidate() {
         // old_ready=true, new_ready=true, env_changed=true
         assert!(
-            should_restart_on_config_change(true, true, true),
+            should_restart_on_config_change(true, true, true, false),
             "running agent with changed env must be restarted"
         );
     }
@@ -434,7 +452,7 @@ mod tests {
     fn unchanged_running_agent_is_not_candidate() {
         // old_ready=true, new_ready=true, env_changed=false
         assert!(
-            !should_restart_on_config_change(true, true, false),
+            !should_restart_on_config_change(true, true, false, false),
             "running agent with identical env must NOT be restarted"
         );
     }
@@ -444,7 +462,7 @@ mod tests {
     fn not_ready_to_ready_is_candidate() {
         // old_ready=false, new_ready=true, env_changed=false (env_changed irrelevant)
         assert!(
-            should_restart_on_config_change(false, true, false),
+            should_restart_on_config_change(false, true, false, false),
             "NotReady → Ready must be a restart candidate"
         );
     }
@@ -455,7 +473,7 @@ mod tests {
     fn ready_to_not_ready_env_changed_is_candidate() {
         // old_ready=true (had key), new_ready=false (key removed), env_changed=true
         assert!(
-            should_restart_on_config_change(true, false, true),
+            should_restart_on_config_change(true, false, true, false),
             "Ready → NotReady with env change must be a restart candidate"
         );
     }
@@ -465,7 +483,7 @@ mod tests {
     fn both_not_ready_unchanged_is_not_candidate() {
         // old_ready=false, new_ready=false, env_changed=false
         assert!(
-            !should_restart_on_config_change(false, false, false),
+            !should_restart_on_config_change(false, false, false, false),
             "both NotReady with no env change must NOT be a candidate"
         );
     }
@@ -476,7 +494,7 @@ mod tests {
         // Changed one unrelated env var but still missing the required key.
         // old_ready=false, new_ready=false, env_changed=true
         assert!(
-            !should_restart_on_config_change(false, false, true),
+            !should_restart_on_config_change(false, false, true, false),
             "NotReady→NotReady (env changed but still broken) must NOT be a candidate"
         );
     }
@@ -490,8 +508,16 @@ mod tests {
     fn not_ready_to_ready_with_env_change_is_candidate() {
         // old_ready=false, new_ready=true, env_changed=true
         assert!(
-            should_restart_on_config_change(false, true, true),
+            should_restart_on_config_change(false, true, true, false),
             "NotReady → Ready (with env change) must be a restart candidate"
+        );
+    }
+
+    #[test]
+    fn not_ready_agent_with_changed_acp_command_is_candidate() {
+        assert!(
+            should_restart_on_config_change(false, false, false, true),
+            "a setup listener must relaunch under the newly inherited ACP command"
         );
     }
 }

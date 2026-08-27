@@ -63,14 +63,16 @@ pub async fn get_agent_models(
             .find(|r| r.pubkey == pubkey)
             .ok_or_else(|| format!("agent {pubkey} not found"))?;
 
-        let resolved = resolve_command(&record.acp_command)
-            .ok_or_else(|| missing_command_message(&record.acp_command, "ACP harness command"))?;
-
         // Resolve the effective harness from the linked persona (mirrors spawn),
         // so model discovery runs against the persona's current harness, not the
         // frozen record snapshot. An explicit per-agent override wins.
         let personas = load_personas(&app).unwrap_or_default();
         let global = load_global_agent_config(&app).unwrap_or_default();
+        let effective_acp_command =
+            crate::managed_agents::effective_acp_command(&record.acp_command, &global);
+        let resolved = resolve_command(&effective_acp_command).ok_or_else(|| {
+            missing_command_message(&effective_acp_command, "ACP harness command")
+        })?;
 
         // Single pure helper — descriptor + authoritative model/provider
         // resolver, packaged so the linked-agent regression test binds the
@@ -199,20 +201,23 @@ pub struct DiscoverAgentModelsInput {
 #[tauri::command]
 pub async fn discover_agent_models(
     input: DiscoverAgentModelsInput,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AgentModelsResponse, String> {
     crate::managed_agents::validate_user_env_keys(&input.env_vars)?;
     // Also validate definition_env (caller-supplied, same trust level as env_vars).
     crate::managed_agents::validate_user_env_keys(&input.definition_env)?;
 
-    let acp_command = input
+    let requested_acp_command = input
         .acp_command
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_ACP_COMMAND);
-    let resolved_acp = resolve_command(acp_command)
-        .ok_or_else(|| missing_command_message(acp_command, "ACP harness command"))?;
+    let global = load_global_agent_config(&app).unwrap_or_default();
+    let acp_command = crate::managed_agents::effective_acp_command(requested_acp_command, &global);
+    let resolved_acp = resolve_command(&acp_command)
+        .ok_or_else(|| missing_command_message(&acp_command, "ACP harness command"))?;
 
     let agent_command = input.agent_command.trim();
     if agent_command.is_empty() {

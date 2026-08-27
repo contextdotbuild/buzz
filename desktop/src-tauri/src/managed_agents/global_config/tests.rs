@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    normalize_global_config_fields, resolve_effective_model_provider, strip_empty_env_vars,
-    validate_global_config, GlobalAgentConfig,
+    effective_acp_command, normalize_global_config_fields, resolve_effective_model_provider,
+    strip_empty_env_vars, validate_global_config, GlobalAgentConfig,
 };
 use crate::managed_agents::{AgentDefinition, BackendKind, ManagedAgentRecord, RespondTo};
 
@@ -153,6 +153,27 @@ fn validate_accepts_valid_provider_and_model() {
     assert!(validate_global_config(&config).is_ok());
 }
 
+#[test]
+fn validate_rejects_preferred_acp_command_with_nul_byte() {
+    let config = GlobalAgentConfig {
+        preferred_acp_command: Some("heartbeat\0evil".to_string()),
+        ..Default::default()
+    };
+    let err = validate_global_config(&config).unwrap_err();
+    assert!(err.contains("preferred_acp_command") && err.contains("NUL"));
+}
+
+#[test]
+fn validate_rejects_preferred_acp_command_exceeding_size_cap() {
+    use crate::managed_agents::env_vars::MAX_ENV_VALUE_BYTES;
+    let config = GlobalAgentConfig {
+        preferred_acp_command: Some("x".repeat(MAX_ENV_VALUE_BYTES + 1)),
+        ..Default::default()
+    };
+    let err = validate_global_config(&config).unwrap_err();
+    assert!(err.contains("preferred_acp_command") && err.contains("maximum allowed length"));
+}
+
 // ── normalize_global_config_fields ───────────────────────────────────────────
 
 #[test]
@@ -227,6 +248,59 @@ fn normalize_none_fields_stay_none() {
     assert!(config.model.is_none());
 }
 
+#[test]
+fn normalize_blank_preferred_acp_command_becomes_none() {
+    let mut config = GlobalAgentConfig {
+        preferred_acp_command: Some("  \t ".to_string()),
+        ..Default::default()
+    };
+    normalize_global_config_fields(&mut config);
+    assert!(config.preferred_acp_command.is_none());
+}
+
+// ── effective_acp_command ───────────────────────────────────────────────────
+
+#[test]
+fn default_record_without_global_uses_bundled_acp() {
+    assert_eq!(
+        effective_acp_command("buzz-acp", &GlobalAgentConfig::default()),
+        "buzz-acp"
+    );
+}
+
+#[test]
+fn default_record_inherits_global_acp_command() {
+    let global = GlobalAgentConfig {
+        preferred_acp_command: Some("/opt/buzz-heartbeat/buzz-acp".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        effective_acp_command("buzz-acp", &global),
+        "/opt/buzz-heartbeat/buzz-acp"
+    );
+}
+
+#[test]
+fn blank_record_inherits_global_acp_command() {
+    let global = GlobalAgentConfig {
+        preferred_acp_command: Some("/opt/buzz-heartbeat/buzz-acp".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        effective_acp_command("  ", &global),
+        "/opt/buzz-heartbeat/buzz-acp"
+    );
+}
+
+#[test]
+fn explicit_record_acp_command_wins_over_global() {
+    let global = GlobalAgentConfig {
+        preferred_acp_command: Some("/opt/buzz-heartbeat/buzz-acp".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(effective_acp_command("custom-acp", &global), "custom-acp");
+}
+
 // ── strip_empty_env_vars ──────────────────────────────────────────────────────
 
 #[test]
@@ -267,6 +341,7 @@ fn roundtrip_serialization() {
         provider: Some("anthropic".to_string()),
         model: Some("claude-opus-4".to_string()),
         preferred_runtime: Some("claude".to_string()),
+        preferred_acp_command: Some("/opt/buzz-heartbeat/buzz-acp".to_string()),
     };
     let json = serde_json::to_string(&config).expect("serialize");
     let back: GlobalAgentConfig = serde_json::from_str(&json).expect("deserialize");
@@ -292,6 +367,10 @@ fn default_global_config_serializes_all_fields() {
     assert!(
         json.contains("\"model\""),
         "serialized JSON must always include model; got: {json}"
+    );
+    assert!(
+        json.contains("\"preferred_acp_command\""),
+        "serialized JSON must always include preferred_acp_command; got: {json}"
     );
 }
 
@@ -594,6 +673,7 @@ fn populated_global_config_round_trips() {
         provider: Some("anthropic".to_string()),
         model: Some("claude-opus-4-5".to_string()),
         preferred_runtime: None,
+        preferred_acp_command: Some("/opt/buzz-heartbeat/buzz-acp".to_string()),
     };
     let json = serde_json::to_string(&original).expect("serialization must not fail");
     let decoded: GlobalAgentConfig =

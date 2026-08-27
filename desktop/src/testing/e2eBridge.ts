@@ -546,6 +546,7 @@ type E2eConfig = {
       provider: string | null;
       model: string | null;
       preferred_runtime?: string | null;
+      preferred_acp_command?: string | null;
     };
     /** Explicit owner-only agent-access capability; independent of baked defaults. */
     ownerOnlyAccessBuild?: boolean;
@@ -8221,6 +8222,7 @@ let mockGlobalAgentConfig: {
   provider: string | null;
   model: string | null;
   preferred_runtime?: string | null;
+  preferred_acp_command?: string | null;
 } | null = null;
 
 // Per-page get_nsec call counter for sequenced error testing.
@@ -13267,6 +13269,7 @@ export function maybeInstallE2eTauriMocks() {
             provider: null,
             model: null,
             preferred_runtime: null,
+            preferred_acp_command: null,
           }
         );
       }
@@ -13290,6 +13293,7 @@ export function maybeInstallE2eTauriMocks() {
               provider: string | null;
               model: string | null;
               preferred_runtime: string | null;
+              preferred_acp_command: string | null;
             };
           }
         ).config;

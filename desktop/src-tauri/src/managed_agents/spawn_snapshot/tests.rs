@@ -625,6 +625,53 @@ fn global_model_change_trips_snapshot_without_model_env_var() {
 }
 
 #[test]
+fn global_acp_command_change_trips_snapshot_for_default_record() {
+    let rec = record();
+    let global_a = GlobalAgentConfig {
+        preferred_acp_command: Some("/opt/heartbeat-a/buzz-acp".to_string()),
+        ..Default::default()
+    };
+    let global_b = GlobalAgentConfig {
+        preferred_acp_command: Some("/opt/heartbeat-b/buzz-acp".to_string()),
+        ..Default::default()
+    };
+
+    let snapshot_a = snapshot(&rec, &[], &[], "wss://ws.example", &global_a);
+    let snapshot_b = snapshot(&rec, &[], &[], "wss://ws.example", &global_b);
+
+    assert_ne!(
+        snapshot_a, snapshot_b,
+        "changing the inherited ACP command must mark the running agent stale"
+    );
+    assert_eq!(
+        snapshot_a
+            .get("acp_command")
+            .and_then(serde_json::Value::as_str),
+        Some("/opt/heartbeat-a/buzz-acp")
+    );
+}
+
+#[test]
+fn explicit_agent_acp_command_ignores_global_default_change() {
+    let mut rec = record();
+    rec.acp_command = "custom-acp".to_string();
+    let global_a = GlobalAgentConfig {
+        preferred_acp_command: Some("/opt/heartbeat-a/buzz-acp".to_string()),
+        ..Default::default()
+    };
+    let global_b = GlobalAgentConfig {
+        preferred_acp_command: Some("/opt/heartbeat-b/buzz-acp".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        snapshot(&rec, &[], &[], "wss://ws.example", &global_a),
+        snapshot(&rec, &[], &[], "wss://ws.example", &global_b),
+        "an explicit per-agent ACP command must remain authoritative"
+    );
+}
+
+#[test]
 fn linked_instance_stale_prompt_bytes_are_inert_at_snapshot_time() {
     // Regression for the split-resolve defect: prompt used to be read from
     // the record's own (possibly Phase-A-snapshot-stale) bytes while

@@ -475,8 +475,10 @@ pub fn spawn_agent_child(
     let stderr = stdout
         .try_clone()
         .map_err(|error| format!("failed to clone log handle: {error}"))?;
-    let resolved_acp_command = resolve_command(&record.acp_command)
-        .ok_or_else(|| missing_command_message(&record.acp_command, "ACP harness command"))?;
+    let effective_acp_command =
+        crate::managed_agents::effective_acp_command(&record.acp_command, &global);
+    let resolved_acp_command = resolve_command(&effective_acp_command)
+        .ok_or_else(|| missing_command_message(&effective_acp_command, "ACP harness command"))?;
     let effective_mcp_command = known_acp_runtime(effective_command)
         .and_then(|r| r.mcp_command)
         .unwrap_or("");
@@ -855,6 +857,7 @@ pub fn spawn_agent_child(
         super::spawn_snapshot::SpawnConfigInputs {
             record,
             descriptor: &descriptor,
+            acp_command: &effective_acp_command,
             relay_url: &effective_relay_url,
             team_instructions: team_instructions.as_deref(),
             system_prompt: effective_prompt.as_deref(),

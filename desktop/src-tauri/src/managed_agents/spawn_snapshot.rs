@@ -67,6 +67,8 @@ pub(crate) fn effective_team_instructions(
 pub(crate) struct SpawnConfigInputs<'a> {
     pub record: &'a ManagedAgentRecord,
     pub descriptor: &'a EffectiveHarnessDescriptor,
+    /// Effective ACP harness command after global-default inheritance.
+    pub acp_command: &'a str,
     /// Resolved workspace/pair relay — never the record's legacy pin.
     pub relay_url: &'a str,
     pub team_instructions: Option<&'a str>,
@@ -160,6 +162,7 @@ impl SpawnConfigSnapshot {
         let SpawnConfigInputs {
             record,
             descriptor,
+            acp_command,
             relay_url,
             team_instructions,
             system_prompt,
@@ -170,7 +173,7 @@ impl SpawnConfigSnapshot {
         let (respond_to, respond_to_allowlist) =
             super::projected_access_with_policy(record, enforced_owner_only);
         Self {
-            acp_command: record.acp_command.clone(),
+            acp_command: acp_command.to_string(),
             command: descriptor.command.clone(),
             args: descriptor.args.clone(),
             mcp_command: known_acp_runtime(&descriptor.command)
@@ -301,6 +304,7 @@ pub(crate) fn prospective_spawn_config_snapshot(
     SpawnConfigSnapshot::from_inputs(SpawnConfigInputs {
         record,
         descriptor: &descriptor,
+        acp_command: &crate::managed_agents::effective_acp_command(&record.acp_command, global),
         // Resolved, not stored: every record spawns on the workspace relay
         // (legacy pins ignored), so a workspace relay change must badge.
         relay_url: &crate::relay::effective_agent_relay_url(&record.relay_url, workspace_relay),
