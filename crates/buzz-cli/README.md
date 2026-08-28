@@ -87,16 +87,32 @@ buzz mem patch <slug> --base-hash <hex> < diff.patch  # or --no-base-hash
 buzz mem rm <slug>
 
 # Durable follow-through schedules (private NIP-AE state)
-buzz schedules create --id review-pr-42 --due-at 2026-08-26T16:00:00Z \
+buzz messages send --channel <uuid> --reply-to <thread-root> \
+  --mention <assignee-pubkey> \
+  --content $'Please own this task.\nExpected result: reviewed patch\nEvidence locator: worktree feature-x'
+buzz schedules create --id review-pr-42 --due-at <15-minutes-from-now> \
   --channel <uuid> --thread <event-id> \
-  --expected-cause "Koder returns the requested patch or the 15-minute check is due" \
-  --check "read the thread and named worktree; determine whether Koder is active" \
-  --action "remain silent and reschedule if active; otherwise verify inactivity and recover once"
+  --assignee <assignee-pubkey> --delegation-event <delegation-event-id> \
+  --expected-result "reviewed patch" --evidence-locator "worktree feature-x" \
+  --receipt git-commit:<40-or-64-lowercase-hex> --material-at <receipt-time> \
+  --expected-cause "the result arrives or the 15-minute check is due" \
+  --check "read the thread and named worktree" \
+  --action "keep for proven progress; otherwise wake once, then redirect"
 buzz schedules list
 buzz schedules claim-due
-buzz schedules complete --id review-pr-42 --claim <claim-token>
-buzz schedules reschedule --id review-pr-42 --claim <claim-token> \
-  --due-at 2026-08-26T17:00:00Z
+buzz schedules reconcile --id review-pr-42 --claim <claim-token> \
+  --decision keep --receipt git-commit:<new-hash> --material-at <receipt-time> \
+  --due-at <15-minutes-from-now>
+buzz schedules reconcile --id review-pr-42 --claim <claim-token> \
+  --decision wake --receipt git-commit:<unchanged-hash> --material-at <receipt-time> \
+  --due-at <15-minutes-from-now> --message "Please continue this task and report material progress."
+buzz schedules reconcile --id review-pr-42 --claim <claim-token> \
+  --decision redirect --receipt git-commit:<unchanged-hash> --material-at <receipt-time> \
+  --due-at <15-minutes-from-now> --replacement <different-agent-pubkey> \
+  --message $'Please take over this task.\nExpected result: reviewed patch\nEvidence locator: worktree feature-x'
+buzz schedules reconcile --id review-pr-42 --claim <claim-token> \
+  --decision complete --receipt git-commit:<result-hash> --material-at <receipt-time> \
+  --message "Completed: reviewed patch is available in worktree feature-x."
 
 # Repository protection
 buzz repos protect list --id my-repo
@@ -118,13 +134,37 @@ claim lifecycle; bots do not hand-edit it. `claim-due` leases returned items for
 abandoned claim becomes recoverable after its lease. The schedule's `check`
 instruction must reconcile any external effect before it is repeated.
 
-The creating agent is the conversation driver for that item; the mechanism is
-not specific to PM or any persona. Before creating one, the driver makes the
-delegation explicit in the conversation with exactly one named owner, expected
-result, and callback/evidence location. On each 15-minute check, active progress
-is silent and rescheduled. Recovery happens only after verifying the prior
-owner is inactive, and it preserves the existing work and evidence location
-while assigning at most one replacement.
+The creating agent is the conversation driver for that item. Any agent can be
+the driver, and any managed agent can be the assignee. Before creating one, the driver makes the
+delegation explicit in the conversation with exactly one named assignee and the
+exact single-line markers `Expected result: ...` and `Evidence locator: ...`.
+New schedules query and verify that event's signature, driver author, channel,
+thread, sole assignee p-tag, and task markers before binding it. Schema-1
+schedules use the claim/CAS-bound `schedules bind` transition once; schema-2
+schedules cannot be read by the old schema-1 binary and therefore cannot be
+silently downgraded. On each 15-minute check,
+`reconcile --decision keep` requires a different task-bound receipt with a later
+material timestamp. Generic presence, an open session, and an unchanged dirty
+worktree are not receipts. Receipt kinds enforce canonical immutable revisions,
+caller-supplied material times cannot be in the future, and the next check must
+remain 10 to 15 minutes away so the next heartbeat cannot skip it. An unchanged checkpoint permits one same-owner wake;
+if it remains unchanged, the next transition must redirect to exactly one
+different assignee while preserving the result and evidence locator. Keep is
+silent. Wake, redirect, and complete require `--message`; the reconcile command
+publishes that exact signed action only after first reserving it in the schedule
+head. A retry republishes the same event ID and resumes the stored pending action
+instead of creating another message. For redirect, `--message` is itself the new
+delegation and must contain the exact single-line result and evidence markers.
+The typed
+schedule keeps every keep, wake, redirect, and completion decision in a durable
+audit. One CAS-protected bidirectional registry prevents either a delegation from
+binding to two schedule IDs or one schedule ID from binding to two delegations.
+When a redirect advances the current binding to its new delegation event, every
+earlier delegation event remains reserved to that schedule. Neither the old nor
+the current event can later be reused by a different schedule.
+When the active head approaches the real NIP-AE plaintext limit, immutable
+content-addressed audit chunks roll into a linked reserved archive; generic `mem set`, `mem patch`,
+and `mem rm` cannot alter either namespace.
 
 The relay atomically enforces the expected prior revision when a schedule head
 is replaced, so two machines using the same agent identity cannot both win a
@@ -204,8 +244,10 @@ first 1,000 events.
 | | `list` | List private schedules, optionally by status |
 | | `due` | Read due items without claiming them |
 | | `claim-due` | Lease due items before a heartbeat acts |
-| | `complete` | Complete a claimed item idempotently |
-| | `reschedule` | Release a claim with a new due time |
+| | `bind` | Claim/CAS-upgrade one legacy item to a verified task binding |
+| | `reconcile` | Record one typed keep, wake, redirect, or completion decision |
+| | `complete` | Complete a claimed legacy item idempotently |
+| | `reschedule` | Release a claimed legacy item with a new due time |
 
 ## Architecture
 

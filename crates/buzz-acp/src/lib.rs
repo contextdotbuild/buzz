@@ -9,6 +9,7 @@ mod pool;
 mod pool_lifecycle;
 mod queue;
 mod relay;
+mod runtime_fence;
 mod setup_mode;
 mod usage;
 
@@ -28,6 +29,7 @@ use buzz_core::observer::{
     decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
     OBSERVER_MAX_PLAINTEXT_LEN,
 };
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use config::{
     AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, Config, DedupMode, HeartbeatMode, ModelsArgs,
@@ -65,6 +67,12 @@ const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for `buzz-acp authenticate`. Browser-based vendor auth can require
 /// human interaction, so it must not share the short probe timeout.
 const AUTHENTICATE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// A due schedule that remains due after a heartbeat gets one bounded retry,
+/// rather than an immediate loop of background turns.
+const SCHEDULE_DUE_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+type ScheduleDueRefresh = std::result::Result<Option<DateTime<Utc>>, String>;
 
 /// Resolve the process working directory for ACP session metadata and prompts.
 ///
@@ -1619,10 +1627,20 @@ fn reconcile_worker_capacity(
         let args = config.agent_args.clone();
         let env = config.persona_env_vars.clone();
         let has_codex = config.has_generated_codex_config;
+        let runtime_revocation = pool.runtime_revocation();
         let observer = observer.clone();
         let guard = RespawnGuard::new(idx, respawn_tx.clone());
         respawn_tasks.spawn(async move {
-            let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+            let result = spawn_and_init(
+                &cmd,
+                &args,
+                &env,
+                has_codex,
+                idx,
+                runtime_revocation,
+                observer,
+            )
+            .await;
             guard.send(result);
         });
     }
@@ -2176,10 +2194,27 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
+    // Create the process-local authority before any ACP child starts. The
+    // durable lease is acquired below, but eager initialization must already
+    // register its children so a failed or superseded startup can revoke them
+    // without waiting for the main loop.
+    let runtime_revocation = startup_owner
+        .as_ref()
+        .map(|_| runtime_fence::RuntimeRevocation::new());
+
     let mut pool = if config.lazy_pool {
-        AgentPool::from_slots((0..config.agents).map(|_| None).collect())
+        let mut pool = AgentPool::from_slots((0..config.agents).map(|_| None).collect());
+        if let Some(revocation) = runtime_revocation.clone() {
+            pool.bind_runtime_revocation(revocation);
+        }
+        pool
     } else {
-        initialize_agent_pool(&PoolStartup::from_config(&config, observer.clone()), None).await?
+        initialize_agent_pool(
+            &PoolStartup::from_config(&config, observer.clone()),
+            runtime_revocation.clone(),
+            None,
+        )
+        .await?
     };
     let mut pool_ready = !config.lazy_pool;
     let mut pool_lifecycle: PoolLifecycle<AgentPool> = PoolLifecycle::listening();
@@ -2360,6 +2395,38 @@ async fn tokio_main() -> Result<()> {
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
 
+    // Relay delivery fans out to every process subscribed under this key. A
+    // process-local seen-event set therefore cannot stop two machines running
+    // the same managed identity from both answering one event. Acquire the
+    // encrypted per-identity lease before advertising readiness or consuming
+    // the buffered subscription stream. Unowned development identities retain
+    // the historical behavior because they have no private owner namespace in
+    // which to store the fence.
+    let runtime_fence_guard = match startup_owner.as_deref() {
+        Some(owner_hex) => {
+            let owner = PublicKey::from_hex(owner_hex)
+                .context("configured agent owner is not a valid public key")?;
+            Some(
+                runtime_fence::acquire(
+                    &relay.rest_client(),
+                    owner,
+                    runtime_revocation
+                        .clone()
+                        .expect("owner-backed runtime created revocation authority"),
+                )
+                .await?,
+            )
+        }
+        None => {
+            tracing::warn!("runtime identity fence disabled because no agent owner is configured");
+            None
+        }
+    };
+    debug_assert_eq!(
+        pool.runtime_revocation().is_some(),
+        runtime_fence_guard.is_some()
+    );
+
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
     // a durable readiness boundary before they send a startup mention.
@@ -2433,10 +2500,19 @@ async fn tokio_main() -> Result<()> {
         None
     };
     let mut heartbeat_in_flight = false;
-    // A schedules heartbeat must wake a sleeping lazy pool. The flag survives
-    // the asynchronous pool-start boundary and is cleared only after the
-    // heartbeat turn is actually dispatched.
-    let mut heartbeat_wake_pending = false;
+    // A schedules heartbeat must survive either an asynchronous lazy-pool
+    // wake or a tick that arrives while the previous heartbeat is still in
+    // flight. Clear it only after the owed heartbeat turn is dispatched.
+    let mut heartbeat_pending = false;
+    let schedule_due_enabled = schedule_due_refresh_enabled(
+        heartbeat.is_some(),
+        config.heartbeat_mode,
+        ctx.agent_owner_pubkey.is_some(),
+    );
+    let (schedule_due_tx, mut schedule_due_rx) = mpsc::channel::<ScheduleDueRefresh>(1);
+    let mut schedule_due_refresh_requested = schedule_due_enabled;
+    let mut schedule_due_refresh_in_flight = false;
+    let mut schedule_due_wake: Option<tokio::time::Instant> = None;
 
     let mut presence_heartbeat = if config.presence_enabled {
         let interval = Duration::from_secs(60);
@@ -2522,6 +2598,12 @@ async fn tokio_main() -> Result<()> {
     //      `IN_FLIGHT_DEADLINE_SECS` expires.
     let (steer_ack_tx, mut steer_ack_rx) = mpsc::unbounded_channel::<SteerAckEvent>();
 
+    let (runtime_fence_loss_tx, mut runtime_fence_loss_rx) = mpsc::channel::<String>(1);
+    let mut runtime_fence_task = runtime_fence_guard.clone().map(|guard| {
+        let rest = relay.rest_client();
+        tokio::spawn(runtime_fence::maintain(rest, guard, runtime_fence_loss_tx))
+    });
+
     // ── Step 7: Shutdown signal ───────────────────────────────────────────────
     let (shutdown_tx, mut shutdown_rx) = watch::channel(());
 
@@ -2599,7 +2681,41 @@ async fn tokio_main() -> Result<()> {
         Wake(u32, Result<AgentPool, String>),
     }
 
+    let mut runtime_fence_lost = false;
     loop {
+        if runtime_fence_guard
+            .as_ref()
+            .is_some_and(|guard| guard.revocation().is_revoked())
+        {
+            runtime_fence_lost = true;
+            tracing::error!(
+                "runtime identity fence was revoked independently — cleaning up killed workers"
+            );
+            shutdown_agent_pool_after_fence_loss(&mut pool).await;
+            break;
+        }
+
+        // Schedule mode complements the fixed heartbeat with one exact
+        // deadline derived from the encrypted schedule heads. Refresh after
+        // every completed agent turn because any agent may create or advance a
+        // delegation schedule. Coalesce concurrent completions into one
+        // follow-up query rather than scanning once per worker.
+        if schedule_due_refresh_requested && !schedule_due_refresh_in_flight && !heartbeat_in_flight
+        {
+            schedule_due_refresh_requested = false;
+            if let Some(owner) = ctx.agent_owner_pubkey {
+                schedule_due_refresh_in_flight = true;
+                let rest = ctx.rest_client.clone();
+                let keys = ctx.agent_keys.clone();
+                let tx = schedule_due_tx.clone();
+                tokio::spawn(async move {
+                    let result =
+                        engram_fetch::fetch_earliest_follow_through_due(&rest, &keys, &owner).await;
+                    let _ = tx.send(result).await;
+                });
+            }
+        }
+
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
@@ -2607,7 +2723,7 @@ async fn tokio_main() -> Result<()> {
         // busy spin — whenever the queued work drained after a failed wake.
         let mut lazy_wake_work_pending = false;
         if config.lazy_pool && !pool_ready {
-            lazy_wake_work_pending = queue.has_flushable_work() || heartbeat_wake_pending;
+            lazy_wake_work_pending = queue.has_flushable_work() || heartbeat_pending;
             if let Some(attempt) = pool_lifecycle
                 .start_wake_if_due(lazy_wake_work_pending, tokio::time::Instant::now())
             {
@@ -2622,10 +2738,12 @@ async fn tokio_main() -> Result<()> {
                 let startup = PoolStartup::from_config(&config, observer.clone()).for_lazy_wake();
                 let wake_tx = wake_tx.clone();
                 let wake_shutdown = shutdown_rx.clone();
+                let wake_revocation = pool.runtime_revocation();
                 wake_tasks.spawn(async move {
-                    let result = initialize_agent_pool(&startup, Some(wake_shutdown))
-                        .await
-                        .map_err(|error| error.to_string());
+                    let result =
+                        initialize_agent_pool(&startup, wake_revocation, Some(wake_shutdown))
+                            .await
+                            .map_err(|error| error.to_string());
                     if let Err(error) = wake_tx.send((attempt, result)).await {
                         let (_attempt, result) = error.0;
                         if let Ok(mut abandoned_pool) = result {
@@ -2639,7 +2757,7 @@ async fn tokio_main() -> Result<()> {
         let flushable_channel_work = queue.has_flushable_work();
         if pending_heartbeat_dispatch_allowed(
             pool_ready,
-            heartbeat_wake_pending,
+            heartbeat_pending,
             heartbeat_in_flight,
             flushable_channel_work,
             queue.has_in_flight(),
@@ -2650,7 +2768,11 @@ async fn tokio_main() -> Result<()> {
             &mut heartbeat_in_flight,
             config.heartbeat_mode,
         ) {
-            heartbeat_wake_pending = false;
+            heartbeat_pending = false;
+            schedule_due_wake = None;
+            if schedule_due_refresh_in_flight {
+                schedule_due_refresh_requested = true;
+            }
             last_activity = tokio::time::Instant::now();
         }
 
@@ -2661,7 +2783,7 @@ async fn tokio_main() -> Result<()> {
             reconcile_worker_capacity(
                 &pool,
                 &mut queue,
-                heartbeat_wake_pending,
+                heartbeat_pending,
                 heartbeat_in_flight,
                 &config,
                 &mut crash_history,
@@ -2724,6 +2846,7 @@ async fn tokio_main() -> Result<()> {
         }
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
+        let mut runtime_fence_failure = None;
         let pool_event: Option<PoolEvent> = {
             let (result_rx, join_set) = pool.rx_and_join_set();
             tokio::select! {
@@ -2756,6 +2879,12 @@ async fn tokio_main() -> Result<()> {
                 }
                 Some((attempt, result)) = wake_rx.recv(), if config.lazy_pool && !pool_ready => {
                     Some(PoolEvent::Wake(attempt, result))
+                }
+                fence_loss = runtime_fence_loss_rx.recv(), if runtime_fence_guard.is_some() => {
+                    runtime_fence_failure = Some(fence_loss.unwrap_or_else(|| {
+                        "runtime identity fence maintenance ended unexpectedly".to_string()
+                    }));
+                    None
                 }
                 // Gated on pending work: with an empty queue there is nothing
                 // for the retry to dispatch, and a past `retry_at` would
@@ -3261,6 +3390,7 @@ async fn tokio_main() -> Result<()> {
                             idle_pool_sleep_seconds = config.idle_pool_sleep_secs,
                             "idle pool sleep bound reached — tearing pool back to lazy state"
                         );
+                        let runtime_revocation = pool.runtime_revocation();
                         shutdown_agent_pool(&mut pool).await;
                         // Return to the exact pre-wake lazy state: empty slots,
                         // Listening lifecycle. The top-of-loop wake path re-wakes
@@ -3268,6 +3398,9 @@ async fn tokio_main() -> Result<()> {
                         pool = AgentPool::from_slots(
                             (0..config.agents).map(|_| None).collect(),
                         );
+                        if let Some(revocation) = runtime_revocation {
+                            pool.bind_runtime_revocation(revocation);
+                        }
                         pool_ready = false;
                         pool_lifecycle = PoolLifecycle::listening();
                         last_activity = tokio::time::Instant::now();
@@ -3282,6 +3415,56 @@ async fn tokio_main() -> Result<()> {
                     }
                     None
                 }
+                refresh = schedule_due_rx.recv(), if schedule_due_refresh_in_flight => {
+                    let _ = result_rx;
+                    schedule_due_refresh_in_flight = false;
+                    if schedule_due_refresh_requested {
+                        // A turn completed while this scan was running. Its
+                        // schedule mutation may supersede the result, so let
+                        // the next loop run one fresh coalesced scan.
+                        tracing::debug!("discarding stale schedule due refresh");
+                    } else {
+                        match refresh {
+                            Some(Ok(earliest_due)) => {
+                                schedule_due_wake = schedule_due_wake_at(
+                                    earliest_due,
+                                    Utc::now(),
+                                    tokio::time::Instant::now(),
+                                );
+                                if let Some(wake_at) = schedule_due_wake {
+                                    tracing::debug!(?wake_at, "schedule due wake armed");
+                                } else {
+                                    tracing::debug!("no pending follow-through schedule heads");
+                                }
+                            }
+                            Some(Err(error)) => {
+                                schedule_due_wake = None;
+                                tracing::warn!(
+                                    "schedule due refresh failed; fixed heartbeat remains active: {error}"
+                                );
+                            }
+                            None => {
+                                schedule_due_wake = None;
+                                tracing::warn!(
+                                    "schedule due refresh channel closed; fixed heartbeat remains active"
+                                );
+                            }
+                        }
+                    }
+                    None
+                }
+                _ = async {
+                    match schedule_due_wake {
+                        Some(wake_at) => tokio::time::sleep_until(wake_at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = result_rx;
+                    schedule_due_wake = None;
+                    heartbeat_pending = true;
+                    tracing::info!("schedule_due_heartbeat_pending");
+                    None
+                }
                 _ = async {
                     match heartbeat.as_mut() {
                         Some(hb) => hb.tick().await,
@@ -3289,9 +3472,18 @@ async fn tokio_main() -> Result<()> {
                     }
                 } => {
                     let _ = result_rx;
-                    if !pool_ready {
+                    if heartbeat_tick_requests_due_refresh(
+                        config.heartbeat_mode,
+                        heartbeat_in_flight,
+                    ) {
+                        // The active turn may have advanced its schedule after
+                        // this fixed tick. Refresh the durable heads when it
+                        // finishes; do not blindly owe a second full heartbeat.
+                        schedule_due_refresh_requested = true;
+                        tracing::debug!("heartbeat_tick_requested_due_refresh");
+                    } else if !pool_ready {
                         if config.lazy_pool && heartbeat_wakes_lazy_pool(config.heartbeat_mode) {
-                            heartbeat_wake_pending = true;
+                            heartbeat_pending = true;
                             tracing::info!("heartbeat_waking_lazy_pool");
                         } else {
                             tracing::debug!("heartbeat_skipped_pool_not_ready");
@@ -3318,6 +3510,12 @@ async fn tokio_main() -> Result<()> {
                             &mut heartbeat_in_flight,
                             config.heartbeat_mode,
                         );
+                        if dispatched && config.heartbeat_mode == HeartbeatMode::Schedules {
+                            schedule_due_wake = None;
+                            if schedule_due_refresh_in_flight {
+                                schedule_due_refresh_requested = true;
+                            }
+                        }
                         last_activity = activity_after_heartbeat_dispatch(
                             config.heartbeat_mode,
                             dispatched,
@@ -3379,6 +3577,13 @@ async fn tokio_main() -> Result<()> {
             }
         };
 
+        if let Some(reason) = runtime_fence_failure {
+            runtime_fence_lost = true;
+            tracing::error!(%reason, "runtime identity fence lost — killing every worker before lease expiry");
+            shutdown_agent_pool_after_fence_loss(&mut pool).await;
+            break;
+        }
+
         match pool_event {
             Some(PoolEvent::Result(result)) => {
                 // Stop typing indicator for the completed channel.
@@ -3400,6 +3605,9 @@ async fn tokio_main() -> Result<()> {
                 ) == LoopAction::Exit
                 {
                     break;
+                }
+                if schedule_due_enabled {
+                    schedule_due_refresh_requested = true;
                 }
                 if drain_ready_join_results(
                     &mut pool,
@@ -3457,6 +3665,9 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                 );
+                if schedule_due_enabled {
+                    schedule_due_refresh_requested = true;
+                }
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
                     tracing::error!("all agents dead — exiting");
                     break;
@@ -3631,6 +3842,7 @@ async fn tokio_main() -> Result<()> {
                 }
             }
             Some(PoolEvent::Wake(attempt, result)) => {
+                let runtime_revocation = pool.runtime_revocation();
                 let completion = result.as_ref().map(|_| ()).map_err(|error| error.clone());
                 if let Err(error) =
                     pool_lifecycle.complete_wake(attempt, result, tokio::time::Instant::now())
@@ -3643,6 +3855,9 @@ async fn tokio_main() -> Result<()> {
                         pool = pool_lifecycle
                             .take_ready()
                             .expect("successful wake stores a ready pool");
+                        if let Some(revocation) = runtime_revocation {
+                            pool.bind_runtime_revocation(revocation);
+                        }
                         pool_ready = true;
                         emit_runtime_lifecycle(
                             observer.as_ref(),
@@ -3703,41 +3918,45 @@ async fn tokio_main() -> Result<()> {
         }
     }
 
-    tracing::info!("shutdown: waiting for in-flight prompts");
-    // 30 s is generous for in-flight prompts to be cancelled; using
-    // max_turn_duration here would cause Ctrl+C to hang for up to an hour.
-    let grace = Duration::from_secs(30);
-    // Best-effort drain of both join_set and result_rx during the grace period.
-    // Tasks that finish normally send their OwnedAgent through result_rx — we
-    // explicitly shut them down here to reap child processes. If the grace
-    // period expires, remaining tasks are aborted and fall back to
-    // AcpClient::Drop (start_kill + try_wait — best-effort, not guaranteed).
-    let (rx_ref, js_ref) = pool.rx_and_join_set();
-    let shutdown_result = tokio::time::timeout(grace, async {
-        loop {
-            tokio::select! {
-                result = js_ref.join_next() => {
-                    match result {
-                        Some(Err(e)) => tracing::warn!("task error during shutdown: {e}"),
-                        Some(Ok(())) => {}
-                        None => break, // join_set empty
+    if runtime_fence_lost {
+        tracing::info!("shutdown: fence-loss path already killed all prompt workers");
+    } else {
+        tracing::info!("shutdown: waiting for in-flight prompts");
+        // 30 s is generous for in-flight prompts to be cancelled; using
+        // max_turn_duration here would cause Ctrl+C to hang for up to an hour.
+        let grace = Duration::from_secs(30);
+        // Best-effort drain of both join_set and result_rx during the grace period.
+        // Tasks that finish normally send their OwnedAgent through result_rx — we
+        // explicitly shut them down here to reap child processes. If the grace
+        // period expires, remaining tasks are aborted and fall back to
+        // AcpClient::Drop (start_kill + try_wait — best-effort, not guaranteed).
+        let (rx_ref, js_ref) = pool.rx_and_join_set();
+        let shutdown_result = tokio::time::timeout(grace, async {
+            loop {
+                tokio::select! {
+                    result = js_ref.join_next() => {
+                        match result {
+                            Some(Err(e)) => tracing::warn!("task error during shutdown: {e}"),
+                            Some(Ok(())) => {}
+                            None => break, // join_set empty
+                        }
                     }
-                }
-                maybe_result = rx_ref.recv() => {
-                    if let Some(mut pr) = maybe_result {
-                        let idx = pr.agent.index;
-                        pr.agent.acp.shutdown().await;
-                        tracing::debug!(agent = idx, "reaped checked-out agent on shutdown");
+                    maybe_result = rx_ref.recv() => {
+                        if let Some(mut pr) = maybe_result {
+                            let idx = pr.agent.index;
+                            pr.agent.acp.shutdown().await;
+                            tracing::debug!(agent = idx, "reaped checked-out agent on shutdown");
+                        }
+                        // If None, channel closed — tasks are done.
                     }
-                    // If None, channel closed — tasks are done.
                 }
             }
+        })
+        .await;
+        if shutdown_result.is_err() {
+            tracing::warn!("grace period expired, aborting remaining tasks");
+            pool.join_set.shutdown().await;
         }
-    })
-    .await;
-    if shutdown_result.is_err() {
-        tracing::warn!("grace period expired, aborting remaining tasks");
-        pool.join_set.shutdown().await;
     }
     // Drain any remaining results that arrived after join_set drained but
     // before tasks were aborted.
@@ -3769,6 +3988,25 @@ async fn tokio_main() -> Result<()> {
         if let Ok((mut acp, _, _)) = rr.result {
             acp.shutdown().await;
             tracing::debug!(agent = rr.index, "reaped respawned agent on shutdown");
+        }
+    }
+
+    // Keep renewing while prompts drain, then release only after no old
+    // worker can publish a foreground answer. A crash needs no cleanup: the
+    // short lease expires and a replacement can take over.
+    if let Some(handle) = runtime_fence_task.take() {
+        handle.abort();
+    }
+    if let Some(guard) = runtime_fence_guard.as_ref() {
+        match tokio::time::timeout(
+            Duration::from_secs(3),
+            runtime_fence::release(&relay.rest_client(), guard),
+        )
+        .await
+        {
+            Ok(Ok(())) => tracing::info!("released durable runtime identity fence"),
+            Ok(Err(error)) => tracing::warn!(%error, "failed to release runtime identity fence"),
+            Err(_) => tracing::warn!("runtime identity fence release timed out"),
         }
     }
 
@@ -3901,18 +4139,54 @@ fn foreground_dispatch_allowed(pool_ready: bool, heartbeat_in_flight: bool) -> b
 
 fn pending_heartbeat_dispatch_allowed(
     pool_ready: bool,
-    heartbeat_wake_pending: bool,
+    heartbeat_pending: bool,
     heartbeat_in_flight: bool,
     flushable_channel_work: bool,
     channel_turn_in_flight: bool,
     idle_worker_available: bool,
 ) -> bool {
     pool_ready
-        && heartbeat_wake_pending
+        && heartbeat_pending
         && !heartbeat_in_flight
         && !flushable_channel_work
         && !channel_turn_in_flight
         && idle_worker_available
+}
+
+fn heartbeat_tick_requests_due_refresh(
+    heartbeat_mode: HeartbeatMode,
+    heartbeat_in_flight: bool,
+) -> bool {
+    heartbeat_mode == HeartbeatMode::Schedules && heartbeat_in_flight
+}
+
+fn schedule_due_refresh_enabled(
+    heartbeat_configured: bool,
+    heartbeat_mode: HeartbeatMode,
+    owner_configured: bool,
+) -> bool {
+    heartbeat_configured && heartbeat_mode == HeartbeatMode::Schedules && owner_configured
+}
+
+/// Map the earliest durable schedule claim time onto Tokio's monotonic clock.
+///
+/// Future deadlines are armed exactly. An already-due head receives a bounded
+/// retry delay so a malformed or repeatedly failing heartbeat cannot create a
+/// busy loop.
+fn schedule_due_wake_at(
+    earliest_due: Option<DateTime<Utc>>,
+    wall_now: DateTime<Utc>,
+    monotonic_now: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    let due = earliest_due?;
+    let delay = if due <= wall_now {
+        SCHEDULE_DUE_RETRY_DELAY
+    } else {
+        due.signed_duration_since(wall_now)
+            .to_std()
+            .unwrap_or(SCHEDULE_DUE_RETRY_DELAY)
+    };
+    Some(monotonic_now + delay)
 }
 
 /// Attempt the non-cancelling (ACP) steer for a freshly-queued event.
@@ -4634,6 +4908,7 @@ fn recover_panicked_agent(
     // Panics count as crashes for the circuit breaker.
     // The panicked task already dropped the AcpClient, so we just need to
     // check the circuit and spawn a fresh agent in the background.
+    let runtime_revocation = pool.runtime_revocation();
     let slot = &mut crash_history[i];
 
     let delay = match slot.record_crash() {
@@ -4666,7 +4941,16 @@ fn recover_panicked_agent(
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(
+            &cmd,
+            &args,
+            &env,
+            has_codex,
+            i,
+            runtime_revocation,
+            observer,
+        )
+        .await;
         guard.send(result);
     });
 }
@@ -4829,13 +5113,21 @@ mod agent_draft_prompt_tests {
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("Any agent may delegate work"));
         assert!(prompt.contains("the **driver** is the one agent"));
-        assert!(prompt.contains("name exactly one owner, the expected result"));
+        assert!(prompt.contains("name exactly one assignee, the expected result"));
         assert!(prompt.contains("where the callback or evidence will appear"));
         assert!(prompt.contains("15 minutes after each delegation or recheck"));
         assert!(prompt.contains("A missing callback alone does not prove the work stopped"));
         assert!(prompt.contains("publish nothing"));
-        assert!(prompt.contains("Verify the prior owner is no longer active"));
-        assert!(prompt.contains("assign exactly one replacement"));
+        assert!(prompt.contains("exact assignee pubkey, delegation event"));
+        assert!(prompt.contains("Generic `online` presence"));
+        assert!(prompt.contains("wake the same assignee once"));
+        assert!(prompt.contains("redirect it to exactly one different assignee"));
+        assert!(prompt.contains("`buzz schedules reconcile`"));
+        assert!(prompt.contains("Wake, redirect, and complete each require `--message`"));
+        assert!(prompt.contains("do not send a separate message first"));
+        assert!(prompt.contains("The redirect `--message` is the new delegation"));
+        assert!(prompt.contains("exactly one `Expected result: ...` line"));
+        assert!(prompt.contains("exactly one `Evidence locator: ...` line"));
         assert!(prompt.contains("Never duplicate an active owner"));
         assert!(!prompt.contains("PM Bot is the driver"));
     }
@@ -4866,43 +5158,64 @@ fn schedule_heartbeat_prompt() -> String {
     format!(
         "[System: Follow-through heartbeat]\nTime: {now}\n\n\
          You have NO incoming message, active channel context, or automatically injected core\n\
-         memory. This opted-in heartbeat processes your private due follow-through schedule and\n\
-         pending workflow actions.\n\n\
+         memory. This opted-in heartbeat processes only your private due follow-through schedule.\n\n\
          Follow-through tasks:\n\
          1. Run `buzz schedules claim-due`. This claims only due items owned by this agent. A due\n\
-            item means you are the designated driver for that conversation; this behavior is not\n\
-            specific to PM or to any agent persona.\n\
+            item means you are the designated driver for that conversation. Any agent can be the\n\
+            driver, and any managed agent can be the assignee.\n\
          2. For each claimed item, use its channel_id and thread_id with\n\
             `buzz messages thread --channel <channel_id> --event <thread_id>`. Find the explicit\n\
-            delegation naming one owner, its expected result, and the callback/evidence location.\n\
-            Follow the item's `check` before its `action`, and inspect that named location.\n\
+            delegation naming one assignee, its expected result, and the callback/evidence location.\n\
+            Verify that the stored task binding matches the exact assignee pubkey and delegation\n\
+            event, follow the item's `check` before its `action`, and inspect that named location.\n\
+            A valid delegation event is authored by this driver in the same channel/thread,\n\
+            p-tags exactly one assignee, and contains exact `Expected result: ...` and\n\
+            `Evidence locator: ...` lines. If a claimed item is legacy schema 1, use its claim\n\
+            with `buzz schedules bind`, that verified event, and an immutable baseline receipt;\n\
+            then stop processing that item until its next due claim.\n\
          3. Distinguish material progress from genuinely stopped work. A missing callback alone is\n\
-            not evidence of a stop. If the owner is active or has made material progress, use\n\
-            `buzz schedules reschedule` for 15 minutes later and publish nothing.\n\
-         4. Only for genuinely stopped work, verify the prior owner is no longer active before\n\
-            recovering its existing work or assigning exactly one replacement. Preserve the\n\
-            existing context, expected result, and callback/evidence location. Publish only the\n\
-            material recovery action or a genuine blocker requiring the owner.\n\
-         5. Immediately before any `buzz messages send`, re-read the target thread. If a newer\n\
-            message from this identity already covers this exact claimed obligation and result,\n\
+            not evidence of a stop. Keep only for a newer task-bound receipt: a Buzz event,\n\
+            Codex/Cursor turn, commit or PR head, document hash, worktree fingerprint, or external\n\
+            job revision tied to this delegation. Use the canonical receipt shape required by the\n\
+            CLI; a caller-invented status or presence label is not a revision. Generic online presence,\n\
+            an open session, an ended foreground command, or an unchanged dirty worktree is not progress.\n\
+            Use\n\
+            `buzz schedules reconcile --decision keep` with that exact receipt, `--material-at`,\n\
+            and a `--due-at` 10 to 15 minutes away. Keep has no `--message` and publishes nothing.\n\
+        4. With no newer receipt, wake the same assignee once and record\n\
+            `buzz schedules reconcile --decision wake` with the unchanged receipt, `--material-at`,\n\
+            a `--due-at` 10 to 15 minutes away, and a material `--message`. If the exact receipt is still unchanged at\n\
+           the next check, preserve the existing work and context, assign exactly one different\n\
+            replacement, and record `--decision redirect` with `--replacement` and `--message`.\n\
+            That redirect message is the new delegation: it must contain exactly one\n\
+            `Expected result: ...` line and exactly one `Evidence locator: ...` line matching the\n\
+            stored task. The reconcile command signs and publishes this visible action; do not send\n\
+            a separate delegation message first. Preserve the expected result and evidence locator. A newer material\n\
+           receipt resets the one-wake allowance. Publish only the material recovery action or a\n\
+           genuine blocker for this claimed obligation, through that reconciliation outbox.\n\
+         5. Immediately before any visible wake, redirect, or complete reconciliation, re-read the\n\
+            target thread. If a newer\n\
+           message from this identity already covers this exact claimed obligation and result,\n\
             do not publish it again. Do not suppress a distinct required update merely because\n\
-            another message is newer. Reschedule or complete the item from the verified state\n\
+            another message is newer. Reconcile the item from the verified state\n\
             instead. An ordinary incoming-message turn owns any human question that arrived\n\
             while this heartbeat was running.\n\
-         6. If the expected result is complete, publish the material completion and run\n\
-            `buzz schedules complete --id <id> --claim <claim.token>`. Otherwise retain the item\n\
-            with `buzz schedules reschedule --id <id> --claim <claim.token> --due-at <RFC3339>`.\n\
+         6. If the expected result is complete, run\n\
+            `buzz schedules reconcile --decision complete` with the exact result receipt,\n\
+            `--material-at`, and a material `--message`; omit `--due-at`. That command publishes the\n\
+            completion, so do not send it separately. Otherwise\n\
+            every claimed schema-2 item must end in one typed keep, wake, or redirect\n\
+            reconciliation with a next due time 10 to 15 minutes from this decision. Material\n\
+            timestamps cannot be in the future, and each next due time must be 10 to 15 minutes\n\
+            away so it is due by the next heartbeat. These transitions retain a durable decision audit.\n\
             Inspect only the claimed due items, and never blindly replay an external effect whose\n\
-            outcome is unknown. A background heartbeat may inspect evidence, manage its private\n\
-            schedule, and send Buzz coordination or status messages. It must not approve a\n\
-            workflow or perform a customer, production, financial, or other external effect. A\n\
-            foreground turn carrying explicit authority owns such an action.\n\n\
-         Routine task:\n\
-         7. Run `buzz feed get --types needs_action` for pending approvals or high-priority requests.\n\
-         8. Surface a material approval or blocker when needed, but do not execute its external\n\
-            action from this background heartbeat.\n\
-         9. If the schedule result is `[]` and the needs-action query is empty, end immediately and\n\
-            publish nothing.\n\n\
+            outcome is unknown. A background schedule heartbeat may inspect evidence and manage\n\
+            its private schedule. Its only visible output is the signed reconciliation outbox for\n\
+            a claimed due obligation; do not call `buzz messages send` or publish an unclaimed\n\
+            status. It must not approve a workflow or perform a customer, production, financial,\n\
+            or other external effect. A foreground turn carrying explicit authority owns such an\n\
+            action.\n\
+         7. If the schedule result is `[]`, end immediately and publish nothing.\n\n\
          Schedule heartbeats do not query the mentions feed: normal relay delivery and startup\n\
          catch-up own human messages. Do not scan channels, search for unrelated work, or invent\n\
          tasks."
@@ -4938,28 +5251,42 @@ mod heartbeat_prompt_tests {
     }
 
     #[test]
-    fn opted_in_schedule_prompt_composes_feed_and_due_work() {
+    fn opted_in_schedule_prompt_requires_a_claimed_outbox_for_visibility() {
         let prompt = schedule_heartbeat_prompt();
         assert!(prompt.contains("buzz schedules claim-due"));
         assert!(prompt.contains("buzz messages thread --channel"));
         assert!(prompt.contains("designated driver"));
-        assert!(prompt.contains("specific to PM"));
-        assert!(prompt.contains("delegation naming one owner"));
+        assert!(prompt.contains("Any agent can be the"));
+        assert!(prompt.contains("any managed agent can be the assignee"));
+        assert!(prompt.contains("delegation naming one assignee"));
         assert!(prompt.contains("expected result"));
         assert!(prompt.contains("callback/evidence location"));
-        assert!(prompt.contains("Follow the item's `check` before its `action`"));
+        assert!(prompt.contains("follow the item's `check` before its `action`"));
         assert!(prompt.contains("A missing callback alone"));
-        assert!(prompt.contains("has made material progress"));
-        assert!(prompt.contains("15 minutes later and publish nothing"));
-        assert!(prompt.contains("verify the prior owner is no longer active"));
-        assert!(prompt.contains("assigning exactly one replacement"));
-        assert!(prompt.contains("Preserve the"));
+        assert!(prompt.contains("newer task-bound receipt"));
+        assert!(prompt.contains("Generic online presence"));
+        assert!(prompt.contains("unchanged dirty worktree is not progress"));
+        assert!(prompt.contains("buzz schedules reconcile --decision keep"));
+        assert!(prompt.contains("buzz schedules reconcile --decision wake"));
+        assert!(prompt.contains("`--decision redirect`"));
+        assert!(prompt.contains("`--replacement` and `--message`"));
+        assert!(prompt.contains("That redirect message is the new delegation"));
+        assert!(prompt.contains("exactly one `Evidence locator: ...` line"));
+        assert!(prompt.contains("reconcile command signs and publishes this visible action"));
+        assert!(prompt.contains("a separate delegation message first"));
+        assert!(prompt.contains("one-wake allowance"));
+        assert!(prompt.contains("Preserve the expected result and evidence locator"));
         assert!(prompt.contains("material recovery action"));
-        assert!(prompt.contains("buzz schedules complete"));
-        assert!(prompt.contains("buzz schedules reschedule"));
-        assert!(prompt.contains("buzz feed get --types needs_action"));
+        assert!(prompt.contains("buzz schedules reconcile --decision complete"));
+        assert!(prompt.contains("a material `--message`; omit `--due-at`"));
+        assert!(prompt.contains("That command publishes the"));
+        assert!(prompt.contains("durable decision audit"));
+        assert!(!prompt.contains("buzz feed get --types needs_action"));
         assert!(!prompt.contains("buzz feed get --types mentions"));
-        assert!(prompt.contains("Immediately before any `buzz messages send`"));
+        assert!(prompt.contains("only visible output is the signed reconciliation outbox"));
+        assert!(prompt.contains("do not call `buzz messages send`"));
+        assert!(prompt.contains("claimed due obligation"));
+        assert!(prompt.contains("Immediately before any visible wake, redirect, or complete"));
         assert!(prompt.contains("already covers this exact claimed obligation and result"));
         assert!(prompt.contains("ordinary incoming-message turn owns"));
         assert!(prompt.contains("must not approve a"));
@@ -5026,6 +5353,7 @@ fn spawn_respawn_task(
     observer: Option<observer::ObserverHandle>,
 ) -> bool {
     let index = old_agent.index;
+    let runtime_revocation = old_agent.acp.runtime_revocation();
 
     // Circuit breaker: record crash, decide whether to respawn.
     let delay = match slot.record_crash() {
@@ -5061,7 +5389,16 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(
+            &cmd,
+            &args,
+            &env,
+            has_codex,
+            index,
+            runtime_revocation,
+            observer,
+        )
+        .await;
         guard.send(result);
     });
 
@@ -5096,6 +5433,48 @@ async fn shutdown_agent_pool(pool: &mut AgentPool) {
         if let Some(mut agent) = slot.take() {
             agent.acp.shutdown().await;
         }
+    }
+}
+
+/// Revoke every worker immediately after durable runtime authority is lost.
+///
+/// Ordinary shutdown gives prompts time to finish. Fence loss is different: a
+/// replacement runtime may acquire this identity as soon as the old lease
+/// expires, so no old foreground or heartbeat turn may retain a process that
+/// could publish during that transition. Signal cancellation for protocol
+/// hygiene, SIGKILL every locally-held worker before awaiting any one child,
+/// then abort checked-out tasks so their owned clients run the same kill path.
+async fn shutdown_agent_pool_after_fence_loss(pool: &mut AgentPool) {
+    for meta in pool.task_map_mut().values_mut() {
+        if let Some(control_tx) = meta.control_tx.take() {
+            let _ = control_tx.send(ControlSignal::Cancel);
+        }
+    }
+
+    let mut locally_held = Vec::new();
+    for slot in pool.agents_mut() {
+        if let Some(mut agent) = slot.take() {
+            agent.acp.kill_now();
+            locally_held.push(agent);
+        }
+    }
+    while let Ok(mut result) = pool.result_rx_try_recv() {
+        result.agent.acp.kill_now();
+        locally_held.push(result.agent);
+    }
+
+    pool.join_set.abort_all();
+    while pool.join_set.join_next().await.is_some() {}
+    while let Ok(mut result) = pool.result_rx_try_recv() {
+        result.agent.acp.kill_now();
+        locally_held.push(result.agent);
+    }
+    pool.task_map_mut().clear();
+
+    // All children were signalled before this sequential reap begins, so a
+    // slow wait cannot leave a later worker alive with publishing authority.
+    for mut agent in locally_held {
+        agent.acp.shutdown().await;
     }
 }
 
@@ -5138,6 +5517,7 @@ impl PoolStartup {
 
 async fn initialize_agent_pool(
     startup: &PoolStartup,
+    runtime_revocation: Option<runtime_fence::RuntimeRevocation>,
     mut shutdown: Option<watch::Receiver<()>>,
 ) -> Result<AgentPool> {
     // One agent failing to start must not kill the whole pool.
@@ -5153,6 +5533,15 @@ async fn initialize_agent_pool(
         .await;
         match spawn_result {
             Ok(mut acp) => {
+                if let Some(revocation) = runtime_revocation.clone() {
+                    if !acp.bind_runtime_revocation(revocation) {
+                        acp.shutdown().await;
+                        shutdown_agent_slots(&mut agent_slots).await;
+                        return Err(anyhow::anyhow!(
+                            "runtime authority was revoked during pool initialization"
+                        ));
+                    }
+                }
                 acp.set_observer(startup.observer.clone(), i);
                 let initialize = tokio::time::timeout(Duration::from_secs(60), acp.initialize());
                 let initialize_result = match shutdown.as_mut() {
@@ -5241,7 +5630,11 @@ async fn initialize_agent_pool(
         live_count,
         startup.agents
     );
-    Ok(AgentPool::from_slots(agent_slots))
+    let mut pool = AgentPool::from_slots(agent_slots);
+    if let Some(revocation) = runtime_revocation {
+        pool.bind_runtime_revocation(revocation);
+    }
+    Ok(pool)
 }
 
 // ── spawn_and_init ────────────────────────────────────────────────────────────
@@ -5255,6 +5648,7 @@ async fn spawn_and_init(
     extra_env: &[(String, String)],
     has_generated_codex_config: bool,
     agent_index: usize,
+    runtime_revocation: Option<runtime_fence::RuntimeRevocation>,
     observer: Option<observer::ObserverHandle>,
 ) -> Result<(AcpClient, u32, String)> {
     spawn_and_init_with_timeout(
@@ -5263,6 +5657,7 @@ async fn spawn_and_init(
         extra_env,
         has_generated_codex_config,
         agent_index,
+        runtime_revocation,
         observer,
         Duration::from_secs(60),
     )
@@ -5276,12 +5671,21 @@ async fn spawn_and_init_with_timeout(
     extra_env: &[(String, String)],
     has_generated_codex_config: bool,
     agent_index: usize,
+    runtime_revocation: Option<runtime_fence::RuntimeRevocation>,
     observer: Option<observer::ObserverHandle>,
     initialize_timeout: Duration,
 ) -> Result<(AcpClient, u32, String)> {
     let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
         .await
         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
+    if let Some(revocation) = runtime_revocation {
+        if !acp.bind_runtime_revocation(revocation) {
+            acp.shutdown().await;
+            return Err(anyhow::anyhow!(
+                "runtime authority was revoked before agent initialization"
+            ));
+        }
+    }
     acp.set_observer(observer, agent_index);
 
     match tokio::time::timeout(initialize_timeout, acp.initialize()).await {
@@ -5680,6 +6084,39 @@ mod elastic_worker_capacity_tests {
         }
     }
 
+    async fn delayed_publish_agent(index: usize, marker: &std::path::Path) -> OwnedAgent {
+        let script = format!(
+            "sleep 0.25; printf published > {}; sleep 30",
+            marker.display()
+        );
+        OwnedAgent {
+            index,
+            acp: AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+                .await
+                .expect("spawn delayed-publish test agent"),
+            state: Default::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        }
+    }
+
+    async fn wait_for_registered_worker(revocation: &runtime_fence::RuntimeRevocation) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while revocation.registered_process_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("worker was not registered during initialization");
+    }
+
     #[test]
     fn lazy_wake_starts_one_worker_but_preserves_ten_slots() {
         let startup = PoolStartup {
@@ -5739,6 +6176,7 @@ mod elastic_worker_capacity_tests {
             false,
             0,
             None,
+            None,
             Duration::from_millis(25),
         )
         .await
@@ -5748,6 +6186,86 @@ mod elastic_worker_capacity_tests {
         };
 
         assert!(error.to_string().contains("initialize timed out"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lazy_wake_worker_is_revocable_while_initialize_is_still_blocked() {
+        let marker = std::env::temp_dir().join(format!(
+            "buzz-lazy-wake-init-survived-revocation-{}",
+            Uuid::new_v4()
+        ));
+        let startup = PoolStartup {
+            agents: 1,
+            initial_live_agents: 1,
+            command: "bash".into(),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "read -r _request; sleep 0.3; printf survived > {}; sleep 30",
+                    marker.display()
+                ),
+            ],
+            extra_env: vec![],
+            has_generated_codex_config: false,
+            model: None,
+            effort_level: None,
+            observer: None,
+        }
+        .for_lazy_wake();
+        let revocation = runtime_fence::RuntimeRevocation::new();
+        let revocation_for_task = revocation.clone();
+        let wake = tokio::spawn(async move {
+            initialize_agent_pool(&startup, Some(revocation_for_task), None).await
+        });
+
+        wait_for_registered_worker(&revocation).await;
+        revocation.revoke();
+        assert!(wake.await.expect("wake task panicked").is_err());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !marker.exists(),
+            "lazy-wake child survived revocation during initialize"
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn respawn_worker_is_revocable_while_initialize_is_still_blocked() {
+        let marker = std::env::temp_dir().join(format!(
+            "buzz-respawn-init-survived-revocation-{}",
+            Uuid::new_v4()
+        ));
+        let script = format!(
+            "read -r _request; sleep 0.3; printf survived > {}; sleep 30",
+            marker.display()
+        );
+        let revocation = runtime_fence::RuntimeRevocation::new();
+        let revocation_for_task = revocation.clone();
+        let respawn = tokio::spawn(async move {
+            spawn_and_init_with_timeout(
+                "bash",
+                &["-c".into(), script],
+                &[],
+                false,
+                0,
+                Some(revocation_for_task),
+                None,
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        wait_for_registered_worker(&revocation).await;
+        revocation.revoke();
+        assert!(respawn.await.expect("respawn task panicked").is_err());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !marker.exists(),
+            "respawn child survived revocation during initialize"
+        );
+        let _ = std::fs::remove_file(marker);
     }
 
     #[tokio::test]
@@ -5779,6 +6297,42 @@ mod elastic_worker_capacity_tests {
         while pool.join_set.join_next().await.is_some() {}
     }
 
+    #[tokio::test]
+    async fn replacement_takeover_cannot_leave_the_old_in_flight_agent_able_to_publish() {
+        let marker =
+            std::env::temp_dir().join(format!("buzz-fence-old-runtime-publish-{}", Uuid::new_v4()));
+        let agent = delayed_publish_agent(0, &marker).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task = pool.join_set.spawn(async move {
+            std::future::pending::<()>().await;
+            drop(agent);
+        });
+        pool.task_map_mut().insert(
+            task.id(),
+            pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(Uuid::new_v4()),
+                turn_id: "old-runtime-in-flight".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+
+        // The fence-loss branch runs before the old 90-second lease expires.
+        // By the time runtime B can acquire at expiry, runtime A's checked-out
+        // worker has already been killed and cannot emit its delayed marker.
+        shutdown_agent_pool_after_fence_loss(&mut pool).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert!(
+            !marker.exists(),
+            "old runtime published after losing its fence"
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
     #[test]
     fn foreground_waits_for_heartbeat_cancel_and_then_dispatches() {
         assert!(!foreground_dispatch_allowed(true, true));
@@ -5794,6 +6348,127 @@ mod elastic_worker_capacity_tests {
         assert!(pending_heartbeat_dispatch_allowed(
             true, true, false, false, false, true,
         ));
+    }
+
+    #[test]
+    fn due_aware_refresh_is_schedule_mode_only() {
+        assert!(schedule_due_refresh_enabled(
+            true,
+            HeartbeatMode::Schedules,
+            true,
+        ));
+        assert!(!schedule_due_refresh_enabled(
+            true,
+            HeartbeatMode::Feed,
+            true,
+        ));
+        assert!(!schedule_due_refresh_enabled(
+            false,
+            HeartbeatMode::Schedules,
+            true,
+        ));
+        assert!(!schedule_due_refresh_enabled(
+            true,
+            HeartbeatMode::Schedules,
+            false,
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn schedule_tick_during_an_active_heartbeat_refreshes_without_a_second_turn() {
+        let started = tokio::time::Instant::now();
+        let mut interval = tokio::time::interval_at(
+            started + Duration::from_secs(15 * 60),
+            Duration::from_secs(15 * 60),
+        );
+
+        tokio::time::advance(Duration::from_secs(15 * 60)).await;
+        assert_eq!(
+            interval.tick().await,
+            started + Duration::from_secs(15 * 60)
+        );
+        assert!(heartbeat_tick_requests_due_refresh(
+            HeartbeatMode::Schedules,
+            true,
+        ));
+        assert!(!heartbeat_tick_requests_due_refresh(
+            HeartbeatMode::Feed,
+            true
+        ));
+
+        // The tick requests a durable-head refresh; it does not itself owe a
+        // second heartbeat. If the refreshed head remains unchanged and not
+        // due, only its real due deadline is armed and no full turn or visible
+        // action can occur now.
+        let schedule_due_refresh_requested = true;
+        let heartbeat_pending = false;
+        let wall_now = DateTime::parse_from_rfc3339("2026-08-28T15:15:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let wake_at = schedule_due_wake_at(
+            Some(wall_now + chrono::Duration::minutes(7)),
+            wall_now,
+            tokio::time::Instant::now(),
+        )
+        .expect("not-due schedule head");
+        assert!(schedule_due_refresh_requested);
+        assert!(wake_at > tokio::time::Instant::now());
+        assert!(!pending_heartbeat_dispatch_allowed(
+            true,
+            heartbeat_pending,
+            false,
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn schedule_due_rearm_catches_item_missed_by_the_fixed_tick() {
+        let monotonic_start = tokio::time::Instant::now();
+        let wall_start = DateTime::parse_from_rfc3339("2026-08-28T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // The heartbeat starts at t0, records a decision at t8, and ends at
+        // t9. Its next schedule is due at t18. The fixed t15 tick is too early
+        // and the following fixed tick would not arrive until t30.
+        tokio::time::advance(Duration::from_secs(9 * 60)).await;
+        let due_at = wall_start + chrono::Duration::minutes(18);
+        let wake_at = schedule_due_wake_at(
+            Some(due_at),
+            wall_start + chrono::Duration::minutes(9),
+            tokio::time::Instant::now(),
+        )
+        .expect("future schedule due time");
+
+        assert_eq!(wake_at, monotonic_start + Duration::from_secs(18 * 60));
+        assert!(wake_at > monotonic_start + Duration::from_secs(15 * 60));
+        assert!(wake_at < monotonic_start + Duration::from_secs(30 * 60));
+
+        tokio::time::advance(Duration::from_secs(6 * 60)).await;
+        assert!(
+            tokio::time::timeout(Duration::ZERO, tokio::time::sleep_until(wake_at))
+                .await
+                .is_err()
+        );
+        tokio::time::advance(Duration::from_secs(3 * 60)).await;
+        tokio::time::sleep_until(wake_at).await;
+        assert_eq!(tokio::time::Instant::now(), wake_at);
+    }
+
+    #[test]
+    fn an_already_due_schedule_uses_a_bounded_retry_not_a_busy_loop() {
+        let wall_now = Utc::now();
+        let monotonic_now = tokio::time::Instant::now();
+        assert_eq!(
+            schedule_due_wake_at(
+                Some(wall_now - chrono::Duration::minutes(1)),
+                wall_now,
+                monotonic_now,
+            ),
+            Some(monotonic_now + SCHEDULE_DUE_RETRY_DELAY),
+        );
     }
 }
 

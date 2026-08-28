@@ -11,14 +11,47 @@
 //!   overwrite real, just-unreachable memory with a fresh profile.
 //! - Either way, session creation is never blocked.
 
+use std::collections::{HashMap, HashSet};
+
 use buzz_core::engram::{conversation_key, d_tag, select_head, validate_and_decrypt, Body};
 use buzz_core::kind::KIND_AGENT_ENGRAM;
-use nostr::{Event, Keys, PublicKey};
+use chrono::{DateTime, Utc};
+use nostr::{Event, EventId, Keys, PublicKey};
+use serde::Deserialize;
 
 use crate::relay::RestClient;
 
 /// Section header rendered into the prompt.
 const SECTION_LABEL: &str = "Agent Memory — core";
+const FOLLOW_THROUGH_PREFIX: &str = "mem/buzz-follow-through/";
+const MEMORY_PAGE_LIMIT: usize = 1_000;
+const MAX_MEMORY_PAGES: usize = 10_000;
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FollowThroughStatus {
+    Pending,
+    Claimed,
+    Completed,
+}
+
+#[derive(Debug, Deserialize)]
+struct FollowThroughClaim {
+    lease_expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FollowThroughHead {
+    due_at: String,
+    status: FollowThroughStatus,
+    claim: Option<FollowThroughClaim>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MemoryCursor {
+    until: u64,
+    before_id: EventId,
+}
 
 /// Onboarding nudge for new agents with no core yet.
 ///
@@ -53,6 +86,165 @@ pub async fn build_core_section(
             None
         }
     }
+}
+
+/// Read the agent's private follow-through heads and return the earliest time
+/// at which one can be claimed.
+///
+/// The fixed heartbeat remains the fallback if this best-effort refresh fails.
+/// A claimed item becomes eligible at the later of its due time and lease
+/// expiry; completed items are excluded.
+pub async fn fetch_earliest_follow_through_due(
+    rest: &RestClient,
+    agent_keys: &Keys,
+    owner: &PublicKey,
+) -> Result<Option<DateTime<Utc>>, String> {
+    let events = query_all_agent_engrams(rest, &agent_keys.public_key(), owner).await?;
+    let mut groups: HashMap<String, Vec<(Event, Body)>> = HashMap::new();
+    for event in events {
+        if event.verify().is_err() {
+            continue;
+        }
+        let Some(d_value) = event
+            .tags
+            .iter()
+            .find(|tag| tag.kind().to_string() == "d")
+            .and_then(|tag| tag.content())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let body = match validate_and_decrypt(
+            &event,
+            &agent_keys.public_key(),
+            owner,
+            agent_keys.secret_key(),
+            owner,
+        ) {
+            Ok(body) => body,
+            Err(_) => continue,
+        };
+        groups.entry(d_value).or_default().push((event, body));
+    }
+
+    let mut earliest: Option<DateTime<Utc>> = None;
+    for members in groups.into_values() {
+        let Some(head) = select_head(members.iter().map(|(event, _)| event.clone())) else {
+            continue;
+        };
+        let Some((_, body)) = members.into_iter().find(|(event, _)| event.id == head.id) else {
+            continue;
+        };
+        let Body::Memory {
+            slug,
+            value: Some(value),
+        } = body
+        else {
+            continue;
+        };
+        if !slug.starts_with(FOLLOW_THROUGH_PREFIX) {
+            continue;
+        }
+        match follow_through_claim_at(&value) {
+            Ok(Some(claim_at)) => {
+                earliest = Some(earliest.map_or(claim_at, |current| current.min(claim_at)));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    slug,
+                    "follow-through due refresh skipped invalid head: {error}"
+                );
+            }
+        }
+    }
+    Ok(earliest)
+}
+
+fn follow_through_claim_at(value: &str) -> Result<Option<DateTime<Utc>>, String> {
+    let head: FollowThroughHead =
+        serde_json::from_str(value).map_err(|error| format!("invalid schedule JSON: {error}"))?;
+    if matches!(head.status, FollowThroughStatus::Completed) {
+        return Ok(None);
+    }
+    let due_at = parse_schedule_time(&head.due_at, "due_at")?;
+    match (head.status, head.claim) {
+        (FollowThroughStatus::Pending, None) => Ok(Some(due_at)),
+        (FollowThroughStatus::Claimed, Some(claim)) => {
+            let lease_expires_at =
+                parse_schedule_time(&claim.lease_expires_at, "claim.lease_expires_at")?;
+            Ok(Some(due_at.max(lease_expires_at)))
+        }
+        (FollowThroughStatus::Pending, Some(_)) => {
+            Err("pending schedule unexpectedly retains a claim".into())
+        }
+        (FollowThroughStatus::Claimed, None) => Err("claimed schedule has no lease".into()),
+        (FollowThroughStatus::Completed, _) => Ok(None),
+    }
+}
+
+fn parse_schedule_time(raw: &str, field: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|error| format!("invalid {field}: {error}"))
+}
+
+async fn query_all_agent_engrams(
+    rest: &RestClient,
+    agent: &PublicKey,
+    owner: &PublicKey,
+) -> Result<Vec<Event>, String> {
+    let mut events = Vec::new();
+    let mut seen_events = HashSet::new();
+    let mut seen_cursors = HashSet::new();
+    let mut cursor: Option<MemoryCursor> = None;
+
+    for _ in 0..MAX_MEMORY_PAGES {
+        let mut filter = serde_json::json!({
+            "kinds": [KIND_AGENT_ENGRAM],
+            "authors": [agent.to_hex()],
+            "#p": [owner.to_hex()],
+            "limit": MEMORY_PAGE_LIMIT,
+        });
+        if let Some(cursor) = &cursor {
+            filter["until"] = serde_json::json!(cursor.until);
+            filter["before_id"] = serde_json::json!(cursor.before_id.to_hex());
+        }
+        let value = rest
+            .query_raw(&serde_json::json!([filter]))
+            .await
+            .map_err(|error| format!("relay memory query failed: {error}"))?;
+        let page: Vec<Event> = serde_json::from_value(value)
+            .map_err(|error| format!("relay memory query returned invalid events: {error}"))?;
+        let page_len = page.len();
+        let next_cursor = page.last().map(|event| MemoryCursor {
+            until: event.created_at.as_secs(),
+            before_id: event.id,
+        });
+        let before_len = events.len();
+        for event in page {
+            if seen_events.insert(event.id) {
+                events.push(event);
+            }
+        }
+        if page_len < MEMORY_PAGE_LIMIT {
+            return Ok(events);
+        }
+        let Some(next_cursor) = next_cursor else {
+            return Ok(events);
+        };
+        if events.len() == before_len || !seen_cursors.insert(next_cursor.clone()) {
+            return Err(
+                "relay memory pagination made no progress; composite cursor support is required"
+                    .into(),
+            );
+        }
+        cursor = Some(next_cursor);
+    }
+
+    Err(format!(
+        "relay memory query exceeded the bounded {MAX_MEMORY_PAGES}-page traversal"
+    ))
 }
 
 /// Query the relay for the core head and decode it. Returns:
@@ -244,5 +436,43 @@ mod tests {
         let arr = vec![json!({"not": "an event"}), json!("garbage")];
         let result = decode_core_body(&arr, &agent, &owner.public_key());
         assert!(result.is_err(), "expected Err, got: {result:?}");
+    }
+
+    #[test]
+    fn follow_through_claim_time_respects_status_and_lease() {
+        let pending = serde_json::json!({
+            "due_at": "2026-08-28T15:18:00Z",
+            "status": "pending",
+            "claim": null,
+        });
+        assert_eq!(
+            follow_through_claim_at(&pending.to_string())
+                .unwrap()
+                .unwrap()
+                .to_rfc3339(),
+            "2026-08-28T15:18:00+00:00",
+        );
+
+        let claimed = serde_json::json!({
+            "due_at": "2026-08-28T15:18:00Z",
+            "status": "claimed",
+            "claim": { "lease_expires_at": "2026-08-28T15:24:00Z" },
+        });
+        assert_eq!(
+            follow_through_claim_at(&claimed.to_string())
+                .unwrap()
+                .unwrap()
+                .to_rfc3339(),
+            "2026-08-28T15:24:00+00:00",
+        );
+
+        let completed = serde_json::json!({
+            "due_at": "2026-08-28T15:18:00Z",
+            "status": "completed",
+            "claim": null,
+        });
+        assert!(follow_through_claim_at(&completed.to_string())
+            .unwrap()
+            .is_none());
     }
 }

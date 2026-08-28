@@ -1860,6 +1860,18 @@ pub enum ScheduleStatusArg {
     Completed,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum ScheduleDecisionArg {
+    /// A newer task-bound material receipt proves progress.
+    Keep,
+    /// No newer receipt exists; wake the same owner once.
+    Wake,
+    /// The receipt is still unchanged after the wake; use one replacement.
+    Redirect,
+    /// The exact expected result is complete.
+    Complete,
+}
+
 /// Subcommands for `buzz schedules`.
 #[derive(Subcommand)]
 pub enum SchedulesCmd {
@@ -1877,6 +1889,24 @@ pub enum SchedulesCmd {
         /// Root Buzz event ID for the work thread
         #[arg(long)]
         thread: String,
+        /// Exact managed-agent pubkey responsible for this delegation
+        #[arg(long)]
+        assignee: String,
+        /// Exact Buzz event ID containing the delegation
+        #[arg(long)]
+        delegation_event: String,
+        /// Concrete result the delegated owner owes
+        #[arg(long)]
+        expected_result: String,
+        /// Exact thread, session, worktree, branch, PR, document, or receipt to inspect
+        #[arg(long)]
+        evidence_locator: String,
+        /// Canonical immutable baseline receipt for the task at binding time
+        #[arg(long)]
+        receipt: String,
+        /// RFC3339 timestamp of the baseline receipt's material progress
+        #[arg(long)]
+        material_at: String,
         /// Named owner/result/callback event or absence that makes this follow-up due
         #[arg(long)]
         expected_cause: String,
@@ -1923,6 +1953,38 @@ pub enum SchedulesCmd {
         #[arg(long)]
         owner: Option<String>,
     },
+    /// Upgrade one claimed schema-1 schedule to a verified task-bound schema-2 schedule
+    Bind {
+        #[arg(long)]
+        id: String,
+        /// Claim token returned by `claim-due`
+        #[arg(long)]
+        claim: String,
+        /// Next check, 10 to 15 minutes from this bind decision
+        #[arg(long)]
+        due_at: String,
+        /// Exact managed-agent pubkey responsible for this delegation
+        #[arg(long)]
+        assignee: String,
+        /// Exact Buzz event ID containing the delegation
+        #[arg(long)]
+        delegation_event: String,
+        /// Concrete single-line result the delegated owner owes
+        #[arg(long)]
+        expected_result: String,
+        /// Exact single-line thread, session, worktree, branch, PR, document, or receipt to inspect
+        #[arg(long)]
+        evidence_locator: String,
+        /// Canonical immutable baseline receipt for the task at binding time
+        #[arg(long)]
+        receipt: String,
+        /// RFC3339 timestamp of the baseline receipt's material progress
+        #[arg(long)]
+        material_at: String,
+        /// Owner pubkey (hex). Overrides BUZZ_AUTH_TAG.
+        #[arg(long)]
+        owner: Option<String>,
+    },
     /// Mark a claimed schedule complete
     Complete {
         #[arg(long)]
@@ -1953,6 +2015,35 @@ pub enum SchedulesCmd {
         /// Replace the reconciliation check
         #[arg(long)]
         check: Option<String>,
+        /// Owner pubkey (hex). Overrides BUZZ_AUTH_TAG.
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Reconcile one task-bound schedule from an exact material receipt
+    Reconcile {
+        #[arg(long)]
+        id: String,
+        /// Claim token returned by `claim-due`
+        #[arg(long)]
+        claim: String,
+        /// Typed decision made from the exact task evidence
+        #[arg(long, value_enum)]
+        decision: ScheduleDecisionArg,
+        /// Exact event ID, turn ID, commit/hash, PR head, or other task revision observed
+        #[arg(long)]
+        receipt: String,
+        /// RFC3339 timestamp of the receipt's material progress
+        #[arg(long)]
+        material_at: String,
+        /// Next wake time for keep, wake, or redirect decisions
+        #[arg(long)]
+        due_at: Option<String>,
+        /// Different managed-agent pubkey required by a redirect decision
+        #[arg(long)]
+        replacement: Option<String>,
+        /// Visible wake, redirect delegation, or completion message. Required except for keep.
+        #[arg(long)]
+        message: Option<String>,
         /// Owner pubkey (hex). Overrides BUZZ_AUTH_TAG.
         #[arg(long)]
         owner: Option<String>,
@@ -2237,6 +2328,70 @@ mod tests {
     }
 
     #[test]
+    fn schedules_reconcile_visible_action_commands_parse_with_message() {
+        let receipt = format!("document-hash:{}", "1".repeat(64));
+        let replacement = "2".repeat(64);
+        let common = |decision: &str| {
+            vec![
+                "buzz".to_owned(),
+                "schedules".to_owned(),
+                "reconcile".to_owned(),
+                "--id".to_owned(),
+                "task-a".to_owned(),
+                "--claim".to_owned(),
+                "3e7c7fb7a5cf41d683f4be618bc9b211".to_owned(),
+                "--decision".to_owned(),
+                decision.to_owned(),
+                "--receipt".to_owned(),
+                receipt.clone(),
+                "--material-at".to_owned(),
+                "2026-08-26T15:00:00Z".to_owned(),
+            ]
+        };
+
+        let mut wake = common("wake");
+        wake.extend(
+            [
+                "--due-at",
+                "2026-08-26T15:15:00Z",
+                "--message",
+                "Please continue and report material progress.",
+            ]
+            .map(str::to_owned),
+        );
+        assert!(Cli::try_parse_from(wake).is_ok());
+
+        let mut redirect = common("redirect");
+        redirect.extend([
+            "--due-at".to_owned(),
+            "2026-08-26T15:15:00Z".to_owned(),
+            "--replacement".to_owned(),
+            replacement.clone(),
+            "--message".to_owned(),
+            "Please take over.\nExpected result: exact result\nEvidence locator: exact locator"
+                .to_owned(),
+        ]);
+        assert!(Cli::try_parse_from(redirect).is_ok());
+
+        let mut complete = common("complete");
+        complete.extend(["--message", "Completed with exact evidence."].map(str::to_owned));
+        assert!(Cli::try_parse_from(complete).is_ok());
+
+        let mut obsolete = common("redirect");
+        obsolete.extend([
+            "--due-at".to_owned(),
+            "2026-08-26T15:15:00Z".to_owned(),
+            "--replacement".to_owned(),
+            replacement,
+            "--message".to_owned(),
+            "marked delegation".to_owned(),
+            "--replacement-delegation-event".to_owned(),
+            "4".to_owned(),
+        ]);
+        assert!(Cli::try_parse_from(obsolete).is_err());
+    }
+
+    #[test]
     fn messages_thread_accepts_link_or_explicit_identifiers() {
         let channel = "123e4567-e89b-12d3-a456-426614174000";
         let event = "a".repeat(64);
@@ -2498,11 +2653,13 @@ mod tests {
         assert_eq!(
             names(&cmd, "schedules"),
             vec![
+                "bind",
                 "claim-due",
                 "complete",
                 "create",
                 "due",
                 "list",
+                "reconcile",
                 "reschedule"
             ]
         );
@@ -2539,7 +2696,7 @@ mod tests {
             ("projects", 7),
             ("reactions", 3),
             ("repos", 5),
-            ("schedules", 6),
+            ("schedules", 8),
             ("social", 7),
             ("upload", 1),
             ("users", 5),

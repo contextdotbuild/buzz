@@ -28,6 +28,23 @@ use nostr::PublicKey;
 use crate::client::BuzzClient;
 use crate::error::CliError;
 
+const FOLLOW_THROUGH_PREFIX: &str = "mem/buzz-follow-through/";
+const FOLLOW_THROUGH_ARCHIVE_PREFIX: &str = "mem/buzz-follow-through-archive/";
+const FOLLOW_THROUGH_BINDING_REGISTRY: &str = "mem/buzz-follow-through-bindings";
+
+fn reject_reserved_follow_through_mutation(slug: &str) -> Result<(), CliError> {
+    if slug.starts_with(FOLLOW_THROUGH_PREFIX)
+        || slug.starts_with(FOLLOW_THROUGH_ARCHIVE_PREFIX)
+        || slug == FOLLOW_THROUGH_BINDING_REGISTRY
+    {
+        return Err(CliError::Usage(
+            "follow-through schedules and audit archives are state-machine owned; use `buzz schedules` instead of generic `buzz mem` mutation commands"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 #[path = "mem_pagination.rs"]
 mod pagination;
 
@@ -512,6 +529,7 @@ pub async fn cmd_set(
 ) -> Result<(), CliError> {
     let slug =
         normalize_slug(raw_slug).map_err(|e| CliError::Usage(format!("invalid slug: {e}")))?;
+    reject_reserved_follow_through_mutation(&slug)?;
     let value = if raw_value == "-" {
         // Bound the stdin read so a runaway producer can't OOM us. We allow
         // one extra byte over the NIP-44 plaintext cap so the build step can
@@ -739,6 +757,7 @@ pub async fn cmd_patch(
 ) -> Result<(), CliError> {
     let slug =
         normalize_slug(raw_slug).map_err(|e| CliError::Usage(format!("invalid slug: {e}")))?;
+    reject_reserved_follow_through_mutation(&slug)?;
 
     // Require an explicit base-hash decision: this is the whole point of the
     // command vs. raw stdin pipelines.
@@ -902,6 +921,7 @@ pub async fn cmd_rm(
 ) -> Result<(), CliError> {
     let slug =
         normalize_slug(raw_slug).map_err(|e| CliError::Usage(format!("invalid slug: {e}")))?;
+    reject_reserved_follow_through_mutation(&slug)?;
     if slug == engram::CORE_SLUG {
         return Err(CliError::Usage(
             "core cannot be tombstoned; overwrite it with `buzz mem set core ''` instead".into(),
@@ -972,6 +992,16 @@ pub async fn dispatch(cmd: crate::MemCmd, client: &BuzzClient) -> Result<(), Cli
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_through_namespaces_are_readable_but_not_generically_mutable() {
+        assert!(reject_reserved_follow_through_mutation("mem/buzz-follow-through/task-1").is_err());
+        assert!(reject_reserved_follow_through_mutation(
+            "mem/buzz-follow-through-archive/task-1/00000001"
+        )
+        .is_err());
+        assert!(reject_reserved_follow_through_mutation("mem/ordinary-note").is_ok());
+    }
 
     // sha256_hex must match `printf '%s' "$value" | sha256sum` so operators can
     // verify base-hash from the shell. Hard-coded vectors from the NIST and

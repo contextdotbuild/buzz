@@ -493,47 +493,129 @@ owner's hex pubkey explicitly.
 
 ```bash
 SCHEDULE_ID="cli-follow-through"
-THREAD_ID="$(printf 'a%.0s' {1..64})"
+# Use a real top-level event in CHANNEL_ID; delegation validation queries it.
+THREAD_ID="<real-thread-root-event-id>"
 OWNER_PUBKEY="$(buzz-admin generate-key | awk '/Public key:/ {print $3}')"
-test -n "$OWNER_PUBKEY"
+ASSIGNEE_PUBKEY="$(buzz-admin generate-key | awk '/Public key:/ {print $3}')"
+REPLACEMENT_PUBKEY="$(buzz-admin generate-key | awk '/Public key:/ {print $3}')"
+test -n "$OWNER_PUBKEY" && test -n "$ASSIGNEE_PUBKEY" && test -n "$REPLACEMENT_PUBKEY"
 
+# Keep every time relative to the command that consumes it; static timestamps
+# make this live recipe fail as soon as the document ages.
+rfc3339_after() {
+  python3 - "$1" <<'PY'
+import datetime
+import sys
+
+offset = int(sys.argv[1])
+value = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=offset)
+print(value.replace(microsecond=0).isoformat().replace("+00:00", "Z"))
+PY
+}
+
+# Both assignees must actually be channel members before either is mentioned.
+buzz channels add-member --channel "$CHANNEL_ID" --pubkey "$ASSIGNEE_PUBKEY" --role member | jq .
+buzz channels add-member --channel "$CHANNEL_ID" --pubkey "$REPLACEMENT_PUBKEY" --role member | jq .
+
+# The exact markers below are
+# part of the verified task binding, not presentation-only prose.
+DELEGATION_EVENT=$(buzz messages send \
+  --channel "$CHANNEL_ID" --reply-to "$THREAD_ID" \
+  --mention "$ASSIGNEE_PUBKEY" \
+  --content $'Please own this harmless test.\nExpected result: harmless synthetic completion\nEvidence locator: /tmp/synthetic-follow-through' \
+  | jq -r '.event_id')
+
+BASELINE_AT="$(rfc3339_after 0)"
+NEXT_DUE_AT="$(rfc3339_after 900)"
 buzz schedules create \
   --id "$SCHEDULE_ID" \
-  --due-at 2026-08-26T15:00:00Z \
+  --due-at "$NEXT_DUE_AT" \
   --channel "$CHANNEL_ID" \
   --thread "$THREAD_ID" \
+  --assignee "$ASSIGNEE_PUBKEY" \
+  --delegation-event "$DELEGATION_EVENT" \
+  --expected-result "harmless synthetic completion" \
+  --evidence-locator "/tmp/synthetic-follow-through" \
+  --receipt "worktree-fingerprint:$(printf '1%.0s' {1..64})" \
+  --material-at "$BASELINE_AT" \
   --expected-cause "synthetic timeout" \
   --check "read the synthetic thread first" \
   --action "record the harmless synthetic check" \
   --owner "$OWNER_PUBKEY" | jq .
 
 buzz schedules list --owner "$OWNER_PUBKEY" | jq .
+CLAIM_AT="$(rfc3339_after 901)"
 buzz schedules due \
-  --at 2026-08-26T15:01:00Z --owner "$OWNER_PUBKEY" | jq .
+  --at "$CLAIM_AT" --owner "$OWNER_PUBKEY" | jq .
 
 CLAIMED=$(buzz schedules claim-due \
-  --at 2026-08-26T15:01:00Z --owner "$OWNER_PUBKEY")
+  --at "$CLAIM_AT" --owner "$OWNER_PUBKEY")
 CLAIM=$(echo "$CLAIMED" | jq -r '.[0].claim.token')
 test -n "$CLAIM"
 
 # An active lease prevents a duplicate wake action.
 buzz schedules claim-due \
-  --at 2026-08-26T15:02:00Z --owner "$OWNER_PUBKEY" | jq -e 'length == 0'
+  --at "$(rfc3339_after 902)" --owner "$OWNER_PUBKEY" | jq -e 'length == 0'
 
-buzz schedules reschedule \
+# With no newer receipt, exactly one same-owner wake is recorded and its
+# --message is published by reconcile from the durable outbox.
+NEXT_DUE_AT="$(rfc3339_after 900)"
+buzz schedules reconcile \
   --id "$SCHEDULE_ID" --claim "$CLAIM" \
-  --due-at 2026-08-26T16:00:00Z --owner "$OWNER_PUBKEY" | jq .
+  --decision wake \
+  --receipt "worktree-fingerprint:$(printf '1%.0s' {1..64})" \
+  --material-at "$BASELINE_AT" \
+  --due-at "$NEXT_DUE_AT" \
+  --message "Please continue this harmless test and report material progress." \
+  --owner "$OWNER_PUBKEY" | jq .
 
+CLAIM_AT="$(rfc3339_after 901)"
 CLAIM=$(buzz schedules claim-due \
-  --at 2026-08-26T16:01:00Z --owner "$OWNER_PUBKEY" \
+  --at "$CLAIM_AT" --owner "$OWNER_PUBKEY" \
   | jq -r '.[0].claim.token')
-buzz schedules complete \
-  --id "$SCHEDULE_ID" --claim "$CLAIM" --owner "$OWNER_PUBKEY" | jq .
+
+# The unchanged receipt now requires one different replacement. The redirect
+# message is itself the new delegation; do not send a separate message first.
+NEXT_DUE_AT="$(rfc3339_after 900)"
+buzz schedules reconcile \
+  --id "$SCHEDULE_ID" --claim "$CLAIM" \
+  --decision redirect \
+  --receipt "worktree-fingerprint:$(printf '1%.0s' {1..64})" \
+  --material-at "$BASELINE_AT" \
+  --due-at "$NEXT_DUE_AT" \
+  --replacement "$REPLACEMENT_PUBKEY" \
+  --message $'Please take over this harmless test.\nExpected result: harmless synthetic completion\nEvidence locator: /tmp/synthetic-follow-through' \
+  --owner "$OWNER_PUBKEY" | jq .
+
+CLAIM_AT="$(rfc3339_after 901)"
+CLAIM=$(buzz schedules claim-due \
+  --at "$CLAIM_AT" --owner "$OWNER_PUBKEY" \
+  | jq -r '.[0].claim.token')
+sleep 1
+RESULT_AT="$(rfc3339_after 0)"
+buzz schedules reconcile \
+  --id "$SCHEDULE_ID" --claim "$CLAIM" \
+  --decision complete \
+  --receipt "document-hash:$(printf 'd%.0s' {1..64})" \
+  --material-at "$RESULT_AT" \
+  --message "Completed: harmless synthetic result is present at /tmp/synthetic-follow-through." \
+  --owner "$OWNER_PUBKEY" | jq -e '.audit | length == 3'
 
 # A completed schedule never becomes due again.
 buzz schedules due \
-  --at 2026-08-27T00:00:00Z --owner "$OWNER_PUBKEY" | jq -e 'length == 0'
+  --at "$(rfc3339_after 86400)" --owner "$OWNER_PUBKEY" | jq -e 'length == 0'
 ```
+
+For a pre-existing schema-1 item, claim it normally and use that exact claim
+once with `buzz schedules bind`. Supply the same verified delegation fields,
+baseline receipt, material timestamp, and a due time 10–15 minutes ahead. The
+bind is CAS-protected and an exact retry after lost output is idempotent. After
+binding, only `schedules reconcile` may change its lifecycle; generic `mem set`,
+`mem patch`, and `mem rm` reject the schedule, archive, and binding-registry
+prefixes. Visible decisions use a prepare/publish/finalize outbox: the schedule
+head reserves the exact signed action before publication, and any retry resumes
+that stored event ID. Audit archives are immutable and content-addressed, so two
+rollover candidates at the same sequence cannot overwrite one another.
 
 ---
 

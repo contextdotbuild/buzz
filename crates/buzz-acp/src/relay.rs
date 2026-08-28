@@ -417,7 +417,22 @@ impl RestClient {
     pub async fn query(&self, filters: &[nostr::Filter]) -> Result<Value, RelayError> {
         let body_bytes = serde_json::to_vec(filters)
             .map_err(|e| RelayError::Http(format!("filter serialize error: {e}")))?;
-        let resp = self.bridge_post("/query", &body_bytes).await?;
+        self.query_bytes(&body_bytes).await
+    }
+
+    /// Query events with raw bridge filters.
+    ///
+    /// The HTTP bridge supports a composite `until` + `before_id` cursor that
+    /// is intentionally outside the Nostr filter type. Keep that extension
+    /// confined to bounded internal pagination callers.
+    pub(crate) async fn query_raw(&self, filters: &Value) -> Result<Value, RelayError> {
+        let body_bytes = serde_json::to_vec(filters)
+            .map_err(|e| RelayError::Http(format!("filter serialize error: {e}")))?;
+        self.query_bytes(&body_bytes).await
+    }
+
+    async fn query_bytes(&self, body_bytes: &[u8]) -> Result<Value, RelayError> {
+        let resp = self.bridge_post("/query", body_bytes).await?;
         resp.json()
             .await
             .map_err(|e| RelayError::Http(e.to_string()))

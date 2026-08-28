@@ -299,6 +299,7 @@ pub struct AgentPool {
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
+    runtime_revocation: Option<crate::runtime_fence::RuntimeRevocation>,
 }
 
 /// Result returned by a completed prompt task.
@@ -659,7 +660,20 @@ impl AgentPool {
             result_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
+            runtime_revocation: None,
         }
+    }
+
+    /// Bind every current and future worker to the managed runtime fence.
+    pub fn bind_runtime_revocation(&mut self, revocation: crate::runtime_fence::RuntimeRevocation) {
+        for agent in self.agents.iter_mut().flatten() {
+            let _ = agent.acp.bind_runtime_revocation(revocation.clone());
+        }
+        self.runtime_revocation = Some(revocation);
+    }
+
+    pub fn runtime_revocation(&self) -> Option<crate::runtime_fence::RuntimeRevocation> {
+        self.runtime_revocation.clone()
     }
 
     /// Try to claim an idle agent for the given channel (or heartbeat if `None`).
@@ -669,6 +683,13 @@ impl AgentPool {
     ///
     /// Returns `None` if all agents are checked out.
     pub fn try_claim(&mut self, channel_id: Option<Uuid>) -> Option<OwnedAgent> {
+        if self
+            .runtime_revocation
+            .as_ref()
+            .is_some_and(crate::runtime_fence::RuntimeRevocation::is_revoked)
+        {
+            return None;
+        }
         // Pass 1: prefer agent with existing session for this channel.
         if let Some(cid) = channel_id {
             let idx = self.agents.iter().position(|slot| {
@@ -687,7 +708,10 @@ impl AgentPool {
     }
 
     /// Return an agent to its slot after a task completes.
-    pub fn return_agent(&mut self, agent: OwnedAgent) {
+    pub fn return_agent(&mut self, mut agent: OwnedAgent) {
+        if let Some(revocation) = &self.runtime_revocation {
+            let _ = agent.acp.bind_runtime_revocation(revocation.clone());
+        }
         let idx = agent.index;
         if self.agents[idx].is_some() {
             // This is a bug: two tasks returned the same agent index. Log it

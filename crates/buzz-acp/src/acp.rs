@@ -141,6 +141,9 @@ fn build_initialize_params() -> serde_json::Value {
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
+    /// Registers this child process group with the durable runtime fence.
+    /// The registration moves with the client while it is idle or checked out.
+    runtime_registration: Option<crate::runtime_fence::RuntimeProcessRegistration>,
     /// Write end of the agent's stdin pipe.
     stdin: ChildStdin,
     /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
@@ -414,6 +417,20 @@ fn build_client_capabilities() -> serde_json::Value {
 }
 
 impl AcpClient {
+    /// Immediately revoke the subprocess's ability to perform more work.
+    ///
+    /// Unlike [`Self::shutdown`], this does not wait for the child to exit. It
+    /// exists for fail-closed authority loss, where every worker must receive
+    /// SIGKILL before the runtime spends any time reaping one process.
+    pub(crate) fn kill_now(&mut self) {
+        match self.child.id() {
+            Some(pid) if kill_process_group(pid) => {}
+            _ => {
+                let _ = self.child.start_kill();
+            }
+        }
+    }
+
     /// Kill the agent subprocess and wait for it to exit (no zombies).
     ///
     /// `Drop` only calls `start_kill()` (sends SIGKILL but doesn't reap).
@@ -427,19 +444,30 @@ impl AcpClient {
         //
         // Falls back to start_kill() (direct child only) on non-Unix or if
         // the child has been polled to completion (id() returns None).
-        match self.child.id() {
-            Some(pid) if kill_process_group(pid) => {}
-            _ => {
-                let _ = self.child.start_kill();
-            }
-        }
+        self.kill_now();
         // Bounded wait: if the child doesn't exit within 5s after SIGKILL,
         // give up and let Drop/OS handle it. An unbounded wait here would
         // wedge the harness during respawn or shutdown if a child is stuck.
-        match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::debug!("child wait error after kill: {e}"),
-            Err(_) => tracing::warn!("child did not exit within 5s after SIGKILL — abandoning"),
+        let reaped = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.child.wait(),
+        )
+        .await
+        {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                tracing::debug!("child wait error after kill: {e}");
+                false
+            }
+            Err(_) => {
+                tracing::warn!("child did not exit within 5s after SIGKILL — abandoning");
+                false
+            }
+        };
+        // A reaped PID may be reused by the OS. Remove it from the fence
+        // registry before this AcpClient remains alive for later cleanup.
+        if reaped {
+            self.runtime_registration.take();
         }
     }
 
@@ -547,6 +575,7 @@ impl AcpClient {
 
         Ok(Self {
             child,
+            runtime_registration: None,
             stdin,
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
@@ -564,6 +593,34 @@ impl AcpClient {
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
         })
+    }
+
+    /// Bind this worker process group to a managed runtime's fence authority.
+    pub(crate) fn bind_runtime_revocation(
+        &mut self,
+        revocation: crate::runtime_fence::RuntimeRevocation,
+    ) -> bool {
+        if self.runtime_registration.is_some() {
+            return !revocation.is_revoked();
+        }
+        let Some(process_group) = self.child.id() else {
+            return false;
+        };
+        self.runtime_registration = Some(revocation.register(process_group));
+        // Non-Unix platforms cannot kill by process group from the registry;
+        // retain the owned-child fallback when binding after revocation.
+        if revocation.is_revoked() {
+            self.kill_now();
+            false
+        } else {
+            true
+        }
+    }
+
+    pub(crate) fn runtime_revocation(&self) -> Option<crate::runtime_fence::RuntimeRevocation> {
+        self.runtime_registration
+            .as_ref()
+            .map(crate::runtime_fence::RuntimeProcessRegistration::revocation)
     }
 
     /// Attach a local observer feed to this ACP client.
@@ -2320,7 +2377,7 @@ impl Drop for AcpClient {
 /// Uses `nix::sys::signal::killpg` — a safe wrapper around the POSIX `killpg`
 /// syscall — so the crate's `#![deny(unsafe_code)]` policy is preserved.
 #[cfg(unix)]
-fn kill_process_group(pid: u32) -> bool {
+pub(crate) fn kill_process_group(pid: u32) -> bool {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
 
@@ -2328,10 +2385,23 @@ fn kill_process_group(pid: u32) -> bool {
     killpg(Pid::from_raw(pid as i32), Signal::SIGKILL).is_ok()
 }
 
-/// Fallback for non-Unix: process-group kill not available.
-/// Returns `false` so the caller falls back to `child.start_kill()`.
-#[cfg(not(unix))]
-fn kill_process_group(_pid: u32) -> bool {
+/// Windows equivalent: forcibly terminate the process tree rooted at `pid`.
+#[cfg(windows)]
+pub(crate) fn kill_process_group(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Fallback for unsupported platforms: the owned child path still calls
+/// `start_kill`, but independent process-tree revocation is unavailable.
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn kill_process_group(_pid: u32) -> bool {
     false
 }
 

@@ -199,7 +199,7 @@ buzz-acp --agents 2 --heartbeat-interval 300
 ```bash
 buzz-acp --agents 2 --heartbeat-interval 300 \
   --heartbeat-mode schedules \
-  --heartbeat-prompt "Run buzz schedules claim-due. Process only claimed items and complete or reschedule each claim. If none are due, publish nothing."
+  --heartbeat-prompt "Run buzz schedules claim-due. Bind claimed schema-1 items before acting. End every claimed schema-2 item with exactly one buzz schedules reconcile keep, wake, redirect, or complete decision. Keep is silent. Wake, redirect, and complete require --message; redirect's message is the exact new delegation with one Expected result line and one Evidence locator line. If none are due, publish nothing."
 ```
 
 ### Shared Identity
@@ -211,26 +211,64 @@ All N agents authenticate as the **same Nostr bot identity** — users see one b
 When `--heartbeat-interval` is set, the harness fires a prompt on an idle agent at the configured interval. Heartbeat rules:
 
 - **Lower priority than queued events** — if events are pending, they are dispatched first.
-- **Skipped when all agents are busy** — no queuing; the tick is simply dropped.
+- **Skipped when all agents are busy** — feed-mode ticks are dropped. In schedule mode, a tick that arrives while the preceding heartbeat is still running requests a fresh encrypted-head scan after that turn finishes; it does not blindly dispatch a second heartbeat. Another turn runs only when the refreshed earliest claim time is actually due. Schedule mode also refreshes the encrypted schedule heads after every completed agent turn and arms one exact wake for the earliest claimable due time, so a fixed tick that lands just before an item becomes due cannot defer it to the following interval. Already-due retries use a bounded delay rather than busy polling.
 - **At most one heartbeat in flight globally** — the next tick is suppressed until the current one completes.
 - **Default mode is unchanged** — `--heartbeat-mode feed` runs the historical needs-action and mentions checks.
-- **Schedule mode is opt-in** — `--heartbeat-mode schedules` runs `buzz schedules claim-due`, thread reconciliation, and the needs-action feed. It deliberately leaves human mentions to normal relay delivery and startup catch-up. A heartbeat does not start while a channel turn is active, and an accepted foreground message cancels a running heartbeat so background work does not race the ordinary turn. Before publishing, it re-reads the target thread and stays silent when the exact claimed obligation and result were already covered. On a lazy managed-agent pool, only this opted-in mode wakes the pool after restart or idle re-sleep.
+- **Schedule mode is opt-in** — `--heartbeat-mode schedules` runs only `buzz schedules claim-due` and thread reconciliation. It deliberately leaves needs-action items and human mentions to normal relay delivery and startup catch-up. Schedule-mode visible output must come from the durable reconciliation outbox for a claimed due obligation; it cannot publish an unclaimed status. A heartbeat does not start while a channel turn is active, and an accepted foreground message cancels a running heartbeat so background work does not race the ordinary turn. Before publishing, it re-reads the target thread and stays silent when the exact claimed obligation and result were already covered. On a lazy managed-agent pool, only this opted-in mode wakes the pool after restart or idle re-sleep.
 - **Custom prompts still replace the built-in prompt** — set `--heartbeat-mode schedules` as well when a custom schedule prompt must wake a lazy pool.
 
 Schedule mode is driver-neutral. Any managed agent that the owner designated to
 own an outcome, provide status, or coordinate a conversation can create the
 conversation-bound item. The delegation in that conversation names exactly one
-owner, the expected result, and the callback/evidence location. At each
-15-minute check, the driver stays silent and reschedules when work is active;
-it verifies the prior owner is inactive before recovering existing work or
-assigning exactly one replacement. The owner-only internal build applies this
-schedule mode and interval to every managed agent; OSS deployments continue to
-opt in explicitly.
+assignee, the expected result, and the callback/evidence location. The schedule
+binds those facts to the exact assignee pubkey and delegation event. The event
+must be authored by the driver in the same channel/thread, p-tag only that
+assignee, and contain exact `Expected result: ...` and `Evidence locator: ...`
+lines. At each
+15-minute check, the driver stays silent only for a newer task-bound receipt;
+generic online presence, an open session, or an unchanged dirty worktree cannot
+keep work alive. With no newer receipt the driver wakes the same assignee once; a
+second unchanged check requires exactly one replacement. Every keep, wake,
+redirect, and completion decision remains in the schedule's durable audit. The
+keep transition is silent. Wake, redirect, and complete require `--message`;
+the reconcile command publishes that exact signed action from a durable outbox,
+so callers do not send a separate message. A redirect message is itself the new
+delegation and repeats the exact stored `Expected result:` and `Evidence locator:`
+lines once each. If publishing or finalization is retried, the stored event ID is
+reused rather than creating a duplicate visible action. The
+next check is constrained to 10–15 minutes after each decision so it is due by
+the next heartbeat, material receipt
+times cannot be in the future, and canonical receipt formats cannot encode
+generic `online`/`running` presence as progress. Audit history rolls into linked,
+immutable NIP-AE archive entries before the active head reaches its real
+plaintext cap. The
+owner-only internal build applies this schedule mode and interval to every
+managed agent; OSS deployments continue to opt in explicitly.
 
 Schedules are private NIP-AE entries owned by the bot that created them. They
 survive process and app restarts. A claim lease prevents overlapping heartbeat
 work; an abandoned claim becomes due again after the lease, so the schedule's
 `check` instruction must reconcile any external effect before repeating it.
+Task-bound schedules use `buzz schedules reconcile`; legacy `complete` and
+`reschedule` commands cannot bypass the typed receipt/wake/redirect state.
+
+Owner-backed runtimes also acquire one short encrypted NIP-AE identity fence
+before advertising readiness or consuming foreground events. Two processes
+using the same bot key and owner therefore cannot both answer the same relay
+event: atomic revision replacement admits one runtime, renews its lease every
+30 seconds, and makes a loser exit before dispatch. A renewal must finish at
+least 30 seconds before the 90-second lease expires. Missing that local deadline
+immediately revokes a shared process registry and kills every worker process
+group directly from the fence monitor. This does not wait for the relay event
+loop to finish a metadata/access request or observe a notification. Later main
+loop cleanup still cancels and reaps those workers, while ordinary operator
+shutdown retains its separate graceful path. A replacement therefore cannot
+overlap an old in-flight turn. Eager, lazy-wake, elastic-refill, and crash-respawn
+children enter that registry immediately after process spawn, before their ACP
+initialize request, so revocation also covers a main loop blocked while a new
+worker starts. The fence is scoped to that agent identity, so other agents,
+obligations, channels, and the configured worker parallelism remain
+independent. The public bot key does not change.
 
 Heartbeat is designed for idle periods. Under sustained event load it will rarely fire — that's expected.
 
