@@ -12,6 +12,8 @@ use super::*;
 
 const RELEASE_ID: &str = "1111111111111111111111111111111111111111";
 const SOURCE_TREE: &str = "2222222222222222222222222222222222222222";
+const ROLLBACK_TEST_RELEASE_ID: &str = "3333333333333333333333333333333333333333";
+const ROLLBACK_TEST_SOURCE_TREE: &str = "4444444444444444444444444444444444444444";
 const ARTIFACT_MODE: &str = "0555";
 
 struct Fixture {
@@ -30,6 +32,12 @@ struct Fixture {
     wrapper_size: u64,
     libexec_hash: String,
     libexec_size: u64,
+    rollback_wrapper: PathBuf,
+    rollback_manifest_hash: String,
+    rollback_wrapper_hash: String,
+    rollback_wrapper_size: u64,
+    rollback_libexec_hash: String,
+    rollback_libexec_size: u64,
     pubkeys: Vec<String>,
 }
 
@@ -68,7 +76,7 @@ impl Fixture {
             },
             "desktop_contract": {
                 "acp_command": wrapper.to_string_lossy(),
-                "environment": approved_environment(),
+                "environment": EnvironmentContract::Forward.env_set(),
                 "unchanged_desktop": "/Applications/Buzz.app 0.5.19",
                 "unchanged_global_cli": "/Users/timi/.local/bin/buzz"
             },
@@ -83,6 +91,63 @@ impl Fixture {
         fs::write(&manifest, &manifest_bytes).expect("write manifest");
         set_mode(&manifest, 0o444);
         let manifest_hash = sha256(&manifest_bytes);
+
+        let rollback_release_root = runtime_root.join(ROLLBACK_TEST_RELEASE_ID);
+        let rollback_wrapper = rollback_release_root.join("bin/buzz-acp");
+        let rollback_libexec = rollback_release_root.join("libexec/buzz-acp");
+        fs::create_dir_all(rollback_wrapper.parent().expect("rollback wrapper parent"))
+            .expect("create rollback wrapper directory");
+        fs::create_dir_all(rollback_libexec.parent().expect("rollback libexec parent"))
+            .expect("create rollback libexec directory");
+        let rollback_libexec_bytes = b"fixture immutable rollback executable bytes";
+        fs::write(&rollback_wrapper, wrapper_bytes).expect("write rollback wrapper fixture");
+        fs::write(&rollback_libexec, rollback_libexec_bytes)
+            .expect("write rollback libexec fixture");
+        set_mode(&rollback_wrapper, 0o555);
+        set_mode(&rollback_libexec, 0o555);
+        let rollback_wrapper_hash = sha256(wrapper_bytes);
+        let rollback_libexec_hash = sha256(rollback_libexec_bytes);
+        let rollback_wrapper_size =
+            u64::try_from(wrapper_bytes.len()).expect("rollback wrapper size");
+        let rollback_libexec_size =
+            u64::try_from(rollback_libexec_bytes.len()).expect("rollback libexec size");
+        let rollback_manifest = rollback_release_root.join("MANIFEST.json");
+        let rollback_manifest_value = json!({
+            "schema": 1,
+            "source": {
+                "commit": ROLLBACK_TEST_RELEASE_ID,
+                "tree": ROLLBACK_TEST_SOURCE_TREE
+            },
+            "build": {
+                "profile": "release",
+                "target": "aarch64-apple-darwin",
+                "toolchain": "rustc 1.95.0"
+            },
+            "desktop_contract": {
+                "acp_command": rollback_wrapper.to_string_lossy(),
+                "environment": EnvironmentContract::Rollback.env_set(),
+                "unchanged_desktop": "/Applications/Buzz.app 0.5.19",
+                "unchanged_global_cli": "/Users/timi/.local/bin/buzz"
+            },
+            "artifacts": [
+                {
+                    "path": "bin/buzz-acp",
+                    "sha256": rollback_wrapper_hash,
+                    "size": rollback_wrapper_size
+                },
+                {
+                    "path": "libexec/buzz-acp",
+                    "sha256": rollback_libexec_hash,
+                    "size": rollback_libexec_size
+                }
+            ]
+        });
+        let mut rollback_manifest_bytes = serde_json::to_vec_pretty(&rollback_manifest_value)
+            .expect("serialize rollback manifest");
+        rollback_manifest_bytes.push(b'\n');
+        fs::write(&rollback_manifest, &rollback_manifest_bytes).expect("write rollback manifest");
+        set_mode(&rollback_manifest, 0o444);
+        let rollback_manifest_hash = sha256(&rollback_manifest_bytes);
 
         let desktop_executable = root.join("buzz-desktop");
         fs::write(&desktop_executable, b"desktop fixture").expect("write desktop fixture");
@@ -108,6 +173,12 @@ impl Fixture {
             wrapper_size,
             libexec_hash,
             libexec_size,
+            rollback_wrapper,
+            rollback_manifest_hash,
+            rollback_wrapper_hash,
+            rollback_wrapper_size,
+            rollback_libexec_hash,
+            rollback_libexec_size,
             pubkeys,
         }
     }
@@ -130,8 +201,31 @@ impl Fixture {
             "expectedArtifactOwner": self.owner,
             "expectedArtifactMode": ARTIFACT_MODE,
             "parallelism": REQUIRED_PARALLELISM,
-            "envSet": approved_environment(),
+            "envSet": EnvironmentContract::Forward.env_set(),
             "envUnset": []
+        })
+    }
+
+    fn rollback_request(&self) -> Value {
+        json!({
+            "schemaVersion": 1,
+            "expectedStoreSha256": sha256(&self.store_bytes()),
+            "expectedAgentCount": CANONICAL_AGENT_COUNT,
+            "expectedDesktopPid": dead_pid(),
+            "targetPubkeys": self.pubkeys,
+            "acpCommand": self.rollback_wrapper.to_string_lossy(),
+            "expectedReleaseId": ROLLBACK_TEST_RELEASE_ID,
+            "expectedSourceTree": ROLLBACK_TEST_SOURCE_TREE,
+            "expectedManifestSha256": self.rollback_manifest_hash,
+            "expectedAcpCommandSha256": self.rollback_wrapper_hash,
+            "expectedAcpCommandSize": self.rollback_wrapper_size,
+            "expectedLibexecSha256": self.rollback_libexec_hash,
+            "expectedLibexecSize": self.rollback_libexec_size,
+            "expectedArtifactOwner": self.owner,
+            "expectedArtifactMode": ARTIFACT_MODE,
+            "parallelism": REQUIRED_PARALLELISM,
+            "envSet": EnvironmentContract::Rollback.env_set(),
+            "envUnset": EnvironmentContract::Rollback.env_unset()
         })
     }
 
@@ -149,7 +243,7 @@ impl Fixture {
             canonical_store_path: &self.store,
             desktop_executable: &self.desktop_executable,
             expected_agent_count: CANONICAL_AGENT_COUNT,
-            artifacts: ArtifactContract {
+            forward_artifacts: ArtifactContract {
                 release_id: RELEASE_ID,
                 source_tree: SOURCE_TREE,
                 manifest_sha256: &self.manifest_hash,
@@ -159,6 +253,21 @@ impl Fixture {
                 libexec_size: self.libexec_size,
                 owner,
                 mode: ARTIFACT_MODE,
+                toolchain: "rustc 1.93.0",
+                environment: EnvironmentContract::Forward,
+            },
+            rollback_artifacts: ArtifactContract {
+                release_id: ROLLBACK_TEST_RELEASE_ID,
+                source_tree: ROLLBACK_TEST_SOURCE_TREE,
+                manifest_sha256: &self.rollback_manifest_hash,
+                command_sha256: &self.rollback_wrapper_hash,
+                command_size: self.rollback_wrapper_size,
+                libexec_sha256: &self.rollback_libexec_hash,
+                libexec_size: self.rollback_libexec_size,
+                owner,
+                mode: ARTIFACT_MODE,
+                toolchain: "rustc 1.95.0",
+                environment: EnvironmentContract::Rollback,
             },
             process_inspector: inspector,
         }
@@ -401,7 +510,7 @@ fn fleet_wide_apply_preserves_every_unapproved_field_and_keyless_record() {
         }
         assert_eq!(after_record["acp_command"], json!(fixture.wrapper));
         assert_eq!(after_record["parallelism"], REQUIRED_PARALLELISM);
-        for (key, value) in approved_environment() {
+        for (key, value) in EnvironmentContract::Forward.env_set() {
             assert_eq!(after_record["env_vars"][key], value);
         }
         if let Some(secret) = before_record
@@ -452,6 +561,159 @@ fn dry_run_and_apply_have_identical_candidate_hashes_without_wall_clock_output()
         .expect("apply same candidate");
     assert_eq!(first.after_sha256, applied.after_sha256);
     assert_eq!(applied.after_sha256, sha256(&fixture.store_bytes()));
+}
+
+#[test]
+fn approved_inverse_is_deterministic_and_removes_only_the_two_lazy_pool_keys() {
+    let fixture = Fixture::new();
+    let forward_request = fixture.request();
+    fixture
+        .execute(&forward_request, false, &CountingInspector::default())
+        .expect("apply approved forward contract");
+    let before_inverse = parse_store(&fixture);
+
+    let rollback_request = fixture.rollback_request();
+    let first = fixture
+        .execute(&rollback_request, true, &CountingInspector::default())
+        .expect("first inverse dry run");
+    let second = fixture
+        .execute(&rollback_request, true, &CountingInspector::default())
+        .expect("second inverse dry run");
+    assert_eq!(first, second, "inverse candidate depends on wall clock");
+
+    let applied = fixture
+        .execute(&rollback_request, false, &CountingInspector::default())
+        .expect("apply approved inverse contract");
+    assert_eq!(first.after_sha256, applied.after_sha256);
+    assert_eq!(applied.after_sha256, sha256(&fixture.store_bytes()));
+    assert_eq!(
+        applied.changed_fields,
+        vec!["acp_command".to_owned(), "env_vars".to_owned()]
+    );
+    assert_eq!(
+        applied.changed_env_keys,
+        vec![
+            "BUZZ_ACP_IDLE_POOL_SLEEP".to_owned(),
+            "BUZZ_ACP_LAZY_POOL".to_owned()
+        ]
+    );
+
+    let after_inverse = parse_store(&fixture);
+    for (before_record, after_record) in before_inverse
+        .as_array()
+        .expect("before inverse records")
+        .iter()
+        .zip(after_inverse.as_array().expect("after inverse records"))
+    {
+        if before_record["pubkey"] == "" {
+            assert_eq!(after_record, before_record, "keyless record changed");
+            continue;
+        }
+        for field in [
+            "pubkey",
+            "name",
+            "persona_id",
+            "private_key_nsec",
+            "auth_tag",
+            "system_prompt",
+            "provider",
+            "model",
+            "team_id",
+            "channel_ids",
+            "parallelism",
+            "updated_at",
+            "unknown_extension",
+        ] {
+            assert_eq!(
+                after_record.get(field),
+                before_record.get(field),
+                "inverse changed protected field: {field}"
+            );
+        }
+        assert_ne!(after_record["acp_command"], before_record["acp_command"]);
+        assert_eq!(after_record["acp_command"], json!(fixture.rollback_wrapper));
+        assert!(after_record["env_vars"].get("BUZZ_ACP_LAZY_POOL").is_none());
+        assert!(after_record["env_vars"]
+            .get("BUZZ_ACP_IDLE_POOL_SLEEP")
+            .is_none());
+        for key in ["BUZZ_ACP_HEARTBEAT_INTERVAL", "BUZZ_ACP_HEARTBEAT_MODE"] {
+            assert_eq!(
+                after_record["env_vars"][key], before_record["env_vars"][key],
+                "inverse changed retained heartbeat value: {key}"
+            );
+        }
+        assert_eq!(
+            after_record["env_vars"].get("ARBITRARY_SECRET"),
+            before_record["env_vars"].get("ARBITRARY_SECRET")
+        );
+    }
+}
+
+#[test]
+fn mixed_forward_and_inverse_contracts_are_rejected_without_mutation() {
+    let fixture = Fixture::new();
+    let before = fixture.store_bytes();
+
+    let mut mixed = fixture.request();
+    mixed["expectedLibexecSha256"] = json!(fixture.rollback_libexec_hash);
+    mixed["expectedLibexecSize"] = json!(fixture.rollback_libexec_size);
+    assert_eq!(
+        error_code(fixture.execute(&mixed, false, &CountingInspector::default())),
+        "artifact_contract_mismatch"
+    );
+    assert_eq!(fixture.store_bytes(), before);
+
+    let mut unknown = fixture.rollback_request();
+    unknown["expectedReleaseId"] = json!("f".repeat(40));
+    assert_eq!(
+        error_code(fixture.execute(&unknown, false, &CountingInspector::default())),
+        "artifact_contract_mismatch"
+    );
+    assert_eq!(fixture.store_bytes(), before);
+}
+
+#[test]
+fn production_inverse_contract_is_exactly_the_approved_immutable_release() {
+    let inverse = production_rollback_artifacts();
+    assert_eq!(
+        inverse.release_id,
+        "fda758399379bb46164733b24ba193a0656b289e"
+    );
+    assert_eq!(
+        inverse.source_tree,
+        "75a141a364d34b1d7855252d5be782e153ef4b87"
+    );
+    assert_eq!(
+        inverse.manifest_sha256,
+        "2977b9f86f2e7864d722b07167aab6c49a5969d6cbc43dd1d314423a687faf3f"
+    );
+    assert_eq!(
+        inverse.command_sha256,
+        "8d2720ddde69d25a0d21c28bdd1308cf524243d8cdb86781965a7ade98858745"
+    );
+    assert_eq!(inverse.command_size, 184);
+    assert_eq!(
+        inverse.libexec_sha256,
+        "3083a97fe7f2c813e2bb604049d9cdd0e1e9ee5d8c464121217edd67002e5e96"
+    );
+    assert_eq!(inverse.libexec_size, 13_678_816);
+    assert_eq!(inverse.owner, "timi");
+    assert_eq!(inverse.mode, "0555");
+    assert_eq!(inverse.toolchain, "rustc 1.95.0");
+    assert_eq!(
+        inverse.environment.env_set(),
+        BTreeMap::from([
+            ("BUZZ_ACP_HEARTBEAT_INTERVAL".to_owned(), "900".to_owned()),
+            ("BUZZ_ACP_HEARTBEAT_MODE".to_owned(), "schedules".to_owned())
+        ])
+    );
+    assert_eq!(
+        inverse.environment.env_unset(),
+        vec![
+            "BUZZ_ACP_LAZY_POOL".to_owned(),
+            "BUZZ_ACP_IDLE_POOL_SLEEP".to_owned()
+        ]
+    );
 }
 
 #[test]

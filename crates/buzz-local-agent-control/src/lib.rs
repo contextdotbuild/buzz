@@ -24,16 +24,28 @@ const CANONICAL_STORE_PATH: &str =
     "/Users/timi/Library/Application Support/xyz.block.buzz.app/agents/managed-agents.json";
 const DESKTOP_EXECUTABLE_PATH: &str = "/Applications/Buzz.app/Contents/MacOS/buzz-desktop";
 const STORE_FILENAME: &str = "managed-agents.json";
-const APPROVED_RELEASE_ID: &str = "32bc281d4889f41e28f36b64313d9a4a395816d7";
-const APPROVED_SOURCE_TREE: &str = "68beb7c7203a323dea9ddee51d1f2957c395b8d2";
-const APPROVED_MANIFEST_SHA256: &str =
+const FORWARD_RELEASE_ID: &str = "32bc281d4889f41e28f36b64313d9a4a395816d7";
+const FORWARD_SOURCE_TREE: &str = "68beb7c7203a323dea9ddee51d1f2957c395b8d2";
+const FORWARD_MANIFEST_SHA256: &str =
     "c190079b11ba7202c86a1f1b7d25df815ae10cd65f8ef03a543048c6a6177d6f";
-const APPROVED_COMMAND_SHA256: &str =
+const FORWARD_COMMAND_SHA256: &str =
     "8d2720ddde69d25a0d21c28bdd1308cf524243d8cdb86781965a7ade98858745";
-const APPROVED_COMMAND_SIZE: u64 = 184;
-const APPROVED_LIBEXEC_SHA256: &str =
+const FORWARD_COMMAND_SIZE: u64 = 184;
+const FORWARD_LIBEXEC_SHA256: &str =
     "86bf4676e254d6c64dcce9d134f275c1513554ba89eed40ca91dad0d55ac6ec5";
-const APPROVED_LIBEXEC_SIZE: u64 = 14_013_952;
+const FORWARD_LIBEXEC_SIZE: u64 = 14_013_952;
+const FORWARD_TOOLCHAIN: &str = "rustc 1.93.0";
+const ROLLBACK_RELEASE_ID: &str = "fda758399379bb46164733b24ba193a0656b289e";
+const ROLLBACK_SOURCE_TREE: &str = "75a141a364d34b1d7855252d5be782e153ef4b87";
+const ROLLBACK_MANIFEST_SHA256: &str =
+    "2977b9f86f2e7864d722b07167aab6c49a5969d6cbc43dd1d314423a687faf3f";
+const ROLLBACK_COMMAND_SHA256: &str =
+    "8d2720ddde69d25a0d21c28bdd1308cf524243d8cdb86781965a7ade98858745";
+const ROLLBACK_COMMAND_SIZE: u64 = 184;
+const ROLLBACK_LIBEXEC_SHA256: &str =
+    "3083a97fe7f2c813e2bb604049d9cdd0e1e9ee5d8c464121217edd67002e5e96";
+const ROLLBACK_LIBEXEC_SIZE: u64 = 13_678_816;
+const ROLLBACK_TOOLCHAIN: &str = "rustc 1.95.0";
 const APPROVED_ARTIFACT_OWNER: &str = "timi";
 const APPROVED_ARTIFACT_MODE: &str = "0555";
 const CANONICAL_AGENT_COUNT: usize = 9;
@@ -164,7 +176,8 @@ struct ExecutionContext<'a> {
     canonical_store_path: &'a Path,
     desktop_executable: &'a Path,
     expected_agent_count: usize,
-    artifacts: ArtifactContract<'a>,
+    forward_artifacts: ArtifactContract<'a>,
+    rollback_artifacts: ArtifactContract<'a>,
     process_inspector: &'a dyn ProcessInspector,
 }
 
@@ -179,6 +192,46 @@ struct ArtifactContract<'a> {
     libexec_size: u64,
     owner: &'a str,
     mode: &'a str,
+    toolchain: &'a str,
+    environment: EnvironmentContract,
+}
+
+#[derive(Clone, Copy)]
+enum EnvironmentContract {
+    Forward,
+    Rollback,
+}
+
+fn production_forward_artifacts() -> ArtifactContract<'static> {
+    ArtifactContract {
+        release_id: FORWARD_RELEASE_ID,
+        source_tree: FORWARD_SOURCE_TREE,
+        manifest_sha256: FORWARD_MANIFEST_SHA256,
+        command_sha256: FORWARD_COMMAND_SHA256,
+        command_size: FORWARD_COMMAND_SIZE,
+        libexec_sha256: FORWARD_LIBEXEC_SHA256,
+        libexec_size: FORWARD_LIBEXEC_SIZE,
+        owner: APPROVED_ARTIFACT_OWNER,
+        mode: APPROVED_ARTIFACT_MODE,
+        toolchain: FORWARD_TOOLCHAIN,
+        environment: EnvironmentContract::Forward,
+    }
+}
+
+fn production_rollback_artifacts() -> ArtifactContract<'static> {
+    ArtifactContract {
+        release_id: ROLLBACK_RELEASE_ID,
+        source_tree: ROLLBACK_SOURCE_TREE,
+        manifest_sha256: ROLLBACK_MANIFEST_SHA256,
+        command_sha256: ROLLBACK_COMMAND_SHA256,
+        command_size: ROLLBACK_COMMAND_SIZE,
+        libexec_sha256: ROLLBACK_LIBEXEC_SHA256,
+        libexec_size: ROLLBACK_LIBEXEC_SIZE,
+        owner: APPROVED_ARTIFACT_OWNER,
+        mode: APPROVED_ARTIFACT_MODE,
+        toolchain: ROLLBACK_TOOLCHAIN,
+        environment: EnvironmentContract::Rollback,
+    }
 }
 
 trait ProcessInspector {
@@ -289,17 +342,8 @@ pub fn execute(options: CliOptions) -> Result<Receipt, ControlError> {
             canonical_store_path: Path::new(CANONICAL_STORE_PATH),
             desktop_executable: Path::new(DESKTOP_EXECUTABLE_PATH),
             expected_agent_count: CANONICAL_AGENT_COUNT,
-            artifacts: ArtifactContract {
-                release_id: APPROVED_RELEASE_ID,
-                source_tree: APPROVED_SOURCE_TREE,
-                manifest_sha256: APPROVED_MANIFEST_SHA256,
-                command_sha256: APPROVED_COMMAND_SHA256,
-                command_size: APPROVED_COMMAND_SIZE,
-                libexec_sha256: APPROVED_LIBEXEC_SHA256,
-                libexec_size: APPROVED_LIBEXEC_SIZE,
-                owner: APPROVED_ARTIFACT_OWNER,
-                mode: APPROVED_ARTIFACT_MODE,
-            },
+            forward_artifacts: production_forward_artifacts(),
+            rollback_artifacts: production_rollback_artifacts(),
             process_inspector: &inspector,
         },
     )
@@ -317,8 +361,8 @@ fn execute_with_context(
             "request is not valid schemaVersion 1 JSON",
         )
     })?;
-    validate_request(&request, context)?;
-    validate_release_artifacts(&request, context)?;
+    let artifacts = validate_request(&request, context)?;
+    validate_release_artifacts(&request, context, artifacts)?;
     ensure_desktop_stopped(request.expected_desktop_pid, context)?;
 
     let store = read_secure_store(&options.store_path, context.canonical_store_path)?;
@@ -359,7 +403,7 @@ fn execute_with_context(
     }
 
     let staged_store = stage_restricted_file(&options.store_path, &candidate.bytes)?;
-    validate_release_artifacts(&request, context)?;
+    validate_release_artifacts(&request, context, artifacts)?;
     ensure_desktop_stopped(request.expected_desktop_pid, context)?;
     let current = read_secure_store(&options.store_path, context.canonical_store_path)?;
     if current.identity != store.identity || sha256(&current.bytes) != receipt.actual_before_sha256
@@ -373,10 +417,10 @@ fn execute_with_context(
     Ok(receipt)
 }
 
-fn validate_request(
+fn validate_request<'a>(
     request: &ControlRequest,
-    context: &ExecutionContext<'_>,
-) -> Result<(), ControlError> {
+    context: &ExecutionContext<'a>,
+) -> Result<ArtifactContract<'a>, ControlError> {
     if request.schema_version != SCHEMA_VERSION {
         return Err(ControlError::new(
             "unsupported_schema_version",
@@ -508,48 +552,75 @@ fn require_expected_desktop_stopped(_pid: Option<u32>) -> Result<(), ControlErro
     Ok(())
 }
 
-fn validate_requested_artifact_contract(
+fn validate_requested_artifact_contract<'a>(
     request: &ControlRequest,
-    context: &ExecutionContext<'_>,
-) -> Result<(), ControlError> {
-    let approved = context.artifacts;
-    let exact_command = context
-        .runtime_root
-        .join(approved.release_id)
-        .join("bin/buzz-acp");
-    if request.expected_release_id != approved.release_id
-        || request.expected_source_tree != approved.source_tree
-        || request.expected_manifest_sha256 != approved.manifest_sha256
-        || request.expected_acp_command_sha256 != approved.command_sha256
-        || request.expected_acp_command_size != approved.command_size
-        || request.expected_libexec_sha256 != approved.libexec_sha256
-        || request.expected_libexec_size != approved.libexec_size
-        || request.expected_artifact_owner != approved.owner
-        || request.expected_artifact_mode != approved.mode
-        || Path::new(&request.acp_command) != exact_command
-        || !is_lower_hex(&request.expected_release_id, 40)
-        || !is_lower_hex(&request.expected_source_tree, 40)
-        || !is_lower_hex(&request.expected_manifest_sha256, 64)
-        || !is_lower_hex(&request.expected_acp_command_sha256, 64)
-        || !is_lower_hex(&request.expected_libexec_sha256, 64)
-        || request.env_set != approved_environment()
-        || !request.env_unset.is_empty()
-    {
-        return Err(ControlError::new(
-            "artifact_contract_mismatch",
-            "request does not match the approved immutable heartbeat release contract",
-        ));
+    context: &ExecutionContext<'a>,
+) -> Result<ArtifactContract<'a>, ControlError> {
+    for approved in [context.forward_artifacts, context.rollback_artifacts] {
+        if request_matches_artifact_contract(request, context.runtime_root, approved) {
+            return Ok(approved);
+        }
     }
-    Ok(())
+    Err(ControlError::new(
+        "artifact_contract_mismatch",
+        "request does not match either approved immutable heartbeat release contract",
+    ))
 }
 
-fn approved_environment() -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("BUZZ_ACP_HEARTBEAT_INTERVAL".to_owned(), "900".to_owned()),
-        ("BUZZ_ACP_HEARTBEAT_MODE".to_owned(), "schedules".to_owned()),
-        ("BUZZ_ACP_LAZY_POOL".to_owned(), "true".to_owned()),
-        ("BUZZ_ACP_IDLE_POOL_SLEEP".to_owned(), "300".to_owned()),
-    ])
+fn request_matches_artifact_contract(
+    request: &ControlRequest,
+    runtime_root: &Path,
+    approved: ArtifactContract<'_>,
+) -> bool {
+    let exact_command = runtime_root.join(approved.release_id).join("bin/buzz-acp");
+    request.expected_release_id == approved.release_id
+        && request.expected_source_tree == approved.source_tree
+        && request.expected_manifest_sha256 == approved.manifest_sha256
+        && request.expected_acp_command_sha256 == approved.command_sha256
+        && request.expected_acp_command_size == approved.command_size
+        && request.expected_libexec_sha256 == approved.libexec_sha256
+        && request.expected_libexec_size == approved.libexec_size
+        && request.expected_artifact_owner == approved.owner
+        && request.expected_artifact_mode == approved.mode
+        && Path::new(&request.acp_command) == exact_command
+        && is_lower_hex(&request.expected_release_id, 40)
+        && is_lower_hex(&request.expected_source_tree, 40)
+        && is_lower_hex(&request.expected_manifest_sha256, 64)
+        && is_lower_hex(&request.expected_acp_command_sha256, 64)
+        && is_lower_hex(&request.expected_libexec_sha256, 64)
+        && request.env_set == approved.environment.env_set()
+        && approved.environment.matches_env_unset(&request.env_unset)
+}
+
+impl EnvironmentContract {
+    fn env_set(self) -> BTreeMap<String, String> {
+        let mut environment = BTreeMap::from([
+            ("BUZZ_ACP_HEARTBEAT_INTERVAL".to_owned(), "900".to_owned()),
+            ("BUZZ_ACP_HEARTBEAT_MODE".to_owned(), "schedules".to_owned()),
+        ]);
+        if matches!(self, Self::Forward) {
+            environment.extend([
+                ("BUZZ_ACP_LAZY_POOL".to_owned(), "true".to_owned()),
+                ("BUZZ_ACP_IDLE_POOL_SLEEP".to_owned(), "300".to_owned()),
+            ]);
+        }
+        environment
+    }
+
+    fn env_unset(self) -> Vec<String> {
+        match self {
+            Self::Forward => Vec::new(),
+            Self::Rollback => vec![
+                "BUZZ_ACP_LAZY_POOL".to_owned(),
+                "BUZZ_ACP_IDLE_POOL_SLEEP".to_owned(),
+            ],
+        }
+    }
+
+    fn matches_env_unset(self, actual: &[String]) -> bool {
+        let expected = self.env_unset();
+        actual.len() == expected.len() && expected.iter().all(|key| actual.contains(key))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -597,8 +668,8 @@ struct ManifestArtifact {
 fn validate_release_artifacts(
     request: &ControlRequest,
     context: &ExecutionContext<'_>,
+    approved: ArtifactContract<'_>,
 ) -> Result<(), ControlError> {
-    let approved = context.artifacts;
     let release_root = context.runtime_root.join(approved.release_id);
     require_exact_canonical_path(context.runtime_root, "runtime_root_symlink")?;
     require_exact_canonical_path(&release_root, "release_root_symlink")?;
@@ -628,7 +699,7 @@ fn validate_release_artifacts(
         || manifest.source.tree != request.expected_source_tree
         || manifest.build.profile != "release"
         || manifest.build.target != "aarch64-apple-darwin"
-        || manifest.build.toolchain != "rustc 1.93.0"
+        || manifest.build.toolchain != approved.toolchain
         || manifest.desktop_contract.acp_command != request.acp_command
         || manifest.desktop_contract.environment != request.env_set
         || manifest.desktop_contract.unchanged_desktop != "/Applications/Buzz.app 0.5.19"
