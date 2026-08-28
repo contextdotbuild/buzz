@@ -564,7 +564,7 @@ fn dry_run_and_apply_have_identical_candidate_hashes_without_wall_clock_output()
 }
 
 #[test]
-fn approved_inverse_is_deterministic_and_removes_only_the_two_lazy_pool_keys() {
+fn approved_inverse_is_deterministic_and_preserves_runtime_environment() {
     let fixture = Fixture::new();
     let forward_request = fixture.request();
     fixture
@@ -586,17 +586,8 @@ fn approved_inverse_is_deterministic_and_removes_only_the_two_lazy_pool_keys() {
         .expect("apply approved inverse contract");
     assert_eq!(first.after_sha256, applied.after_sha256);
     assert_eq!(applied.after_sha256, sha256(&fixture.store_bytes()));
-    assert_eq!(
-        applied.changed_fields,
-        vec!["acp_command".to_owned(), "env_vars".to_owned()]
-    );
-    assert_eq!(
-        applied.changed_env_keys,
-        vec![
-            "BUZZ_ACP_IDLE_POOL_SLEEP".to_owned(),
-            "BUZZ_ACP_LAZY_POOL".to_owned()
-        ]
-    );
+    assert_eq!(applied.changed_fields, vec!["acp_command".to_owned()]);
+    assert!(applied.changed_env_keys.is_empty());
 
     let after_inverse = parse_store(&fixture);
     for (before_record, after_record) in before_inverse
@@ -632,11 +623,12 @@ fn approved_inverse_is_deterministic_and_removes_only_the_two_lazy_pool_keys() {
         }
         assert_ne!(after_record["acp_command"], before_record["acp_command"]);
         assert_eq!(after_record["acp_command"], json!(fixture.rollback_wrapper));
-        assert!(after_record["env_vars"].get("BUZZ_ACP_LAZY_POOL").is_none());
-        assert!(after_record["env_vars"]
-            .get("BUZZ_ACP_IDLE_POOL_SLEEP")
-            .is_none());
-        for key in ["BUZZ_ACP_HEARTBEAT_INTERVAL", "BUZZ_ACP_HEARTBEAT_MODE"] {
+        for key in [
+            "BUZZ_ACP_HEARTBEAT_INTERVAL",
+            "BUZZ_ACP_HEARTBEAT_MODE",
+            "BUZZ_ACP_LAZY_POOL",
+            "BUZZ_ACP_IDLE_POOL_SLEEP",
+        ] {
             assert_eq!(
                 after_record["env_vars"][key], before_record["env_vars"][key],
                 "inverse changed retained heartbeat value: {key}"
@@ -677,15 +669,15 @@ fn production_inverse_contract_is_exactly_the_approved_immutable_release() {
     let inverse = production_rollback_artifacts();
     assert_eq!(
         inverse.release_id,
-        "fda758399379bb46164733b24ba193a0656b289e"
+        "32bc281d4889f41e28f36b64313d9a4a395816d7"
     );
     assert_eq!(
         inverse.source_tree,
-        "75a141a364d34b1d7855252d5be782e153ef4b87"
+        "68beb7c7203a323dea9ddee51d1f2957c395b8d2"
     );
     assert_eq!(
         inverse.manifest_sha256,
-        "2977b9f86f2e7864d722b07167aab6c49a5969d6cbc43dd1d314423a687faf3f"
+        "c190079b11ba7202c86a1f1b7d25df815ae10cd65f8ef03a543048c6a6177d6f"
     );
     assert_eq!(
         inverse.command_sha256,
@@ -694,26 +686,22 @@ fn production_inverse_contract_is_exactly_the_approved_immutable_release() {
     assert_eq!(inverse.command_size, 184);
     assert_eq!(
         inverse.libexec_sha256,
-        "3083a97fe7f2c813e2bb604049d9cdd0e1e9ee5d8c464121217edd67002e5e96"
+        "86bf4676e254d6c64dcce9d134f275c1513554ba89eed40ca91dad0d55ac6ec5"
     );
-    assert_eq!(inverse.libexec_size, 13_678_816);
+    assert_eq!(inverse.libexec_size, 14_013_952);
     assert_eq!(inverse.owner, "timi");
     assert_eq!(inverse.mode, "0555");
-    assert_eq!(inverse.toolchain, "rustc 1.95.0");
+    assert_eq!(inverse.toolchain, "rustc 1.93.0");
     assert_eq!(
         inverse.environment.env_set(),
         BTreeMap::from([
             ("BUZZ_ACP_HEARTBEAT_INTERVAL".to_owned(), "900".to_owned()),
-            ("BUZZ_ACP_HEARTBEAT_MODE".to_owned(), "schedules".to_owned())
+            ("BUZZ_ACP_HEARTBEAT_MODE".to_owned(), "schedules".to_owned()),
+            ("BUZZ_ACP_LAZY_POOL".to_owned(), "true".to_owned()),
+            ("BUZZ_ACP_IDLE_POOL_SLEEP".to_owned(), "300".to_owned())
         ])
     );
-    assert_eq!(
-        inverse.environment.env_unset(),
-        vec![
-            "BUZZ_ACP_LAZY_POOL".to_owned(),
-            "BUZZ_ACP_IDLE_POOL_SLEEP".to_owned()
-        ]
-    );
+    assert!(inverse.environment.env_unset().is_empty());
 }
 
 #[test]

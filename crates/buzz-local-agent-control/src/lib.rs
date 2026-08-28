@@ -24,28 +24,28 @@ const CANONICAL_STORE_PATH: &str =
     "/Users/timi/Library/Application Support/xyz.block.buzz.app/agents/managed-agents.json";
 const DESKTOP_EXECUTABLE_PATH: &str = "/Applications/Buzz.app/Contents/MacOS/buzz-desktop";
 const STORE_FILENAME: &str = "managed-agents.json";
-const FORWARD_RELEASE_ID: &str = "32bc281d4889f41e28f36b64313d9a4a395816d7";
-const FORWARD_SOURCE_TREE: &str = "68beb7c7203a323dea9ddee51d1f2957c395b8d2";
+const FORWARD_RELEASE_ID: &str = "0fe6a54b28195be7e2a188f800a0427b7b383513";
+const FORWARD_SOURCE_TREE: &str = "efd70f586e13086868c04842404f313cf6ff2144";
 const FORWARD_MANIFEST_SHA256: &str =
-    "c190079b11ba7202c86a1f1b7d25df815ae10cd65f8ef03a543048c6a6177d6f";
+    "f6e974d9ce1429be95fea77ca600b26c695bb1b549309760faa7a5647d7ded77";
 const FORWARD_COMMAND_SHA256: &str =
     "8d2720ddde69d25a0d21c28bdd1308cf524243d8cdb86781965a7ade98858745";
 const FORWARD_COMMAND_SIZE: u64 = 184;
 const FORWARD_LIBEXEC_SHA256: &str =
-    "86bf4676e254d6c64dcce9d134f275c1513554ba89eed40ca91dad0d55ac6ec5";
-const FORWARD_LIBEXEC_SIZE: u64 = 14_013_952;
-const FORWARD_TOOLCHAIN: &str = "rustc 1.93.0";
-const ROLLBACK_RELEASE_ID: &str = "fda758399379bb46164733b24ba193a0656b289e";
-const ROLLBACK_SOURCE_TREE: &str = "75a141a364d34b1d7855252d5be782e153ef4b87";
+    "ff3df3caaa8a8b69f5cd6307054f4d76abc8eaee5cb3ce91f9fa120e5a0e9ffe";
+const FORWARD_LIBEXEC_SIZE: u64 = 13_941_968;
+const FORWARD_TOOLCHAIN: &str = "rustc 1.95.0";
+const ROLLBACK_RELEASE_ID: &str = "32bc281d4889f41e28f36b64313d9a4a395816d7";
+const ROLLBACK_SOURCE_TREE: &str = "68beb7c7203a323dea9ddee51d1f2957c395b8d2";
 const ROLLBACK_MANIFEST_SHA256: &str =
-    "2977b9f86f2e7864d722b07167aab6c49a5969d6cbc43dd1d314423a687faf3f";
+    "c190079b11ba7202c86a1f1b7d25df815ae10cd65f8ef03a543048c6a6177d6f";
 const ROLLBACK_COMMAND_SHA256: &str =
     "8d2720ddde69d25a0d21c28bdd1308cf524243d8cdb86781965a7ade98858745";
 const ROLLBACK_COMMAND_SIZE: u64 = 184;
 const ROLLBACK_LIBEXEC_SHA256: &str =
-    "3083a97fe7f2c813e2bb604049d9cdd0e1e9ee5d8c464121217edd67002e5e96";
-const ROLLBACK_LIBEXEC_SIZE: u64 = 13_678_816;
-const ROLLBACK_TOOLCHAIN: &str = "rustc 1.95.0";
+    "86bf4676e254d6c64dcce9d134f275c1513554ba89eed40ca91dad0d55ac6ec5";
+const ROLLBACK_LIBEXEC_SIZE: u64 = 14_013_952;
+const ROLLBACK_TOOLCHAIN: &str = "rustc 1.93.0";
 const APPROVED_ARTIFACT_OWNER: &str = "timi";
 const APPROVED_ARTIFACT_MODE: &str = "0555";
 const CANONICAL_AGENT_COUNT: usize = 9;
@@ -594,27 +594,16 @@ fn request_matches_artifact_contract(
 
 impl EnvironmentContract {
     fn env_set(self) -> BTreeMap<String, String> {
-        let mut environment = BTreeMap::from([
+        BTreeMap::from([
             ("BUZZ_ACP_HEARTBEAT_INTERVAL".to_owned(), "900".to_owned()),
             ("BUZZ_ACP_HEARTBEAT_MODE".to_owned(), "schedules".to_owned()),
-        ]);
-        if matches!(self, Self::Forward) {
-            environment.extend([
-                ("BUZZ_ACP_LAZY_POOL".to_owned(), "true".to_owned()),
-                ("BUZZ_ACP_IDLE_POOL_SLEEP".to_owned(), "300".to_owned()),
-            ]);
-        }
-        environment
+            ("BUZZ_ACP_LAZY_POOL".to_owned(), "true".to_owned()),
+            ("BUZZ_ACP_IDLE_POOL_SLEEP".to_owned(), "300".to_owned()),
+        ])
     }
 
     fn env_unset(self) -> Vec<String> {
-        match self {
-            Self::Forward => Vec::new(),
-            Self::Rollback => vec![
-                "BUZZ_ACP_LAZY_POOL".to_owned(),
-                "BUZZ_ACP_IDLE_POOL_SLEEP".to_owned(),
-            ],
-        }
+        Vec::new()
     }
 
     fn matches_env_unset(self, actual: &[String]) -> bool {
