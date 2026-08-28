@@ -1,0 +1,21 @@
+[package]
+name = "buzz-local-agent-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Offline, bounded control surface for existing Buzz managed agents"
+
+[dependencies]
+chrono = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+nix = { version = "0.31", default-features = false, features = ["signal", "process", "user"] }
