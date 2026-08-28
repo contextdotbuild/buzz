@@ -5120,6 +5120,8 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("A missing callback alone does not prove the work stopped"));
         assert!(prompt.contains("publish nothing"));
         assert!(prompt.contains("exact assignee pubkey, delegation event"));
+        assert!(prompt.contains("`buzz schedules assigned`"));
+        assert!(prompt.contains("excludes tasks durably marked redirected or completed"));
         assert!(prompt.contains("Generic `online` presence"));
         assert!(prompt.contains("wake the same assignee once"));
         assert!(prompt.contains("redirect it to exactly one different assignee"));

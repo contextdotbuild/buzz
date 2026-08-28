@@ -1929,6 +1929,18 @@ pub enum SchedulesCmd {
         #[arg(long)]
         owner: Option<String>,
     },
+    /// List structured work assigned to this identity across conversations
+    Assigned {
+        /// Include redirected and completed assignments
+        #[arg(long)]
+        include_closed: bool,
+        /// Ignore assignments older than this Unix timestamp
+        #[arg(long)]
+        since: Option<i64>,
+        /// Maximum assignment messages to inspect
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
     /// List schedules that are due without claiming them
     Due {
         /// Evaluate at this RFC3339 time instead of now
@@ -2671,6 +2683,7 @@ mod tests {
         assert_eq!(
             names(&cmd, "schedules"),
             vec![
+                "assigned",
                 "bind",
                 "claim-due",
                 "complete",
@@ -2714,7 +2727,7 @@ mod tests {
             ("projects", 7),
             ("reactions", 3),
             ("repos", 5),
-            ("schedules", 8),
+            ("schedules", 9),
             ("social", 7),
             ("upload", 1),
             ("users", 5),

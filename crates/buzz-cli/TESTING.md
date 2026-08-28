@@ -548,6 +548,10 @@ buzz schedules create \
   --owner "$OWNER_PUBKEY" | jq .
 
 buzz schedules list --owner "$OWNER_PUBKEY" | jq .
+# Run this from the assignee identity to see its structured assignments across
+# every accessible conversation. Redirected and completed work is hidden by
+# default; --include-closed returns the full lifecycle view.
+buzz schedules assigned | jq .
 CLAIM_AT="$(rfc3339_after 901)"
 buzz schedules due \
   --at "$CLAIM_AT" --owner "$OWNER_PUBKEY" | jq .

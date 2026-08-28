@@ -10,7 +10,7 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
 use crate::client::BuzzClient;
@@ -34,6 +34,7 @@ const MAX_RECEIPT_BYTES: usize = 256;
 const ACTIVE_HEAD_ROLLOVER_BYTES: usize = 48_000;
 const MIN_NEXT_CHECK_SECONDS: i64 = 10 * 60;
 const MAX_NEXT_CHECK_SECONDS: i64 = 15 * 60;
+const TASK_STATE_PREFIX: &str = "buzz-follow-through:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,6 +66,17 @@ enum ScheduleDecision {
     Wake,
     Redirect,
     Completed,
+}
+
+impl ScheduleDecision {
+    fn task_state(self) -> &'static str {
+        match self {
+            Self::Keep => "kept",
+            Self::Wake => "woken",
+            Self::Redirect => "redirected",
+            Self::Completed => "completed",
+        }
+    }
 }
 
 impl From<ScheduleDecisionArg> for ScheduleDecision {
@@ -232,6 +244,36 @@ struct LoadedSchedule {
     schedule: Schedule,
     revision: String,
     slug: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AssignedTaskStatus {
+    Assigned,
+    Woken,
+    Redirected,
+    Completed,
+}
+
+impl AssignedTaskStatus {
+    fn is_closed(self) -> bool {
+        matches!(self, Self::Redirected | Self::Completed)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AssignedTaskOutput {
+    delegation_event_id: String,
+    driver_pubkey: String,
+    channel_id: String,
+    thread_id: String,
+    expected_result: String,
+    evidence_locator: String,
+    delegated_at: u64,
+    status: AssignedTaskStatus,
+    updated_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_event_id: Option<String>,
 }
 
 impl From<LegacyScheduleV1> for Schedule {
@@ -607,6 +649,194 @@ fn validate_delegation_event(
             "delegation event must contain exactly one `{expected_marker}` line and exactly one `{evidence_marker}` line"
         )));
     }
+    Ok(())
+}
+
+fn tag_values<'a>(event: &'a nostr::Event, key: &str) -> Vec<&'a str> {
+    event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some(key))
+        .filter_map(|tag| tag.content())
+        .collect()
+}
+
+fn single_task_marker(content: &str, marker: &str) -> Option<String> {
+    let values: Vec<&str> = content
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix(marker).map(str::trim))
+        .filter(|value| !value.is_empty())
+        .collect();
+    (values.len() == 1).then(|| values[0].to_owned())
+}
+
+fn event_thread_root(event: &nostr::Event) -> Option<String> {
+    let event_id = event.id.to_hex();
+    let has_thread_tag = event
+        .tags
+        .iter()
+        .any(|tag| tag.as_slice().first().map(String::as_str) == Some("e"));
+    match buzz_core::nip10::parse_thread_markers(&event.tags).resolve() {
+        Some((root, _)) => Some(root),
+        None if !has_thread_tag => Some(event_id),
+        None => None,
+    }
+}
+
+fn parse_assigned_task_event(
+    event: &nostr::Event,
+    assignee_pubkey: &str,
+) -> Option<AssignedTaskOutput> {
+    let kind = event.kind.as_u16() as u32;
+    if kind != KIND_STREAM_MESSAGE && kind != KIND_STREAM_MESSAGE_V2 {
+        return None;
+    }
+    let channels = tag_values(event, "h");
+    if channels.len() != 1 || Uuid::parse_str(channels[0]).is_err() {
+        return None;
+    }
+    let mut assignees: Vec<String> = tag_values(event, "p")
+        .into_iter()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    assignees.sort();
+    assignees.dedup();
+    if assignees.as_slice() != [assignee_pubkey] {
+        return None;
+    }
+    let expected_result = single_task_marker(&event.content, "Expected result:")?;
+    let evidence_locator = single_task_marker(&event.content, "Evidence locator:")?;
+    let thread_id = event_thread_root(event)?;
+    let delegated_at = event.created_at.as_secs();
+    Some(AssignedTaskOutput {
+        delegation_event_id: event.id.to_hex(),
+        driver_pubkey: event.pubkey.to_hex(),
+        channel_id: channels[0].to_owned(),
+        thread_id,
+        expected_result,
+        evidence_locator,
+        delegated_at,
+        status: AssignedTaskStatus::Assigned,
+        updated_at: delegated_at,
+        status_event_id: None,
+    })
+}
+
+fn task_state_reference(event: &nostr::Event) -> Option<&str> {
+    let values = tag_values(event, "d");
+    if values.len() != 1 {
+        return None;
+    }
+    values[0].strip_prefix(TASK_STATE_PREFIX)
+}
+
+fn apply_task_state(task: &mut AssignedTaskOutput, event: &nostr::Event) {
+    if event.pubkey.to_hex() != task.driver_pubkey
+        || event.created_at.as_secs() < task.delegated_at
+        || tag_values(event, "h").as_slice() != [task.channel_id.as_str()]
+        || event_thread_root(event).as_deref() != Some(task.thread_id.as_str())
+    {
+        return;
+    }
+    let states = tag_values(event, "task-status");
+    let status = match states.as_slice() {
+        ["woken"] => AssignedTaskStatus::Woken,
+        ["redirected"] => AssignedTaskStatus::Redirected,
+        ["completed"] => AssignedTaskStatus::Completed,
+        _ => return,
+    };
+    let updated_at = event.created_at.as_secs();
+    let event_id = event.id.to_hex();
+    if (updated_at, event_id.as_str())
+        <= (
+            task.updated_at,
+            task.status_event_id.as_deref().unwrap_or(""),
+        )
+    {
+        return;
+    }
+    task.status = status;
+    task.updated_at = updated_at;
+    task.status_event_id = Some(event_id);
+}
+
+async fn assigned(
+    client: &BuzzClient,
+    include_closed: bool,
+    since: Option<i64>,
+    limit: u32,
+) -> Result<(), CliError> {
+    if limit == 0 || limit > 500 {
+        return Err(CliError::Usage("--limit must be between 1 and 500".into()));
+    }
+    if since.is_some_and(|value| value < 0) {
+        return Err(CliError::Usage(
+            "--since must be a non-negative Unix timestamp".into(),
+        ));
+    }
+    let assignee = client.keys().public_key().to_hex();
+    let mut filter = serde_json::json!({
+        "kinds": [KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_V2],
+        "#p": [assignee],
+        "limit": limit,
+    });
+    if let Some(since) = since {
+        filter["since"] = serde_json::json!(since);
+    }
+    let raw = client.query(&filter).await?;
+    let events: Vec<nostr::Event> = serde_json::from_str(&raw)
+        .map_err(|error| CliError::Other(format!("failed to parse assignment query: {error}")))?;
+    let mut tasks: Vec<AssignedTaskOutput> = events
+        .iter()
+        .filter(|event| event.verify().is_ok())
+        .filter_map(|event| parse_assigned_task_event(event, &assignee))
+        .collect();
+
+    if !tasks.is_empty() {
+        let references: Vec<String> = tasks
+            .iter()
+            .map(|task| format!("{TASK_STATE_PREFIX}{}", task.delegation_event_id))
+            .collect();
+        let state_limit = u32::try_from(tasks.len().saturating_mul(8).min(5_000)).unwrap_or(5_000);
+        let state_filter = serde_json::json!({
+            "kinds": [KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_V2],
+            "#d": references,
+            "limit": state_limit,
+        });
+        let raw = client.query(&state_filter).await?;
+        let state_events: Vec<nostr::Event> = serde_json::from_str(&raw).map_err(|error| {
+            CliError::Other(format!("failed to parse assignment-state query: {error}"))
+        })?;
+        let task_indexes: HashMap<String, usize> = tasks
+            .iter()
+            .enumerate()
+            .map(|(index, task)| (task.delegation_event_id.clone(), index))
+            .collect();
+        for event in state_events.iter().filter(|event| event.verify().is_ok()) {
+            let Some(reference) = task_state_reference(event) else {
+                continue;
+            };
+            let Some(index) = task_indexes.get(reference).copied() else {
+                continue;
+            };
+            apply_task_state(&mut tasks[index], event);
+        }
+    }
+
+    if !include_closed {
+        tasks.retain(|task| !task.status.is_closed());
+    }
+    tasks.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| b.delegation_event_id.cmp(&a.delegation_event_id))
+    });
+    println!(
+        "{}",
+        serde_json::to_string(&tasks)
+            .map_err(|error| CliError::Other(format!("assigned-work output failed: {error}")))?
+    );
     Ok(())
 }
 
@@ -2441,6 +2671,16 @@ fn validate_action_event_scope(
     Ok(())
 }
 
+fn task_state_tags(task: &TaskBinding, decision: ScheduleDecision) -> Vec<Vec<String>> {
+    vec![
+        vec![
+            "d".to_owned(),
+            format!("{TASK_STATE_PREFIX}{}", task.delegation_event_id),
+        ],
+        vec!["task-status".to_owned(), decision.task_state().to_owned()],
+    ]
+}
+
 fn build_action_event(
     client: &BuzzClient,
     schedule: &Schedule,
@@ -2479,9 +2719,17 @@ fn build_action_event(
     };
     let created_at = u64::try_from(now.timestamp())
         .map_err(|_| CliError::Other("decision time predates the Nostr epoch".into()))?;
-    let builder = buzz_sdk::build_message(channel, content, Some(&thread), &mentions, false, &[])
-        .map_err(|error| CliError::Other(format!("action message build failed: {error}")))?
-        .custom_created_at(nostr::Timestamp::from(created_at));
+    let task_state_tags = task_state_tags(task, input.decision);
+    let builder = buzz_sdk::build_message(
+        channel,
+        content,
+        Some(&thread),
+        &mentions,
+        false,
+        &task_state_tags,
+    )
+    .map_err(|error| CliError::Other(format!("action message build failed: {error}")))?
+    .custom_created_at(nostr::Timestamp::from(created_at));
     let event = client.sign_event(builder)?;
     match input.decision {
         ScheduleDecision::Redirect => {
@@ -3068,6 +3316,11 @@ pub async fn dispatch(command: SchedulesCmd, client: &BuzzClient) -> Result<(), 
             .await
         }
         SchedulesCmd::List { status, owner } => list(client, status, owner.as_deref()).await,
+        SchedulesCmd::Assigned {
+            include_closed,
+            since,
+            limit,
+        } => assigned(client, include_closed, since, limit).await,
         SchedulesCmd::Due { at, owner } => due(client, at.as_deref(), owner.as_deref()).await,
         SchedulesCmd::ClaimDue {
             at,
@@ -3317,6 +3570,123 @@ mod tests {
             ])
             .sign_with_keys(driver)
             .unwrap()
+    }
+
+    fn task_state_event(
+        driver: &Keys,
+        channel: &str,
+        thread: &str,
+        delegation_event_id: &str,
+        status: &str,
+        created_at: u64,
+    ) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "State changed")
+            .tags([
+                Tag::parse(["h", channel]).unwrap(),
+                Tag::parse(["e", thread, "", "reply"]).unwrap(),
+                Tag::parse([
+                    "d",
+                    format!("{TASK_STATE_PREFIX}{delegation_event_id}").as_str(),
+                ])
+                .unwrap(),
+                Tag::parse(["task-status", status]).unwrap(),
+            ])
+            .custom_created_at(nostr::Timestamp::from(created_at))
+            .sign_with_keys(driver)
+            .unwrap()
+    }
+
+    #[test]
+    fn assigned_view_parses_exact_structured_delegations() {
+        let driver = Keys::generate();
+        let assignee = Keys::generate();
+        let channel = "94b69f8a-59ab-4bd7-a049-e898ae1f624e";
+        let thread = "a".repeat(64);
+        let task = TaskBinding {
+            assignee_pubkey: assignee.public_key().to_hex(),
+            delegation_event_id: "b".repeat(64),
+            expected_result: "land the bounded fix".into(),
+            evidence_locator: "/workspace/fix-worktree".into(),
+        };
+        let event = delegation_event(&driver, channel, &thread, &task, true);
+
+        let parsed = parse_assigned_task_event(&event, &task.assignee_pubkey).unwrap();
+        assert_eq!(parsed.delegation_event_id, event.id.to_hex());
+        assert_eq!(parsed.driver_pubkey, driver.public_key().to_hex());
+        assert_eq!(parsed.channel_id, channel);
+        assert_eq!(parsed.thread_id, thread);
+        assert_eq!(parsed.expected_result, task.expected_result);
+        assert_eq!(parsed.evidence_locator, task.evidence_locator);
+        assert_eq!(parsed.status, AssignedTaskStatus::Assigned);
+
+        assert!(
+            parse_assigned_task_event(&event, &Keys::generate().public_key().to_hex()).is_none()
+        );
+        let unstructured = delegation_event(&driver, channel, &thread, &task, false);
+        assert!(parse_assigned_task_event(&unstructured, &task.assignee_pubkey).is_none());
+    }
+
+    #[test]
+    fn assigned_view_accepts_only_driver_scoped_lifecycle_state() {
+        let driver = Keys::generate();
+        let assignee = Keys::generate();
+        let channel = "94b69f8a-59ab-4bd7-a049-e898ae1f624e";
+        let thread = "a".repeat(64);
+        let task = TaskBinding {
+            assignee_pubkey: assignee.public_key().to_hex(),
+            delegation_event_id: "b".repeat(64),
+            expected_result: "return the exact candidate".into(),
+            evidence_locator: "/workspace/candidate".into(),
+        };
+        let delegation = delegation_event(&driver, channel, &thread, &task, true);
+        let mut parsed = parse_assigned_task_event(&delegation, &task.assignee_pubkey).unwrap();
+        let completed = task_state_event(
+            &driver,
+            channel,
+            &thread,
+            &delegation.id.to_hex(),
+            "completed",
+            parsed.delegated_at + 1,
+        );
+        assert_eq!(
+            task_state_reference(&completed),
+            Some(delegation.id.to_hex().as_str())
+        );
+        apply_task_state(&mut parsed, &completed);
+        assert_eq!(parsed.status, AssignedTaskStatus::Completed);
+        assert!(parsed.status.is_closed());
+        assert_eq!(parsed.status_event_id, Some(completed.id.to_hex()));
+
+        let forged = task_state_event(
+            &Keys::generate(),
+            channel,
+            &thread,
+            &delegation.id.to_hex(),
+            "woken",
+            parsed.updated_at + 1,
+        );
+        apply_task_state(&mut parsed, &forged);
+        assert_eq!(parsed.status, AssignedTaskStatus::Completed);
+    }
+
+    #[test]
+    fn visible_follow_through_actions_carry_read_only_task_state_tags() {
+        let task = TaskBinding {
+            assignee_pubkey: "a".repeat(64),
+            delegation_event_id: "b".repeat(64),
+            expected_result: "bounded result".into(),
+            evidence_locator: "/workspace/result".into(),
+        };
+        assert_eq!(
+            task_state_tags(&task, ScheduleDecision::Completed),
+            vec![
+                vec![
+                    "d".to_owned(),
+                    format!("{TASK_STATE_PREFIX}{}", task.delegation_event_id),
+                ],
+                vec!["task-status".to_owned(), "completed".to_owned()],
+            ]
+        );
     }
 
     fn scoped_event(
