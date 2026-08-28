@@ -22,6 +22,7 @@ struct Fixture {
     release_root: PathBuf,
     wrapper: PathBuf,
     libexec: PathBuf,
+    mcp: PathBuf,
     manifest: PathBuf,
     desktop_executable: PathBuf,
     store: PathBuf,
@@ -32,6 +33,8 @@ struct Fixture {
     wrapper_size: u64,
     libexec_hash: String,
     libexec_size: u64,
+    mcp_hash: String,
+    mcp_size: u64,
     rollback_wrapper: PathBuf,
     rollback_manifest_hash: String,
     rollback_wrapper_hash: String,
@@ -49,22 +52,28 @@ impl Fixture {
         let release_root = runtime_root.join(RELEASE_ID);
         let wrapper = release_root.join("bin/buzz-acp");
         let libexec = release_root.join("libexec/buzz-acp");
+        let mcp = release_root.join("bin/buzz-dev-mcp");
         fs::create_dir_all(wrapper.parent().expect("wrapper parent"))
             .expect("create wrapper directory");
         fs::create_dir_all(libexec.parent().expect("libexec parent"))
             .expect("create libexec directory");
         let wrapper_bytes = b"#!/bin/sh\nexec ../libexec/buzz-acp \"$@\"\n";
         let libexec_bytes = b"fixture immutable runtime executable bytes";
+        let mcp_bytes = b"fixture immutable MCP executable bytes";
         fs::write(&wrapper, wrapper_bytes).expect("write wrapper fixture");
         fs::write(&libexec, libexec_bytes).expect("write libexec fixture");
+        fs::write(&mcp, mcp_bytes).expect("write MCP fixture");
         set_mode(&wrapper, 0o555);
         set_mode(&libexec, 0o555);
+        set_mode(&mcp, 0o555);
 
         let owner = current_owner();
         let wrapper_hash = sha256(wrapper_bytes);
         let libexec_hash = sha256(libexec_bytes);
+        let mcp_hash = sha256(mcp_bytes);
         let wrapper_size = u64::try_from(wrapper_bytes.len()).expect("wrapper size");
         let libexec_size = u64::try_from(libexec_bytes.len()).expect("libexec size");
+        let mcp_size = u64::try_from(mcp_bytes.len()).expect("MCP size");
         let manifest = release_root.join("MANIFEST.json");
         let manifest_value = json!({
             "schema": 1,
@@ -76,13 +85,15 @@ impl Fixture {
             },
             "desktop_contract": {
                 "acp_command": wrapper.to_string_lossy(),
+                "mcp_command": mcp.to_string_lossy(),
                 "environment": EnvironmentContract::Forward.env_set(),
                 "unchanged_desktop": "/Applications/Buzz.app 0.5.19",
                 "unchanged_global_cli": "/Users/timi/.local/bin/buzz"
             },
             "artifacts": [
                 {"path": "bin/buzz-acp", "sha256": wrapper_hash, "size": wrapper_size},
-                {"path": "libexec/buzz-acp", "sha256": libexec_hash, "size": libexec_size}
+                {"path": "libexec/buzz-acp", "sha256": libexec_hash, "size": libexec_size},
+                {"path": "bin/buzz-dev-mcp", "sha256": mcp_hash, "size": mcp_size}
             ]
         });
         let mut manifest_bytes =
@@ -163,6 +174,7 @@ impl Fixture {
             release_root,
             wrapper,
             libexec,
+            mcp,
             manifest,
             desktop_executable,
             store,
@@ -173,6 +185,8 @@ impl Fixture {
             wrapper_size,
             libexec_hash,
             libexec_size,
+            mcp_hash,
+            mcp_size,
             rollback_wrapper,
             rollback_manifest_hash,
             rollback_wrapper_hash,
@@ -191,6 +205,7 @@ impl Fixture {
             "expectedDesktopPid": dead_pid(),
             "targetPubkeys": self.pubkeys,
             "acpCommand": self.wrapper.to_string_lossy(),
+            "mcpCommand": self.mcp.to_string_lossy(),
             "expectedReleaseId": RELEASE_ID,
             "expectedSourceTree": SOURCE_TREE,
             "expectedManifestSha256": self.manifest_hash,
@@ -198,6 +213,8 @@ impl Fixture {
             "expectedAcpCommandSize": self.wrapper_size,
             "expectedLibexecSha256": self.libexec_hash,
             "expectedLibexecSize": self.libexec_size,
+            "expectedMcpCommandSha256": self.mcp_hash,
+            "expectedMcpCommandSize": self.mcp_size,
             "expectedArtifactOwner": self.owner,
             "expectedArtifactMode": ARTIFACT_MODE,
             "parallelism": REQUIRED_PARALLELISM,
@@ -214,6 +231,7 @@ impl Fixture {
             "expectedDesktopPid": dead_pid(),
             "targetPubkeys": self.pubkeys,
             "acpCommand": self.rollback_wrapper.to_string_lossy(),
+            "mcpCommand": "buzz-dev-mcp",
             "expectedReleaseId": ROLLBACK_TEST_RELEASE_ID,
             "expectedSourceTree": ROLLBACK_TEST_SOURCE_TREE,
             "expectedManifestSha256": self.rollback_manifest_hash,
@@ -221,6 +239,8 @@ impl Fixture {
             "expectedAcpCommandSize": self.rollback_wrapper_size,
             "expectedLibexecSha256": self.rollback_libexec_hash,
             "expectedLibexecSize": self.rollback_libexec_size,
+            "expectedMcpCommandSha256": "",
+            "expectedMcpCommandSize": 0,
             "expectedArtifactOwner": self.owner,
             "expectedArtifactMode": ARTIFACT_MODE,
             "parallelism": REQUIRED_PARALLELISM,
@@ -251,6 +271,10 @@ impl Fixture {
                 command_size: self.wrapper_size,
                 libexec_sha256: &self.libexec_hash,
                 libexec_size: self.libexec_size,
+                mcp: McpContract::RuntimeArtifact {
+                    sha256: &self.mcp_hash,
+                    size: self.mcp_size,
+                },
                 owner,
                 mode: ARTIFACT_MODE,
                 toolchain: "rustc 1.93.0",
@@ -264,6 +288,7 @@ impl Fixture {
                 command_size: self.rollback_wrapper_size,
                 libexec_sha256: &self.rollback_libexec_hash,
                 libexec_size: self.rollback_libexec_size,
+                mcp: McpContract::BundledCommand,
                 owner,
                 mode: ARTIFACT_MODE,
                 toolchain: "rustc 1.95.0",
@@ -377,6 +402,7 @@ fn base_records(pubkeys: &[String]) -> Value {
             "team_id": format!("team-{index}"),
             "channel_ids": [format!("channel-secret-{index}")],
             "acp_command": "/previous/bin/buzz-acp",
+            "mcp_command": "buzz-dev-mcp",
             "parallelism": 10,
             "updated_at": format!("2026-01-{index:02}T00:00:00Z"),
             "unknown_extension": {"preserve": [index, 2, 1]}
@@ -509,6 +535,7 @@ fn fleet_wide_apply_preserves_every_unapproved_field_and_keyless_record() {
             );
         }
         assert_eq!(after_record["acp_command"], json!(fixture.wrapper));
+        assert_eq!(after_record["mcp_command"], json!(fixture.mcp));
         assert_eq!(after_record["parallelism"], REQUIRED_PARALLELISM);
         for (key, value) in EnvironmentContract::Forward.env_set() {
             assert_eq!(after_record["env_vars"][key], value);
@@ -586,7 +613,10 @@ fn approved_inverse_is_deterministic_and_preserves_runtime_environment() {
         .expect("apply approved inverse contract");
     assert_eq!(first.after_sha256, applied.after_sha256);
     assert_eq!(applied.after_sha256, sha256(&fixture.store_bytes()));
-    assert_eq!(applied.changed_fields, vec!["acp_command".to_owned()]);
+    assert_eq!(
+        applied.changed_fields,
+        vec!["acp_command".to_owned(), "mcp_command".to_owned()]
+    );
     assert!(applied.changed_env_keys.is_empty());
 
     let after_inverse = parse_store(&fixture);
@@ -623,6 +653,8 @@ fn approved_inverse_is_deterministic_and_preserves_runtime_environment() {
         }
         assert_ne!(after_record["acp_command"], before_record["acp_command"]);
         assert_eq!(after_record["acp_command"], json!(fixture.rollback_wrapper));
+        assert_ne!(after_record["mcp_command"], before_record["mcp_command"]);
+        assert_eq!(after_record["mcp_command"], json!("buzz-dev-mcp"));
         for key in [
             "BUZZ_ACP_HEARTBEAT_INTERVAL",
             "BUZZ_ACP_HEARTBEAT_MODE",
@@ -669,15 +701,15 @@ fn production_inverse_contract_is_exactly_the_approved_immutable_release() {
     let inverse = production_rollback_artifacts();
     assert_eq!(
         inverse.release_id,
-        "32bc281d4889f41e28f36b64313d9a4a395816d7"
+        "0fe6a54b28195be7e2a188f800a0427b7b383513"
     );
     assert_eq!(
         inverse.source_tree,
-        "68beb7c7203a323dea9ddee51d1f2957c395b8d2"
+        "efd70f586e13086868c04842404f313cf6ff2144"
     );
     assert_eq!(
         inverse.manifest_sha256,
-        "c190079b11ba7202c86a1f1b7d25df815ae10cd65f8ef03a543048c6a6177d6f"
+        "f6e974d9ce1429be95fea77ca600b26c695bb1b549309760faa7a5647d7ded77"
     );
     assert_eq!(
         inverse.command_sha256,
@@ -686,12 +718,13 @@ fn production_inverse_contract_is_exactly_the_approved_immutable_release() {
     assert_eq!(inverse.command_size, 184);
     assert_eq!(
         inverse.libexec_sha256,
-        "86bf4676e254d6c64dcce9d134f275c1513554ba89eed40ca91dad0d55ac6ec5"
+        "ff3df3caaa8a8b69f5cd6307054f4d76abc8eaee5cb3ce91f9fa120e5a0e9ffe"
     );
-    assert_eq!(inverse.libexec_size, 14_013_952);
+    assert_eq!(inverse.libexec_size, 13_941_968);
     assert_eq!(inverse.owner, "timi");
     assert_eq!(inverse.mode, "0555");
-    assert_eq!(inverse.toolchain, "rustc 1.93.0");
+    assert_eq!(inverse.toolchain, "rustc 1.95.0");
+    assert!(matches!(inverse.mcp, McpContract::BundledCommand));
     assert_eq!(
         inverse.environment.env_set(),
         BTreeMap::from([
@@ -849,6 +882,16 @@ fn immutable_release_hashes_modes_and_symlinks_are_enforced() {
         "libexec_hash_mismatch"
     );
 
+    let mcp_fixture = Fixture::new();
+    let mcp_request = mcp_fixture.request();
+    let mut wrong_mcp = fs::read(&mcp_fixture.mcp).expect("read MCP executable");
+    wrong_mcp[0] ^= 1;
+    overwrite_artifact(&mcp_fixture.mcp, &wrong_mcp, 0o555);
+    assert_eq!(
+        error_code(mcp_fixture.execute(&mcp_request, false, &CountingInspector::default())),
+        "mcp_command_hash_mismatch"
+    );
+
     let mode_fixture = Fixture::new();
     let mode_request = mode_fixture.request();
     set_mode(&mode_fixture.wrapper, 0o575);
@@ -888,6 +931,23 @@ fn immutable_release_hashes_modes_and_symlinks_are_enforced() {
                 &CountingInspector::default()
             )),
             "libexec_validation_failed"
+        );
+
+        let mcp_symlink_fixture = Fixture::new();
+        let mcp_symlink_request = mcp_symlink_fixture.request();
+        let actual_mcp = mcp_symlink_fixture
+            .release_root
+            .join("bin/actual-buzz-dev-mcp");
+        fs::rename(&mcp_symlink_fixture.mcp, &actual_mcp).expect("move MCP executable");
+        std::os::unix::fs::symlink(&actual_mcp, &mcp_symlink_fixture.mcp)
+            .expect("symlink MCP executable");
+        assert_eq!(
+            error_code(mcp_symlink_fixture.execute(
+                &mcp_symlink_request,
+                false,
+                &CountingInspector::default()
+            )),
+            "mcp_command_validation_failed"
         );
 
         let release_fixture = Fixture::new();

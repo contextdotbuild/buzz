@@ -24,28 +24,30 @@ const CANONICAL_STORE_PATH: &str =
     "/Users/timi/Library/Application Support/xyz.block.buzz.app/agents/managed-agents.json";
 const DESKTOP_EXECUTABLE_PATH: &str = "/Applications/Buzz.app/Contents/MacOS/buzz-desktop";
 const STORE_FILENAME: &str = "managed-agents.json";
-const FORWARD_RELEASE_ID: &str = "0fe6a54b28195be7e2a188f800a0427b7b383513";
-const FORWARD_SOURCE_TREE: &str = "efd70f586e13086868c04842404f313cf6ff2144";
+const FORWARD_RELEASE_ID: &str = "d10de1f346242cf2615026764671bb2e73f577e8";
+const FORWARD_SOURCE_TREE: &str = "fcab2055f7e6123245b2a125ee5bb0ea8a1f2071";
 const FORWARD_MANIFEST_SHA256: &str =
-    "f6e974d9ce1429be95fea77ca600b26c695bb1b549309760faa7a5647d7ded77";
+    "1326abc216818f51c419953992bf09a9df36c5e9a57f3c13e174aedcbf532a15";
 const FORWARD_COMMAND_SHA256: &str =
     "8d2720ddde69d25a0d21c28bdd1308cf524243d8cdb86781965a7ade98858745";
 const FORWARD_COMMAND_SIZE: u64 = 184;
 const FORWARD_LIBEXEC_SHA256: &str =
-    "ff3df3caaa8a8b69f5cd6307054f4d76abc8eaee5cb3ce91f9fa120e5a0e9ffe";
-const FORWARD_LIBEXEC_SIZE: u64 = 13_941_968;
+    "336449c34c2a780b9db4fe1edbd6753f6e938976b8677ada4b1ef86f6e5cbec3";
+const FORWARD_LIBEXEC_SIZE: u64 = 13_889_392;
+const FORWARD_MCP_SHA256: &str = "adcb70b53513658f73961adfd6e0337e2a6fb519c3b58cf3892c7f12dcfe3572";
+const FORWARD_MCP_SIZE: u64 = 19_951_152;
 const FORWARD_TOOLCHAIN: &str = "rustc 1.95.0";
-const ROLLBACK_RELEASE_ID: &str = "32bc281d4889f41e28f36b64313d9a4a395816d7";
-const ROLLBACK_SOURCE_TREE: &str = "68beb7c7203a323dea9ddee51d1f2957c395b8d2";
+const ROLLBACK_RELEASE_ID: &str = "0fe6a54b28195be7e2a188f800a0427b7b383513";
+const ROLLBACK_SOURCE_TREE: &str = "efd70f586e13086868c04842404f313cf6ff2144";
 const ROLLBACK_MANIFEST_SHA256: &str =
-    "c190079b11ba7202c86a1f1b7d25df815ae10cd65f8ef03a543048c6a6177d6f";
+    "f6e974d9ce1429be95fea77ca600b26c695bb1b549309760faa7a5647d7ded77";
 const ROLLBACK_COMMAND_SHA256: &str =
     "8d2720ddde69d25a0d21c28bdd1308cf524243d8cdb86781965a7ade98858745";
 const ROLLBACK_COMMAND_SIZE: u64 = 184;
 const ROLLBACK_LIBEXEC_SHA256: &str =
-    "86bf4676e254d6c64dcce9d134f275c1513554ba89eed40ca91dad0d55ac6ec5";
-const ROLLBACK_LIBEXEC_SIZE: u64 = 14_013_952;
-const ROLLBACK_TOOLCHAIN: &str = "rustc 1.93.0";
+    "ff3df3caaa8a8b69f5cd6307054f4d76abc8eaee5cb3ce91f9fa120e5a0e9ffe";
+const ROLLBACK_LIBEXEC_SIZE: u64 = 13_941_968;
+const ROLLBACK_TOOLCHAIN: &str = "rustc 1.95.0";
 const APPROVED_ARTIFACT_OWNER: &str = "timi";
 const APPROVED_ARTIFACT_MODE: &str = "0555";
 const CANONICAL_AGENT_COUNT: usize = 9;
@@ -77,6 +79,7 @@ struct ControlRequest {
     expected_desktop_pid: Option<u32>,
     target_pubkeys: Vec<String>,
     acp_command: String,
+    mcp_command: String,
     expected_release_id: String,
     expected_source_tree: String,
     expected_manifest_sha256: String,
@@ -84,6 +87,8 @@ struct ControlRequest {
     expected_acp_command_size: u64,
     expected_libexec_sha256: String,
     expected_libexec_size: u64,
+    expected_mcp_command_sha256: String,
+    expected_mcp_command_size: u64,
     expected_artifact_owner: String,
     expected_artifact_mode: String,
     parallelism: u32,
@@ -108,12 +113,14 @@ pub struct Receipt {
     changed_env_keys: Vec<String>,
     parallelism: u32,
     acp_command: String,
+    mcp_command: String,
     agent_count: usize,
     release_id: String,
     source_tree: String,
     manifest_sha256: String,
     acp_command_sha256: String,
     libexec_sha256: String,
+    mcp_command_sha256: String,
 }
 
 /// Secret-free structured failure written to stderr.
@@ -190,10 +197,17 @@ struct ArtifactContract<'a> {
     command_size: u64,
     libexec_sha256: &'a str,
     libexec_size: u64,
+    mcp: McpContract<'a>,
     owner: &'a str,
     mode: &'a str,
     toolchain: &'a str,
     environment: EnvironmentContract,
+}
+
+#[derive(Clone, Copy)]
+enum McpContract<'a> {
+    RuntimeArtifact { sha256: &'a str, size: u64 },
+    BundledCommand,
 }
 
 #[derive(Clone, Copy)]
@@ -211,6 +225,10 @@ fn production_forward_artifacts() -> ArtifactContract<'static> {
         command_size: FORWARD_COMMAND_SIZE,
         libexec_sha256: FORWARD_LIBEXEC_SHA256,
         libexec_size: FORWARD_LIBEXEC_SIZE,
+        mcp: McpContract::RuntimeArtifact {
+            sha256: FORWARD_MCP_SHA256,
+            size: FORWARD_MCP_SIZE,
+        },
         owner: APPROVED_ARTIFACT_OWNER,
         mode: APPROVED_ARTIFACT_MODE,
         toolchain: FORWARD_TOOLCHAIN,
@@ -227,6 +245,7 @@ fn production_rollback_artifacts() -> ArtifactContract<'static> {
         command_size: ROLLBACK_COMMAND_SIZE,
         libexec_sha256: ROLLBACK_LIBEXEC_SHA256,
         libexec_size: ROLLBACK_LIBEXEC_SIZE,
+        mcp: McpContract::BundledCommand,
         owner: APPROVED_ARTIFACT_OWNER,
         mode: APPROVED_ARTIFACT_MODE,
         toolchain: ROLLBACK_TOOLCHAIN,
@@ -391,12 +410,14 @@ fn execute_with_context(
         changed_env_keys: candidate.changed_env_keys,
         parallelism: request.parallelism,
         acp_command: request.acp_command.clone(),
+        mcp_command: request.mcp_command.clone(),
         agent_count: candidate.agent_count,
         release_id: request.expected_release_id.clone(),
         source_tree: request.expected_source_tree.clone(),
         manifest_sha256: request.expected_manifest_sha256.clone(),
         acp_command_sha256: request.expected_acp_command_sha256.clone(),
         libexec_sha256: request.expected_libexec_sha256.clone(),
+        mcp_command_sha256: request.expected_mcp_command_sha256.clone(),
     };
     if options.dry_run {
         return Ok(receipt);
@@ -573,6 +594,18 @@ fn request_matches_artifact_contract(
     approved: ArtifactContract<'_>,
 ) -> bool {
     let exact_command = runtime_root.join(approved.release_id).join("bin/buzz-acp");
+    let (exact_mcp_command, expected_mcp_sha256, expected_mcp_size) = match approved.mcp {
+        McpContract::RuntimeArtifact { sha256, size } => (
+            runtime_root
+                .join(approved.release_id)
+                .join("bin/buzz-dev-mcp")
+                .to_string_lossy()
+                .into_owned(),
+            sha256,
+            size,
+        ),
+        McpContract::BundledCommand => ("buzz-dev-mcp".to_owned(), "", 0),
+    };
     request.expected_release_id == approved.release_id
         && request.expected_source_tree == approved.source_tree
         && request.expected_manifest_sha256 == approved.manifest_sha256
@@ -580,14 +613,19 @@ fn request_matches_artifact_contract(
         && request.expected_acp_command_size == approved.command_size
         && request.expected_libexec_sha256 == approved.libexec_sha256
         && request.expected_libexec_size == approved.libexec_size
+        && request.expected_mcp_command_sha256 == expected_mcp_sha256
+        && request.expected_mcp_command_size == expected_mcp_size
         && request.expected_artifact_owner == approved.owner
         && request.expected_artifact_mode == approved.mode
         && Path::new(&request.acp_command) == exact_command
+        && request.mcp_command == exact_mcp_command
         && is_lower_hex(&request.expected_release_id, 40)
         && is_lower_hex(&request.expected_source_tree, 40)
         && is_lower_hex(&request.expected_manifest_sha256, 64)
         && is_lower_hex(&request.expected_acp_command_sha256, 64)
         && is_lower_hex(&request.expected_libexec_sha256, 64)
+        && (matches!(approved.mcp, McpContract::BundledCommand)
+            || is_lower_hex(&request.expected_mcp_command_sha256, 64))
         && request.env_set == approved.environment.env_set()
         && approved.environment.matches_env_unset(&request.env_unset)
 }
@@ -641,6 +679,8 @@ struct ManifestBuild {
 #[serde(deny_unknown_fields)]
 struct ManifestDesktopContract {
     acp_command: String,
+    #[serde(default)]
+    mcp_command: Option<String>,
     environment: BTreeMap<String, String>,
     unchanged_desktop: String,
     unchanged_global_cli: String,
@@ -690,6 +730,11 @@ fn validate_release_artifacts(
         || manifest.build.target != "aarch64-apple-darwin"
         || manifest.build.toolchain != approved.toolchain
         || manifest.desktop_contract.acp_command != request.acp_command
+        || manifest.desktop_contract.mcp_command.as_deref()
+            != match approved.mcp {
+                McpContract::RuntimeArtifact { .. } => Some(request.mcp_command.as_str()),
+                McpContract::BundledCommand => None,
+            }
         || manifest.desktop_contract.environment != request.env_set
         || manifest.desktop_contract.unchanged_desktop != "/Applications/Buzz.app 0.5.19"
         || manifest.desktop_contract.unchanged_global_cli != "/Users/timi/.local/bin/buzz"
@@ -720,10 +765,25 @@ fn validate_release_artifacts(
             "MANIFEST.json does not declare libexec/buzz-acp",
         )
     })?;
+    let mcp_declaration = match approved.mcp {
+        McpContract::RuntimeArtifact { .. } => {
+            Some(artifacts.get("bin/buzz-dev-mcp").ok_or_else(|| {
+                ControlError::new(
+                    "missing_manifest_artifact",
+                    "MANIFEST.json does not declare bin/buzz-dev-mcp",
+                )
+            })?)
+        }
+        McpContract::BundledCommand => None,
+    };
     if wrapper_declaration.sha256 != request.expected_acp_command_sha256
         || wrapper_declaration.size != request.expected_acp_command_size
         || libexec_declaration.sha256 != request.expected_libexec_sha256
         || libexec_declaration.size != request.expected_libexec_size
+        || mcp_declaration.is_some_and(|declaration| {
+            declaration.sha256 != request.expected_mcp_command_sha256
+                || declaration.size != request.expected_mcp_command_size
+        })
     {
         return Err(ControlError::new(
             "runtime_manifest_artifact_mismatch",
@@ -769,6 +829,28 @@ fn validate_release_artifacts(
             "libexec_hash_mismatch",
             "libexec/buzz-acp does not match the approved SHA-256",
         ));
+    }
+    if matches!(approved.mcp, McpContract::RuntimeArtifact { .. }) {
+        let mcp_path = release_root.join("bin/buzz-dev-mcp");
+        if Path::new(&request.mcp_command) != mcp_path {
+            return Err(ControlError::new(
+                "mcp_command_path_mismatch",
+                "mcpCommand is not the manifest-declared runtime path",
+            ));
+        }
+        let mcp_bytes = read_restricted_artifact(
+            &mcp_path,
+            owner_uid,
+            Some(expected_mode),
+            Some(request.expected_mcp_command_size),
+            "mcp_command_validation_failed",
+        )?;
+        if sha256(&mcp_bytes) != request.expected_mcp_command_sha256 {
+            return Err(ControlError::new(
+                "mcp_command_hash_mismatch",
+                "bin/buzz-dev-mcp does not match the approved SHA-256",
+            ));
+        }
     }
     Ok(())
 }
@@ -1120,6 +1202,10 @@ fn patch_record(
         Value::String(request.acp_command.clone()),
     );
     object.insert(
+        "mcp_command".to_owned(),
+        Value::String(request.mcp_command.clone()),
+    );
+    object.insert(
         "parallelism".to_owned(),
         Value::Number(request.parallelism.into()),
     );
@@ -1177,7 +1263,7 @@ fn validate_semantic_diff(
 
 fn protected_top_level(object: &Map<String, Value>) -> Map<String, Value> {
     let mut protected = object.clone();
-    for key in ["acp_command", "parallelism", "env_vars"] {
+    for key in ["acp_command", "mcp_command", "parallelism", "env_vars"] {
         protected.remove(key);
     }
     protected
@@ -1201,7 +1287,7 @@ fn collect_changed_names(
     for index in targets {
         let before = original[*index].as_object().ok_or_else(diff_error)?;
         let after = candidate[*index].as_object().ok_or_else(diff_error)?;
-        for field in ["acp_command", "parallelism", "env_vars"] {
+        for field in ["acp_command", "mcp_command", "parallelism", "env_vars"] {
             if before.get(field) != after.get(field) {
                 fields.insert(field.to_owned());
             }
