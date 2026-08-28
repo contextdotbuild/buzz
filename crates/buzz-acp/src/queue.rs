@@ -259,32 +259,7 @@ impl EventQueue {
     /// inserts into `in_flight_channels`, and returns the batch.
     pub fn flush_next(&mut self) -> Option<FlushBatch> {
         let now = Instant::now();
-
-        // Auto-expire any stuck in-flight entries that missed mark_complete.
-        let expired: Vec<Uuid> = self
-            .in_flight_deadlines
-            .iter()
-            .filter(|(_, deadline)| now >= **deadline)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in expired {
-            let lost_events = self.in_flight_batch_sizes.remove(&id).unwrap_or(0);
-            tracing::error!(
-                channel_id = %id,
-                lost_events,
-                deadline_secs = self.in_flight_deadline.as_secs(),
-                "BUG: in-flight channel expired without mark_complete — \
-                 auto-releasing; {lost_events} dispatched event(s) orphaned"
-            );
-            self.in_flight_channels.remove(&id);
-            self.in_flight_deadlines.remove(&id);
-            // Recover any withheld goose-native steer events for the expired
-            // channel back to the queue front so normal dispatch delivers
-            // them. Unlike the in-flight batch above (already delivered to a
-            // now-hung prompt — nothing to recover), these events were never
-            // delivered to the agent.
-            self.recover_withheld_for_expired_channel(id);
-        }
+        self.expire_in_flight(now);
 
         // Find the channel whose head event has the oldest received_at,
         // excluding in-flight channels and throttled channels.
@@ -555,30 +530,7 @@ impl EventQueue {
     /// full `flush_next` call.
     pub fn has_flushable_work(&mut self) -> bool {
         let now = Instant::now();
-
-        // Auto-expire stuck in-flight entries (same logic as flush_next).
-        let expired: Vec<Uuid> = self
-            .in_flight_deadlines
-            .iter()
-            .filter(|(_, deadline)| now >= **deadline)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in expired {
-            let lost_events = self.in_flight_batch_sizes.remove(&id).unwrap_or(0);
-            tracing::error!(
-                channel_id = %id,
-                lost_events,
-                deadline_secs = self.in_flight_deadline.as_secs(),
-                "BUG: in-flight channel expired without mark_complete — \
-                 auto-releasing; {lost_events} dispatched event(s) orphaned"
-            );
-            self.in_flight_channels.remove(&id);
-            self.in_flight_deadlines.remove(&id);
-            // Symmetric with the flush_next expiry block: recover withheld
-            // goose-native steer events for the expired channel so they are
-            // not permanently orphaned in the side table.
-            self.recover_withheld_for_expired_channel(id);
-        }
+        self.expire_in_flight(now);
 
         self.queues.iter().any(|(id, q)| {
             !q.is_empty()
@@ -588,6 +540,36 @@ impl EventQueue {
             .cancelled_batches
             .keys()
             .any(|id| !self.in_flight_channels.contains(id))
+    }
+
+    /// Number of distinct channel turns that need live worker capacity now.
+    ///
+    /// In-flight channels already own a worker. Flushable channels can start a
+    /// turn immediately and therefore each need another worker. Retry-throttled
+    /// channels are deliberately excluded until their deadline is due.
+    pub fn active_channel_demand(&mut self) -> usize {
+        let now = Instant::now();
+        self.expire_in_flight(now);
+
+        let mut demanded_channels = self.in_flight_channels.clone();
+        demanded_channels.extend(
+            self.queues
+                .iter()
+                .filter(|(id, q)| {
+                    !q.is_empty()
+                        && !self.in_flight_channels.contains(id)
+                        && self.retry_after.get(id).is_none_or(|&t| t <= now)
+                })
+                .map(|(id, _)| *id),
+        );
+        demanded_channels.extend(
+            self.cancelled_batches
+                .keys()
+                .filter(|id| !self.in_flight_channels.contains(id))
+                .copied(),
+        );
+
+        demanded_channels.len()
     }
 
     /// Returns `true` if any undispatched work remains for a channel that is
@@ -785,6 +767,30 @@ impl EventQueue {
             if q.is_empty() {
                 self.queues.remove(&channel_id);
             }
+        }
+    }
+
+    /// Release channels whose prompt deadline elapsed and recover any native
+    /// steer events that were withheld but never acknowledged.
+    fn expire_in_flight(&mut self, now: Instant) {
+        let expired: Vec<Uuid> = self
+            .in_flight_deadlines
+            .iter()
+            .filter(|(_, deadline)| now >= **deadline)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            let lost_events = self.in_flight_batch_sizes.remove(&id).unwrap_or(0);
+            tracing::error!(
+                channel_id = %id,
+                lost_events,
+                deadline_secs = self.in_flight_deadline.as_secs(),
+                "BUG: in-flight channel expired without mark_complete — \
+                 auto-releasing; {lost_events} dispatched event(s) orphaned"
+            );
+            self.in_flight_channels.remove(&id);
+            self.in_flight_deadlines.remove(&id);
+            self.recover_withheld_for_expired_channel(id);
         }
     }
 
@@ -3087,6 +3093,53 @@ mod tests {
             q.has_flushable_work(),
             "expired throttle should be flushable"
         );
+    }
+
+    #[test]
+    fn active_channel_demand_counts_distinct_runnable_turns() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let channels = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        for (index, channel) in channels.into_iter().enumerate() {
+            q.push(make_queued(channel, &format!("message {index}")));
+        }
+
+        assert_eq!(q.active_channel_demand(), 3);
+
+        let first = q.flush_next().expect("first channel should dispatch");
+        assert_eq!(q.active_channel_demand(), 3);
+
+        q.mark_complete(first.channel_id);
+        assert_eq!(q.active_channel_demand(), 2);
+    }
+
+    #[test]
+    fn active_channel_demand_excludes_retry_throttled_work_until_due() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let channel = Uuid::new_v4();
+        q.push(make_queued(channel, "retry me"));
+        let batch = q.flush_next().expect("channel should dispatch");
+        assert!(q.requeue(batch).is_none());
+        q.mark_complete(channel);
+
+        assert_eq!(q.active_channel_demand(), 0);
+        assert!(q.has_undispatched_work());
+    }
+
+    #[test]
+    fn active_channel_demand_counts_cancelled_and_new_work_for_one_channel_once() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let channel = Uuid::new_v4();
+        q.push(make_queued(channel, "cancelled turn"));
+        let batch = q.flush_next().expect("channel should dispatch");
+        q.mark_complete(channel);
+        q.requeue_as_cancelled(batch, CancelReason::Steer);
+        q.push(make_queued(channel, "new work"));
+
+        assert_eq!(q.active_channel_demand(), 1);
+        let merged = q.flush_next().expect("work should merge into one turn");
+        assert_eq!(merged.channel_id, channel);
+        assert_eq!(merged.cancelled_events.len(), 1);
+        assert_eq!(merged.events.len(), 1);
     }
 
     #[test]

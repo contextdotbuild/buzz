@@ -64,7 +64,8 @@ pub struct TaskMeta {
     /// Clone of batch for Queue mode panic recovery.
     pub recoverable_batch: Option<FlushBatch>,
     /// Control signal for the in-flight prompt task.
-    /// `None` for heartbeat tasks (not controllable) and after signal is consumed.
+    /// Heartbeats expose only `Cancel`; channel turns may receive every control
+    /// signal. `None` after the signal is consumed.
     pub control_tx: Option<tokio::sync::oneshot::Sender<ControlSignal>>,
     /// Steer request channel for non-cancelling mid-turn delivery.
     /// Capacity-1; `try_send` from the main loop fails on `Full`/`Closed`,
@@ -2451,9 +2452,10 @@ pub async fn run_prompt_task(
         prompt_label(&source)
     );
 
-    // When control_rx is Some (channel tasks), wrap the prompt in select! so
-    // the main loop can cancel, interrupt, or rotate it. Heartbeats
-    // (control_rx=None) take the simple await path — they are not controllable.
+    // When control_rx is Some, wrap the prompt in select! so the main loop can
+    // cancel it. Channel turns may also be interrupted or rotated. Managed
+    // schedule heartbeats install a cancel-only sender so accepted foreground
+    // messages preempt background work instead of racing it to a second reply.
     //
     let prompt_result = match control_rx {
         None => {

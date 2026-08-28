@@ -214,7 +214,7 @@ When `--heartbeat-interval` is set, the harness fires a prompt on an idle agent 
 - **Skipped when all agents are busy** — no queuing; the tick is simply dropped.
 - **At most one heartbeat in flight globally** — the next tick is suppressed until the current one completes.
 - **Default mode is unchanged** — `--heartbeat-mode feed` runs the historical needs-action and mentions checks.
-- **Schedule mode is opt-in** — `--heartbeat-mode schedules` adds `buzz schedules claim-due` and thread reconciliation before the same feed checks. On a lazy managed-agent pool, only this opted-in mode wakes the pool after restart or idle re-sleep.
+- **Schedule mode is opt-in** — `--heartbeat-mode schedules` runs `buzz schedules claim-due`, thread reconciliation, and the needs-action feed. It deliberately leaves human mentions to normal relay delivery and startup catch-up. A heartbeat does not start while a channel turn is active, and an accepted foreground message cancels a running heartbeat so background work does not race the ordinary turn. Before publishing, it re-reads the target thread and stays silent when the exact claimed obligation and result were already covered. On a lazy managed-agent pool, only this opted-in mode wakes the pool after restart or idle re-sleep.
 - **Custom prompts still replace the built-in prompt** — set `--heartbeat-mode schedules` as well when a custom schedule prompt must wake a lazy pool.
 
 Schedule mode is driver-neutral. Any managed agent that the owner designated to

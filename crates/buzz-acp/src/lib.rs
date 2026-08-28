@@ -1538,11 +1538,140 @@ fn any_respawn_in_flight(crash_history: &[SlotCircuit]) -> bool {
     crash_history.iter().any(|s| s.respawn_in_flight)
 }
 
+fn respawns_in_flight(crash_history: &[SlotCircuit]) -> usize {
+    crash_history
+        .iter()
+        .filter(|slot| slot.respawn_in_flight)
+        .count()
+}
+
+/// Live workers needed for work that can run now. Channel demand is distinct
+/// by channel; the global heartbeat consumes at most one additional worker.
+fn desired_worker_capacity(
+    queue: &mut EventQueue,
+    heartbeat_pending: bool,
+    heartbeat_in_flight: bool,
+    configured_capacity: usize,
+) -> usize {
+    let heartbeat_demand = usize::from(heartbeat_pending || heartbeat_in_flight);
+    queue
+        .active_channel_demand()
+        .saturating_add(heartbeat_demand)
+        .min(configured_capacity)
+}
+
+fn worker_spawn_shortfall(desired: usize, live: usize, spawning: usize) -> usize {
+    desired.saturating_sub(live.saturating_add(spawning))
+}
+
+/// Start only the dormant slots required by current work. Existing surplus
+/// workers are left alone until the established whole-pool idle sleep so we do
+/// not kill sessions that may still be waiting for background notifications.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_worker_capacity(
+    pool: &AgentPool,
+    queue: &mut EventQueue,
+    heartbeat_pending: bool,
+    heartbeat_in_flight: bool,
+    config: &Config,
+    crash_history: &mut [SlotCircuit],
+    respawn_tx: &mpsc::Sender<RespawnResult>,
+    respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
+) -> usize {
+    let desired = desired_worker_capacity(
+        queue,
+        heartbeat_pending,
+        heartbeat_in_flight,
+        config.agents as usize,
+    );
+    let provisioned = pool
+        .live_count()
+        .saturating_add(respawns_in_flight(crash_history));
+    let mut missing = worker_spawn_shortfall(
+        desired,
+        pool.live_count(),
+        respawns_in_flight(crash_history),
+    );
+    if missing == 0 {
+        return 0;
+    }
+
+    let mut started = 0;
+    for (idx, slot) in crash_history.iter_mut().enumerate() {
+        if missing == 0 {
+            break;
+        }
+        if pool.slot_alive(idx) || slot.respawn_in_flight || !slot.can_refill() {
+            continue;
+        }
+
+        slot.respawn_in_flight = true;
+        missing -= 1;
+        started += 1;
+        tracing::info!(
+            agent = idx,
+            desired,
+            provisioned,
+            "elastic capacity: spawning worker for current demand"
+        );
+        let cmd = config.agent_command.clone();
+        let args = config.agent_args.clone();
+        let env = config.persona_env_vars.clone();
+        let has_codex = config.has_generated_codex_config;
+        let observer = observer.clone();
+        let guard = RespawnGuard::new(idx, respawn_tx.clone());
+        respawn_tasks.spawn(async move {
+            let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+            guard.send(result);
+        });
+    }
+    started
+}
+
 /// Result of a background respawn task.
 struct RespawnResult {
     index: usize,
     /// Tuple: (initialized client, protocol version, agent name).
     result: Result<(AcpClient, u32, String)>,
+}
+
+fn install_respawn_result(
+    pool: &mut AgentPool,
+    crash_history: &mut [SlotCircuit],
+    config: &Config,
+    rr: RespawnResult,
+) -> bool {
+    crash_history[rr.index].respawn_in_flight = false;
+    match rr.result {
+        Ok((acp, protocol_version, agent_name)) => {
+            let agent = OwnedAgent {
+                index: rr.index,
+                acp,
+                state: SessionState::default(),
+                model_capabilities: None,
+                desired_model: config.model.clone(),
+                model_overridden: false,
+                desired_model_request_id: None,
+                desired_model_pending_ack: false,
+                startup_effort: config.effort_level.clone(),
+                agent_name,
+                goose_system_prompt_supported: None,
+                protocol_version,
+            };
+            pool.return_agent(agent);
+            tracing::info!(agent = rr.index, "worker spawn complete");
+            true
+        }
+        Err(error) => {
+            crash_history[rr.index].mark_spawn_failed();
+            tracing::warn!(
+                agent = rr.index,
+                "worker spawn failed: {error} — circuit re-opened"
+            );
+            false
+        }
+    }
 }
 
 /// Outcome of a non-cancelling steer attempt, forwarded from a per-attempt
@@ -2465,6 +2594,7 @@ async fn tokio_main() -> Result<()> {
     enum PoolEvent {
         Result(Box<PromptResult>),
         Panic(tokio::task::JoinError),
+        Respawn(Box<RespawnResult>),
         SteerAck(SteerAckEvent),
         Wake(u32, Result<AgentPool, String>),
     }
@@ -2489,7 +2619,7 @@ async fn tokio_main() -> Result<()> {
                     "waking",
                     None,
                 );
-                let startup = PoolStartup::from_config(&config, observer.clone());
+                let startup = PoolStartup::from_config(&config, observer.clone()).for_lazy_wake();
                 let wake_tx = wake_tx.clone();
                 let wake_shutdown = shutdown_rx.clone();
                 wake_tasks.spawn(async move {
@@ -2506,48 +2636,44 @@ async fn tokio_main() -> Result<()> {
             }
         }
 
-        if pool_ready
-            && heartbeat_wake_pending
-            && !queue.has_flushable_work()
-            && pool.any_idle()
-            && dispatch_heartbeat(
-                &mut pool,
-                &ctx,
-                &mut heartbeat_in_flight,
-                config.heartbeat_mode,
-            )
-        {
+        let flushable_channel_work = queue.has_flushable_work();
+        if pending_heartbeat_dispatch_allowed(
+            pool_ready,
+            heartbeat_wake_pending,
+            heartbeat_in_flight,
+            flushable_channel_work,
+            queue.has_in_flight(),
+            pool.any_idle(),
+        ) && dispatch_heartbeat(
+            &mut pool,
+            &ctx,
+            &mut heartbeat_in_flight,
+            config.heartbeat_mode,
+        ) {
             heartbeat_wake_pending = false;
             last_activity = tokio::time::Instant::now();
+        }
+
+        // Demand changes on relay delivery and prompt completion, so reconcile
+        // on every loop edge instead of waiting for the 30-second maintenance
+        // tick. The configured ceiling remains unchanged.
+        if pool_ready {
+            reconcile_worker_capacity(
+                &pool,
+                &mut queue,
+                heartbeat_wake_pending,
+                heartbeat_in_flight,
+                &config,
+                &mut crash_history,
+                &respawn_tx,
+                &mut respawn_tasks,
+                observer.clone(),
+            );
         }
 
         if pool_ready && last_maintenance.elapsed() >= maintenance_interval {
             last_maintenance = std::time::Instant::now();
             queue.compact_expired_state();
-
-            // Slot refill: spawn background tasks for empty slots whose
-            // circuit breaker allows it. spawn_and_init runs off the main
-            // loop so it never blocks event processing.
-            for (idx, slot) in crash_history.iter_mut().enumerate() {
-                if pool.slot_alive(idx) || slot.respawn_in_flight {
-                    continue;
-                }
-                if !slot.can_refill() {
-                    continue;
-                }
-                slot.respawn_in_flight = true;
-                tracing::info!(agent = idx, "slot refill: spawning background respawn");
-                let cmd = config.agent_command.clone();
-                let args = config.agent_args.clone();
-                let env = config.persona_env_vars.clone();
-                let has_codex = config.has_generated_codex_config;
-                let observer = observer.clone();
-                let guard = RespawnGuard::new(idx, respawn_tx.clone());
-                respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
-                    guard.send(result);
-                });
-            }
 
             // Flush requeued batches whose retry_after has expired. Without
             // this, a batch requeued during crash recovery can sit idle
@@ -2555,9 +2681,13 @@ async fn tokio_main() -> Result<()> {
             // called on relay events or pool results, neither of which
             // arrive when the channel is silent.
             if queue.has_flushable_work() {
-                for (channel_id, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-                {
+                for (channel_id, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    heartbeat_in_flight,
+                ) {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -2565,32 +2695,7 @@ async fn tokio_main() -> Result<()> {
 
         let mut respawn_collected = false;
         while let Ok(rr) = respawn_rx.try_recv() {
-            crash_history[rr.index].respawn_in_flight = false;
-            match rr.result {
-                Ok((acp, protocol_version, agent_name)) => {
-                    let agent = OwnedAgent {
-                        index: rr.index,
-                        acp,
-                        state: SessionState::default(),
-                        model_capabilities: None,
-                        desired_model: config.model.clone(),
-                        model_overridden: false,
-                        desired_model_request_id: None,
-                        desired_model_pending_ack: false,
-                        startup_effort: config.effort_level.clone(),
-                        agent_name,
-                        goose_system_prompt_supported: None,
-                        protocol_version,
-                    };
-                    pool.return_agent(agent);
-                    tracing::info!(agent = rr.index, "respawn complete");
-                    respawn_collected = true;
-                }
-                Err(e) => {
-                    crash_history[rr.index].mark_spawn_failed();
-                    tracing::warn!(agent = rr.index, "respawn failed: {e} — circuit re-opened");
-                }
-            }
+            respawn_collected |= install_respawn_result(&mut pool, &mut crash_history, &config, rr);
         }
         // Reap completed respawn handles from the JoinSet. Payloads are
         // delivered out-of-band through `respawn_rx` (drained above), so the
@@ -2607,9 +2712,13 @@ async fn tokio_main() -> Result<()> {
         // this, batches requeued during crash recovery sit idle until the
         // next relay event arrives — which can be minutes on quiet channels.
         if respawn_collected {
-            for (channel_id, thread_tags) in
-                dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-            {
+            for (channel_id, thread_tags) in dispatch_pending(
+                &mut pool,
+                &mut queue,
+                &ctx,
+                &mut last_activity,
+                heartbeat_in_flight,
+            ) {
                 typing_channels.insert(channel_id, thread_tags);
             }
         }
@@ -2633,6 +2742,9 @@ async fn tokio_main() -> Result<()> {
                 // are in-flight tasks.
                 Some(Err(e)) = join_set.join_next(), if !join_set.is_empty() => {
                     Some(PoolEvent::Panic(e))
+                }
+                Some(result) = respawn_rx.recv(), if any_respawn_in_flight(&crash_history) => {
+                    Some(PoolEvent::Respawn(Box::new(result)))
                 }
                 // Goose-native steer ack from a watcher task. Outcomes drive
                 // queue side-effects (drop / release withheld event) and
@@ -3016,6 +3128,14 @@ async fn tokio_main() -> Result<()> {
                                 tokio::spawn(async move {
                                     pool::reaction_add(&rc, &eid, "👀").await;
                                 });
+                                if heartbeat_in_flight
+                                    && preempt_heartbeat_for_foreground(&mut pool)
+                                {
+                                    tracing::info!(
+                                        channel_id = %buzz_event.channel_id,
+                                        "accepted foreground event — cancelling background heartbeat"
+                                    );
+                                }
                             }
                             // Event is already queued. If mode requires it AND
                             // the channel has an in-flight task, fire cancel —
@@ -3061,12 +3181,23 @@ async fn tokio_main() -> Result<()> {
                                     }
                                 }
                             }
-                            if pool_ready {
+                            if foreground_dispatch_allowed(pool_ready, heartbeat_in_flight) {
                                 for (channel_id, thread_tags) in
-                                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                                    dispatch_pending(
+                                        &mut pool,
+                                        &mut queue,
+                                        &ctx,
+                                        &mut last_activity,
+                                        heartbeat_in_flight,
+                                    )
                                 {
                                     typing_channels.insert(channel_id, thread_tags);
                                 }
+                            } else if accepted && heartbeat_in_flight {
+                                tracing::debug!(
+                                    channel_id = %buzz_event.channel_id,
+                                    "foreground event queued until heartbeat cancellation completes"
+                                );
                             }
                         }
                         None => {
@@ -3168,10 +3299,18 @@ async fn tokio_main() -> Result<()> {
                     } else if queue.has_flushable_work() {
                         tracing::debug!("heartbeat_skipped_events");
                         for (channel_id, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                            dispatch_pending(
+                                &mut pool,
+                                &mut queue,
+                                &ctx,
+                                &mut last_activity,
+                                heartbeat_in_flight,
+                            )
                         {
                             typing_channels.insert(channel_id, thread_tags);
                         }
+                    } else if queue.has_in_flight() {
+                        tracing::debug!("heartbeat_skipped_channel_turn_in_flight");
                     } else if pool.any_idle() {
                         let dispatched = dispatch_heartbeat(
                             &mut pool,
@@ -3277,10 +3416,30 @@ async fn tokio_main() -> Result<()> {
                 {
                     break;
                 }
-                for (channel_id, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-                {
+                for (channel_id, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    heartbeat_in_flight,
+                ) {
                     typing_channels.insert(channel_id, thread_tags);
+                }
+            }
+            // A guard cannot consume the boxed result, so keep this as an
+            // ordinary arm and dispatch only after a successful install.
+            #[allow(clippy::collapsible_match)]
+            Some(PoolEvent::Respawn(result)) => {
+                if install_respawn_result(&mut pool, &mut crash_history, &config, *result) {
+                    for (channel_id, thread_tags) in dispatch_pending(
+                        &mut pool,
+                        &mut queue,
+                        &ctx,
+                        &mut last_activity,
+                        heartbeat_in_flight,
+                    ) {
+                        typing_channels.insert(channel_id, thread_tags);
+                    }
                 }
             }
             Some(PoolEvent::Panic(join_error)) => {
@@ -3302,9 +3461,13 @@ async fn tokio_main() -> Result<()> {
                     tracing::error!("all agents dead — exiting");
                     break;
                 }
-                for (channel_id, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-                {
+                for (channel_id, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    heartbeat_in_flight,
+                ) {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -3457,9 +3620,13 @@ async fn tokio_main() -> Result<()> {
                 // tear down the in-flight task; on its completion the
                 // queue drains. We still try here in case the in-flight
                 // task has already returned.
-                for (channel_id, thread_tags) in
-                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-                {
+                for (channel_id, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    heartbeat_in_flight,
+                ) {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -3485,9 +3652,13 @@ async fn tokio_main() -> Result<()> {
                             "ready",
                             None,
                         );
-                        for (channel_id, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
-                        {
+                        for (channel_id, thread_tags) in dispatch_pending(
+                            &mut pool,
+                            &mut queue,
+                            &ctx,
+                            &mut last_activity,
+                            heartbeat_in_flight,
+                        ) {
                             typing_channels.insert(channel_id, thread_tags);
                         }
                     }
@@ -3706,6 +3877,44 @@ fn signal_in_flight_task(
     false
 }
 
+/// Give accepted foreground messages precedence over a background heartbeat.
+///
+/// Heartbeats have no channel id and accept only `Cancel`. The accepted event
+/// remains queued until the heartbeat result confirms that cancellation has
+/// completed, so foreground and background turns never overlap.
+fn preempt_heartbeat_for_foreground(pool: &mut AgentPool) -> bool {
+    let Some(control_tx) = pool
+        .task_map_mut()
+        .values_mut()
+        .find(|meta| meta.channel_id.is_none())
+        .and_then(|meta| meta.control_tx.take())
+    else {
+        return false;
+    };
+
+    control_tx.send(ControlSignal::Cancel).is_ok()
+}
+
+fn foreground_dispatch_allowed(pool_ready: bool, heartbeat_in_flight: bool) -> bool {
+    pool_ready && !heartbeat_in_flight
+}
+
+fn pending_heartbeat_dispatch_allowed(
+    pool_ready: bool,
+    heartbeat_wake_pending: bool,
+    heartbeat_in_flight: bool,
+    flushable_channel_work: bool,
+    channel_turn_in_flight: bool,
+    idle_worker_available: bool,
+) -> bool {
+    pool_ready
+        && heartbeat_wake_pending
+        && !heartbeat_in_flight
+        && !flushable_channel_work
+        && !channel_turn_in_flight
+        && idle_worker_available
+}
+
 /// Attempt the non-cancelling (ACP) steer for a freshly-queued event.
 ///
 /// Caller invariants:
@@ -3821,7 +4030,18 @@ fn dispatch_pending(
     queue: &mut EventQueue,
     ctx: &Arc<PromptContext>,
     last_activity: &mut tokio::time::Instant,
+    heartbeat_in_flight: bool,
 ) -> Vec<(Uuid, ThreadTags)> {
+    // A background heartbeat can be cancelled by an accepted foreground
+    // message, but its prompt task still owns a worker until the result or
+    // panic path confirms that cancellation has drained. Keep this guard in
+    // the single dispatch primitive so maintenance, wake, respawn, steer-ack,
+    // and relay paths cannot accidentally start foreground work beside it.
+    if heartbeat_in_flight {
+        tracing::debug!("foreground_dispatch_waiting_for_heartbeat");
+        return Vec::new();
+    }
+
     let mut dispatched_channels = Vec::new();
     loop {
         let batch = match queue.flush_next() {
@@ -4512,6 +4732,7 @@ fn dispatch_heartbeat(
     let turn_id = Uuid::new_v4().to_string();
     let task_turn_id = turn_id.clone();
 
+    let (control_tx, control_rx) = tokio::sync::oneshot::channel();
     let abort_handle = pool.join_set.spawn(async move {
         pool::run_prompt_task(
             agent,
@@ -4519,7 +4740,7 @@ fn dispatch_heartbeat(
             Some(prompt_text),
             ctx_clone,
             result_tx,
-            None,
+            Some(control_rx),
             task_turn_id,
         )
         .await;
@@ -4532,7 +4753,7 @@ fn dispatch_heartbeat(
             channel_id: None,
             turn_id,
             recoverable_batch: None,
-            control_tx: None,
+            control_tx: Some(control_tx),
             steer_tx: None,
             successful_steer_deliveries: HashSet::new(),
         },
@@ -4544,6 +4765,15 @@ fn dispatch_heartbeat(
 
 #[cfg(test)]
 mod agent_draft_prompt_tests {
+    #[test]
+    fn shared_base_prompt_suppresses_only_an_exact_later_answer() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(
+            prompt.contains("already posted a later message fully answering that exact request")
+        );
+        assert!(prompt.contains("publish only if you have new information or a correction"));
+    }
+
     #[test]
     fn shared_base_prompt_teaches_portable_agent_drafts() {
         let prompt = include_str!("base_prompt.md");
@@ -4621,9 +4851,10 @@ fn default_heartbeat_prompt() -> String {
          1. Run `buzz feed get --types needs_action` to check for pending workflow approvals or\n\
             high-priority requests addressed to you.\n\
          2. Run `buzz feed get --types mentions` to check for unanswered @mentions.\n\
-         3. If you find actionable items, address them using the appropriate CLI commands\n\
-            (e.g., `buzz workflows approve --token <UUID>`, `buzz messages send`,\n\
-            `buzz messages send --reply-to <event-id>`).\n\
+         3. If you find actionable items, you may inspect evidence and send Buzz coordination or\n\
+            status messages. Do not approve a workflow or perform a customer, production,\n\
+            financial, or other external effect from this background heartbeat. A foreground turn\n\
+            carrying explicit authority owns such an action.\n\
          4. If there are no pending actions or mentions, end your turn immediately.\n\n\
          Do not run `buzz channels list` or `buzz messages search` unless you have a specific reason.\n\
          Do not invent work — only act on items surfaced by the feed commands."
@@ -4635,8 +4866,8 @@ fn schedule_heartbeat_prompt() -> String {
     format!(
         "[System: Follow-through heartbeat]\nTime: {now}\n\n\
          You have NO incoming message, active channel context, or automatically injected core\n\
-         memory. This opted-in heartbeat preserves the routine feed checks and adds only your\n\
-         private due follow-through schedule.\n\n\
+         memory. This opted-in heartbeat processes your private due follow-through schedule and\n\
+         pending workflow actions.\n\n\
          Follow-through tasks:\n\
          1. Run `buzz schedules claim-due`. This claims only due items owned by this agent. A due\n\
             item means you are the designated driver for that conversation; this behavior is not\n\
@@ -4652,18 +4883,29 @@ fn schedule_heartbeat_prompt() -> String {
             recovering its existing work or assigning exactly one replacement. Preserve the\n\
             existing context, expected result, and callback/evidence location. Publish only the\n\
             material recovery action or a genuine blocker requiring the owner.\n\
-         5. If the expected result is complete, publish the material completion and run\n\
+         5. Immediately before any `buzz messages send`, re-read the target thread. If a newer\n\
+            message from this identity already covers this exact claimed obligation and result,\n\
+            do not publish it again. Do not suppress a distinct required update merely because\n\
+            another message is newer. Reschedule or complete the item from the verified state\n\
+            instead. An ordinary incoming-message turn owns any human question that arrived\n\
+            while this heartbeat was running.\n\
+         6. If the expected result is complete, publish the material completion and run\n\
             `buzz schedules complete --id <id> --claim <claim.token>`. Otherwise retain the item\n\
             with `buzz schedules reschedule --id <id> --claim <claim.token> --due-at <RFC3339>`.\n\
             Inspect only the claimed due items, and never blindly replay an external effect whose\n\
-            outcome is unknown.\n\n\
-         Routine tasks (preserved from the standard heartbeat):\n\
-         6. Run `buzz feed get --types needs_action` for pending approvals or high-priority requests.\n\
-         7. Run `buzz feed get --types mentions` for unanswered @mentions.\n\
-         8. Address any actionable feed items with the appropriate CLI commands.\n\
-         9. If the schedule result is `[]` and both feed queries are empty, end immediately and\n\
+            outcome is unknown. A background heartbeat may inspect evidence, manage its private\n\
+            schedule, and send Buzz coordination or status messages. It must not approve a\n\
+            workflow or perform a customer, production, financial, or other external effect. A\n\
+            foreground turn carrying explicit authority owns such an action.\n\n\
+         Routine task:\n\
+         7. Run `buzz feed get --types needs_action` for pending approvals or high-priority requests.\n\
+         8. Surface a material approval or blocker when needed, but do not execute its external\n\
+            action from this background heartbeat.\n\
+         9. If the schedule result is `[]` and the needs-action query is empty, end immediately and\n\
             publish nothing.\n\n\
-         Do not scan channels, search for unrelated work, or invent tasks."
+         Schedule heartbeats do not query the mentions feed: normal relay delivery and startup\n\
+         catch-up own human messages. Do not scan channels, search for unrelated work, or invent\n\
+         tasks."
     )
 }
 
@@ -4690,6 +4932,9 @@ mod heartbeat_prompt_tests {
         assert!(prompt.contains("buzz feed get --types needs_action"));
         assert!(prompt.contains("buzz feed get --types mentions"));
         assert!(!prompt.contains("buzz schedules claim-due"));
+        assert!(!prompt.contains("buzz workflows approve"));
+        assert!(prompt.contains("Do not approve a workflow"));
+        assert!(prompt.contains("foreground turn"));
     }
 
     #[test]
@@ -4713,7 +4958,12 @@ mod heartbeat_prompt_tests {
         assert!(prompt.contains("buzz schedules complete"));
         assert!(prompt.contains("buzz schedules reschedule"));
         assert!(prompt.contains("buzz feed get --types needs_action"));
-        assert!(prompt.contains("buzz feed get --types mentions"));
+        assert!(!prompt.contains("buzz feed get --types mentions"));
+        assert!(prompt.contains("Immediately before any `buzz messages send`"));
+        assert!(prompt.contains("already covers this exact claimed obligation and result"));
+        assert!(prompt.contains("ordinary incoming-message turn owns"));
+        assert!(prompt.contains("must not approve a"));
+        assert!(prompt.contains("foreground turn carrying explicit authority"));
         assert!(prompt.contains("publish nothing"));
     }
 
@@ -4850,7 +5100,12 @@ async fn shutdown_agent_pool(pool: &mut AgentPool) {
 }
 
 struct PoolStartup {
+    /// Configured ceiling and stable slot count.
     agents: u32,
+    /// Number of slots to start now. Lazy wakes start one; eager startup starts
+    /// the configured ceiling. Remaining slots stay positionally empty until
+    /// concurrent channel demand grows.
+    initial_live_agents: u32,
     command: String,
     args: Vec<String>,
     extra_env: Vec<(String, String)>,
@@ -4864,6 +5119,7 @@ impl PoolStartup {
     fn from_config(config: &Config, observer: Option<observer::ObserverHandle>) -> Self {
         Self {
             agents: config.agents,
+            initial_live_agents: config.agents,
             command: config.agent_command.clone(),
             args: config.agent_args.clone(),
             extra_env: config.persona_env_vars.clone(),
@@ -4873,6 +5129,11 @@ impl PoolStartup {
             observer,
         }
     }
+
+    fn for_lazy_wake(mut self) -> Self {
+        self.initial_live_agents = 1.min(self.agents);
+        self
+    }
 }
 
 async fn initialize_agent_pool(
@@ -4881,8 +5142,8 @@ async fn initialize_agent_pool(
 ) -> Result<AgentPool> {
     // One agent failing to start must not kill the whole pool.
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
-    let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
-    for i in 0..startup.agents as usize {
+    let mut agent_slots: Vec<Option<OwnedAgent>> = (0..startup.agents).map(|_| None).collect();
+    for i in 0..startup.initial_live_agents as usize {
         let spawn_result = AcpClient::spawn(
             &startup.command,
             &startup.args,
@@ -4930,7 +5191,7 @@ async fn initialize_agent_pool(
                             }),
                         );
                         let agent_name = normalized_agent_name(&init_result);
-                        agent_slots.push(Some(OwnedAgent {
+                        agent_slots[i] = Some(OwnedAgent {
                             index: i,
                             acp,
                             state: SessionState::default(),
@@ -4943,23 +5204,20 @@ async fn initialize_agent_pool(
                             agent_name,
                             goose_system_prompt_supported: None,
                             protocol_version,
-                        }));
+                        });
                     }
                     Ok(Err(e)) => {
                         tracing::error!(agent = i, "agent initialize failed: {e}");
                         acp.shutdown().await;
-                        agent_slots.push(None);
                     }
                     Err(_) => {
                         tracing::error!(agent = i, "agent timed out during init (60s)");
                         acp.shutdown().await;
-                        agent_slots.push(None);
                     }
                 }
             }
             Err(e) => {
                 tracing::error!(agent = i, "agent failed to spawn: {e}");
-                agent_slots.push(None);
             }
         }
     }
@@ -4967,17 +5225,22 @@ async fn initialize_agent_pool(
     if live_count == 0 {
         return Err(anyhow::anyhow!(
             "all {} agents failed to start — cannot continue",
-            startup.agents
+            startup.initial_live_agents
         ));
     }
-    if live_count < startup.agents as usize {
+    if live_count < startup.initial_live_agents as usize {
         tracing::warn!(
-            "started {}/{} agents — continuing with reduced pool",
+            "started {}/{} requested agents — continuing with reduced pool (capacity {})",
             live_count,
-            startup.agents
+            startup.initial_live_agents,
+            startup.agents,
         );
     }
-    tracing::info!("agent_pool_ready agents={}", live_count);
+    tracing::info!(
+        "agent_pool_ready agents={} capacity={}",
+        live_count,
+        startup.agents
+    );
     Ok(AgentPool::from_slots(agent_slots))
 }
 
@@ -4994,13 +5257,35 @@ async fn spawn_and_init(
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
 ) -> Result<(AcpClient, u32, String)> {
+    spawn_and_init_with_timeout(
+        command,
+        args,
+        extra_env,
+        has_generated_codex_config,
+        agent_index,
+        observer,
+        Duration::from_secs(60),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_and_init_with_timeout(
+    command: &str,
+    args: &[String],
+    extra_env: &[(String, String)],
+    has_generated_codex_config: bool,
+    agent_index: usize,
+    observer: Option<observer::ObserverHandle>,
+    initialize_timeout: Duration,
+) -> Result<(AcpClient, u32, String)> {
     let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
         .await
         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
 
-    match acp.initialize().await {
-        Ok(init_result) => {
+    match tokio::time::timeout(initialize_timeout, acp.initialize()).await {
+        Ok(Ok(init_result)) => {
             tracing::info!("agent initialized: {init_result}");
             let protocol_version = init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
             acp.observe(
@@ -5013,12 +5298,19 @@ async fn spawn_and_init(
             let agent_name = normalized_agent_name(&init_result);
             Ok((acp, protocol_version, agent_name))
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             // Explicitly shut down the spawned child to prevent zombie/leak.
             // Drop only does start_kill + try_wait (best-effort); shutdown()
             // does start_kill + bounded wait (guaranteed reap).
             acp.shutdown().await;
             Err(anyhow::anyhow!("agent initialize failed: {e}"))
+        }
+        Err(_) => {
+            acp.shutdown().await;
+            Err(anyhow::anyhow!(
+                "agent initialize timed out after {}s",
+                initialize_timeout.as_secs_f64()
+            ))
         }
     }
 }
@@ -5368,6 +5660,140 @@ mod heartbeat_base_prompt_tests {
         let prompt = "[System: Heartbeat]\nrun feed get";
         let composed = pool::prepend_standing_for_legacy(2, &heartbeat_standing(), prompt);
         assert_eq!(composed, prompt);
+    }
+}
+
+#[cfg(test)]
+mod elastic_worker_capacity_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind};
+
+    fn queued_event(channel_id: Uuid, content: &str) -> queue::QueuedEvent {
+        queue::QueuedEvent {
+            channel_id,
+            event: EventBuilder::new(Kind::Custom(9), content)
+                .tags([])
+                .sign_with_keys(&Keys::generate())
+                .expect("sign test event"),
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+        }
+    }
+
+    #[test]
+    fn lazy_wake_starts_one_worker_but_preserves_ten_slots() {
+        let startup = PoolStartup {
+            agents: 10,
+            initial_live_agents: 10,
+            command: "unused".into(),
+            args: vec![],
+            extra_env: vec![],
+            has_generated_codex_config: false,
+            model: None,
+            effort_level: None,
+            observer: None,
+        }
+        .for_lazy_wake();
+
+        assert_eq!(startup.initial_live_agents, 1);
+        assert_eq!(startup.agents, 10);
+    }
+
+    #[test]
+    fn three_channels_demand_three_workers_and_capacity_stops_at_ten() {
+        let mut three = EventQueue::new(DedupMode::Queue);
+        for index in 0..3 {
+            three.push(queued_event(Uuid::new_v4(), &format!("three-{index}")));
+        }
+        assert_eq!(desired_worker_capacity(&mut three, false, false, 10), 3);
+
+        let mut twelve = EventQueue::new(DedupMode::Queue);
+        for index in 0..12 {
+            twelve.push(queued_event(Uuid::new_v4(), &format!("twelve-{index}")));
+        }
+        assert_eq!(desired_worker_capacity(&mut twelve, false, false, 10), 10);
+    }
+
+    #[test]
+    fn heartbeat_uses_one_worker_and_dormant_pool_has_zero_demand() {
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        assert_eq!(desired_worker_capacity(&mut queue, false, false, 10), 0);
+        assert_eq!(desired_worker_capacity(&mut queue, true, false, 10), 1);
+        assert_eq!(desired_worker_capacity(&mut queue, false, true, 10), 1);
+    }
+
+    #[test]
+    fn reconciliation_starts_only_missing_demanded_workers() {
+        assert_eq!(worker_spawn_shortfall(0, 1, 0), 0);
+        assert_eq!(worker_spawn_shortfall(3, 1, 0), 2);
+        assert_eq!(worker_spawn_shortfall(3, 1, 1), 1);
+        assert_eq!(worker_spawn_shortfall(10, 10, 0), 0);
+    }
+
+    #[tokio::test]
+    async fn background_worker_initialize_timeout_releases_spawning_capacity() {
+        let error = match spawn_and_init_with_timeout(
+            "bash",
+            &["-c".into(), "read -r _request; sleep 5".into()],
+            &[],
+            false,
+            0,
+            None,
+            Duration::from_millis(25),
+        )
+        .await
+        {
+            Ok(_) => panic!("silent ACP adapter must time out"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("initialize timed out"));
+    }
+
+    #[tokio::test]
+    async fn accepted_foreground_work_preempts_one_background_heartbeat() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let (control_tx, control_rx) = tokio::sync::oneshot::channel();
+        let task = pool.join_set.spawn(std::future::pending::<()>());
+        pool.task_map_mut().insert(
+            task.id(),
+            pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                turn_id: "heartbeat-test".into(),
+                recoverable_batch: None,
+                control_tx: Some(control_tx),
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+
+        assert!(preempt_heartbeat_for_foreground(&mut pool));
+        assert_eq!(
+            control_rx.await.expect("cancel signal"),
+            ControlSignal::Cancel
+        );
+        assert!(!preempt_heartbeat_for_foreground(&mut pool));
+
+        pool.join_set.abort_all();
+        while pool.join_set.join_next().await.is_some() {}
+    }
+
+    #[test]
+    fn foreground_waits_for_heartbeat_cancel_and_then_dispatches() {
+        assert!(!foreground_dispatch_allowed(true, true));
+        assert!(foreground_dispatch_allowed(true, false));
+        assert!(!foreground_dispatch_allowed(false, false));
+    }
+
+    #[test]
+    fn event_arriving_during_lazy_wake_blocks_pending_heartbeat() {
+        assert!(!pending_heartbeat_dispatch_allowed(
+            true, true, false, false, true, true,
+        ));
+        assert!(pending_heartbeat_dispatch_allowed(
+            true, true, false, false, false, true,
+        ));
     }
 }
 
