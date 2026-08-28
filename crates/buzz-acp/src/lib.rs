@@ -5161,13 +5161,22 @@ fn schedule_heartbeat_prompt() -> String {
     format!(
         "[System: Follow-through heartbeat]\nTime: {now}\n\n\
          You have NO incoming message, active channel context, or automatically injected core\n\
-         memory. This opted-in heartbeat processes only your private due follow-through schedule.\n\n\
+         memory. This opted-in heartbeat checks work assigned to this identity, then processes at\n\
+         most one private due follow-through schedule.\n\n\
          Follow-through tasks:\n\
-         1. Run `buzz schedules claim-due --limit 1 --lease-seconds 300`. This claims one due item\n\
+         1. Run `buzz schedules assigned --limit 100` to list open structured delegations addressed\n\
+            to this identity across conversations. Retain the candidates, but do not start work yet\n\
+            if a driver schedule is due. An assignment row is a pointer, not proof that work remains:\n\
+            older delegations can predate lifecycle markers. Before continuing one, re-read its exact\n\
+            channel_id/thread_id and evidence_locator. Skip it when the thread already contains this\n\
+            identity's material result or blocker after the delegation, the expected result is already\n\
+            present, or the work is obsolete. Never scan the whole Corpus; read only a Corpus record\n\
+            named by the assignment's evidence locator.\n\
+         2. Run `buzz schedules claim-due --limit 1 --lease-seconds 300`. This claims one due item\n\
             owned by this agent for a five-minute recovery window. A due item means you are the\n\
             designated driver for that conversation. Any agent can be the\n\
             driver, and any managed agent can be the assignee.\n\
-         2. For the claimed item, use its channel_id and thread_id with\n\
+         3. For the claimed item, use its channel_id and thread_id with\n\
             `buzz messages thread --channel <channel_id> --event <thread_id>`. Follow the item's\n\
             stored `check` before its `action`, and inspect the named thread, worktree, PR,\n\
             document, Corpus record, or other evidence. Existing schema-1 work does not require a\n\
@@ -5182,7 +5191,7 @@ fn schedule_heartbeat_prompt() -> String {
             current delegation naming one assignee plus exact `Expected result: ...` and\n\
             `Evidence locator: ...` lines, you may instead upgrade it with `buzz schedules bind`\n\
             and an immutable baseline receipt.\n\
-         3. Distinguish material progress from genuinely stopped work. A missing callback alone is\n\
+         4. Distinguish material progress from genuinely stopped work. A missing callback alone is\n\
             not evidence of a stop. Keep only for a newer task-bound receipt: a Buzz event,\n\
             Codex/Cursor turn, commit or PR head, document hash, worktree fingerprint, or external\n\
             job revision tied to this delegation. Use the canonical receipt shape required by the\n\
@@ -5191,7 +5200,7 @@ fn schedule_heartbeat_prompt() -> String {
             Use\n\
             `buzz schedules reconcile --decision keep` with that exact receipt, `--material-at`,\n\
             and a `--due-at` 10 to 15 minutes away. Keep has no `--message` and publishes nothing.\n\
-        4. With no newer receipt, wake the same assignee once and record\n\
+         5. With no newer receipt, wake the same assignee once and record\n\
             `buzz schedules reconcile --decision wake` with the unchanged receipt, `--material-at`,\n\
             a `--due-at` 10 to 15 minutes away, and a material `--message`. If the exact receipt is still unchanged at\n\
            the next check, preserve the existing work and context, assign exactly one different\n\
@@ -5202,14 +5211,14 @@ fn schedule_heartbeat_prompt() -> String {
             a separate delegation message first. Preserve the expected result and evidence locator. A newer material\n\
            receipt resets the one-wake allowance. Publish only the material recovery action or a\n\
            genuine blocker for this claimed obligation, through that reconciliation outbox.\n\
-         5. Immediately before any visible wake, redirect, or complete reconciliation, re-read the\n\
+         6. Immediately before any visible wake, redirect, or complete reconciliation, re-read the\n\
             target thread. If a newer\n\
            message from this identity already covers this exact claimed obligation and result,\n\
             do not publish it again. Do not suppress a distinct required update merely because\n\
             another message is newer. Reconcile the item from the verified state\n\
             instead. An ordinary incoming-message turn owns any human question that arrived\n\
             while this heartbeat was running.\n\
-         6. If the expected result is complete, run\n\
+         7. If the expected result is complete, run\n\
             `buzz schedules reconcile --decision complete` with the exact result receipt,\n\
             `--material-at`, and a material `--message`; omit `--due-at`. That command publishes the\n\
             completion, so do not send it separately. Otherwise\n\
@@ -5226,7 +5235,16 @@ fn schedule_heartbeat_prompt() -> String {
             perform a customer, production, financial,\n\
             or other external effect. A foreground turn carrying explicit authority owns such an\n\
             action.\n\
-         7. If the schedule result is `[]`, end immediately and publish nothing.\n\n\
+         8. After the claimed driver schedule has reached its required transition, or immediately\n\
+            when `claim-due` returned `[]`, continue at most one retained assignment that is\n\
+            genuinely unfinished. First inspect its named evidence\n\
+            and verify that no existing process, Codex/Cursor turn, or other owner is still actively\n\
+            producing that exact result. Resume preserved work instead of starting it again. Do not\n\
+            post a pickup, acknowledgement, or routine status. Publish only a material result or a\n\
+            genuine blocker in the assignment's conversation, with the normal callback mention to\n\
+            its driver. Do not perform a customer, production, financial, or other external effect\n\
+            from this background heartbeat. If both command results are `[]`, end immediately and\n\
+            publish nothing.\n\n\
          Schedule heartbeats do not query the mentions feed: normal relay delivery and startup\n\
          catch-up own human messages. Do not scan channels, search for unrelated work, or invent\n\
          tasks."
@@ -5264,6 +5282,15 @@ mod heartbeat_prompt_tests {
     #[test]
     fn opted_in_schedule_prompt_requires_a_claimed_outbox_for_visibility() {
         let prompt = schedule_heartbeat_prompt();
+        assert!(prompt.contains("buzz schedules assigned --limit 100"));
+        assert!(prompt.contains("assignment row is a pointer"));
+        assert!(prompt.contains("Never scan the whole Corpus"));
+        assert!(prompt.contains("continue at most"));
+        assert!(prompt.contains("one retained assignment"));
+        assert!(prompt.contains("Resume preserved work instead of starting it again"));
+        assert!(prompt.contains("post a pickup, acknowledgement, or routine status"));
+        assert!(prompt.contains("when `claim-due` returned `[]`"));
+        assert!(prompt.contains("normal callback mention to"));
         assert!(prompt.contains("buzz schedules claim-due --limit 1 --lease-seconds 300"));
         assert!(prompt.contains("five-minute recovery window"));
         assert!(prompt.contains("buzz messages thread --channel"));
@@ -5307,6 +5334,8 @@ mod heartbeat_prompt_tests {
         assert!(prompt.contains("must not approve a"));
         assert!(prompt.contains("foreground turn carrying explicit authority"));
         assert!(prompt.contains("publish nothing"));
+        assert!(!prompt.contains("search the whole Corpus"));
+        assert!(!prompt.contains("continue every retained assignment"));
     }
 
     #[test]
