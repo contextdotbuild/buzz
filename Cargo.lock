@@ -1126,7 +1126,6 @@ dependencies = [
 name = "buzz-local-agent-control"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "clap",
  "hex",
  "libc",

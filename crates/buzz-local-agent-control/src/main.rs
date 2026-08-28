@@ -17,7 +17,7 @@ struct Cli {
     #[arg(long)]
     store: PathBuf,
 
-    /// Validate and report the candidate without mutating the store or receipt path.
+    /// Validate and report the candidate without mutating the store.
     #[arg(long)]
     dry_run: bool,
 }

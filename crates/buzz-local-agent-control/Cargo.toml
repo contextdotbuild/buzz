@@ -8,7 +8,6 @@ repository.workspace = true
 description = "Offline, bounded control surface for existing Buzz managed agents"
 
 [dependencies]
-chrono = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 hex = { workspace = true }
 serde = { workspace = true }

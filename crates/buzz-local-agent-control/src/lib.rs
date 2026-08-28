@@ -1,17 +1,18 @@
 //! A deliberately narrow offline control surface for Buzz-managed agents.
 //!
-//! The binary edits an exact `managed-agents.json` only while the caller's
-//! expected Desktop PID is gone. It preserves opaque records as JSON values so
-//! credentials and prompts never become output-bearing typed fields.
+//! The binary edits the exact production `managed-agents.json` only while the
+//! caller's expected Desktop PID and independent Desktop process scans prove
+//! Buzz is stopped. Opaque records stay as JSON values so credentials, prompts,
+//! and arbitrary environment values never enter typed output fields.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
+    process::Command,
 };
 
-use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -19,7 +20,23 @@ use sha2::{Digest, Sha256};
 const SCHEMA_VERSION: u32 = 1;
 const REQUIRED_PARALLELISM: u32 = 10;
 const PRODUCTION_RUNTIME_ROOT: &str = "/Users/timi/.buzz/RUNTIMES/buzz-heartbeat";
+const CANONICAL_STORE_PATH: &str =
+    "/Users/timi/Library/Application Support/xyz.block.buzz.app/agents/managed-agents.json";
+const DESKTOP_EXECUTABLE_PATH: &str = "/Applications/Buzz.app/Contents/MacOS/buzz-desktop";
 const STORE_FILENAME: &str = "managed-agents.json";
+const APPROVED_RELEASE_ID: &str = "32bc281d4889f41e28f36b64313d9a4a395816d7";
+const APPROVED_SOURCE_TREE: &str = "68beb7c7203a323dea9ddee51d1f2957c395b8d2";
+const APPROVED_MANIFEST_SHA256: &str =
+    "c190079b11ba7202c86a1f1b7d25df815ae10cd65f8ef03a543048c6a6177d6f";
+const APPROVED_COMMAND_SHA256: &str =
+    "8d2720ddde69d25a0d21c28bdd1308cf524243d8cdb86781965a7ade98858745";
+const APPROVED_COMMAND_SIZE: u64 = 184;
+const APPROVED_LIBEXEC_SHA256: &str =
+    "86bf4676e254d6c64dcce9d134f275c1513554ba89eed40ca91dad0d55ac6ec5";
+const APPROVED_LIBEXEC_SIZE: u64 = 14_013_952;
+const APPROVED_ARTIFACT_OWNER: &str = "timi";
+const APPROVED_ARTIFACT_MODE: &str = "0555";
+const CANONICAL_AGENT_COUNT: usize = 9;
 const ALLOWED_ENV_KEYS: [&str; 4] = [
     "BUZZ_ACP_HEARTBEAT_INTERVAL",
     "BUZZ_ACP_HEARTBEAT_MODE",
@@ -46,19 +63,25 @@ struct ControlRequest {
     expected_agent_count: usize,
     #[serde(default)]
     expected_desktop_pid: Option<u32>,
-    #[serde(alias = "targetPublicKeys")]
     target_pubkeys: Vec<String>,
     acp_command: String,
+    expected_release_id: String,
+    expected_source_tree: String,
+    expected_manifest_sha256: String,
+    expected_acp_command_sha256: String,
+    expected_acp_command_size: u64,
+    expected_libexec_sha256: String,
+    expected_libexec_size: u64,
+    expected_artifact_owner: String,
+    expected_artifact_mode: String,
     parallelism: u32,
     #[serde(default)]
     env_set: BTreeMap<String, String>,
     #[serde(default)]
     env_unset: Vec<String>,
-    #[serde(default)]
-    receipt_path: Option<PathBuf>,
 }
 
-/// Secret-free success or dry-run receipt.
+/// Secret-free success or dry-run receipt emitted only on stdout.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Receipt {
@@ -74,6 +97,11 @@ pub struct Receipt {
     parallelism: u32,
     acp_command: String,
     agent_count: usize,
+    release_id: String,
+    source_tree: String,
+    manifest_sha256: String,
+    acp_command_sha256: String,
+    libexec_sha256: String,
 }
 
 /// Secret-free structured failure written to stderr.
@@ -133,6 +161,102 @@ impl ControlError {
 
 struct ExecutionContext<'a> {
     runtime_root: &'a Path,
+    canonical_store_path: &'a Path,
+    desktop_executable: &'a Path,
+    expected_agent_count: usize,
+    artifacts: ArtifactContract<'a>,
+    process_inspector: &'a dyn ProcessInspector,
+}
+
+#[derive(Clone, Copy)]
+struct ArtifactContract<'a> {
+    release_id: &'a str,
+    source_tree: &'a str,
+    manifest_sha256: &'a str,
+    command_sha256: &'a str,
+    command_size: u64,
+    libexec_sha256: &'a str,
+    libexec_size: u64,
+    owner: &'a str,
+    mode: &'a str,
+}
+
+trait ProcessInspector {
+    fn ensure_desktop_absent(&self, executable: &Path) -> Result<(), ControlError>;
+}
+
+struct SystemProcessInspector;
+
+impl ProcessInspector for SystemProcessInspector {
+    fn ensure_desktop_absent(&self, executable: &Path) -> Result<(), ControlError> {
+        if executable != Path::new(DESKTOP_EXECUTABLE_PATH) {
+            return Err(ControlError::new(
+                "invalid_desktop_executable",
+                "desktop process fence requires the canonical Buzz executable path",
+            ));
+        }
+        require_exact_regular_file(
+            executable,
+            "invalid_desktop_executable",
+            "canonical Buzz Desktop executable must be a non-symlink regular file",
+        )?;
+        if pgrep_has_match(&["-x", "buzz-desktop"])? {
+            return Err(ControlError::new(
+                "desktop_process_alive",
+                "a Buzz Desktop executable process is still alive",
+            ));
+        }
+        if pgrep_has_match(&[
+            "-f",
+            "^/Applications/Buzz[.]app/Contents/MacOS/buzz-desktop([[:space:]]|$)",
+        ])? {
+            return Err(ControlError::new(
+                "desktop_process_alive",
+                "the canonical Buzz Desktop executable path is still live",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn pgrep_has_match(arguments: &[&str]) -> Result<bool, ControlError> {
+    let output = Command::new("/usr/bin/pgrep")
+        .args(arguments)
+        .output()
+        .map_err(|_| {
+            ControlError::new(
+                "desktop_process_scan_failed",
+                "failed to run the bounded Buzz Desktop process scan",
+            )
+        })?;
+    match output.status.code() {
+        Some(0) => {
+            let stdout = std::str::from_utf8(&output.stdout).map_err(|_| {
+                ControlError::new(
+                    "desktop_process_scan_failed",
+                    "Buzz Desktop process scan returned invalid output",
+                )
+            })?;
+            if output.stderr.is_empty()
+                && !stdout.is_empty()
+                && stdout
+                    .lines()
+                    .all(|line| !line.is_empty() && line.bytes().all(|byte| byte.is_ascii_digit()))
+            {
+                Ok(true)
+            } else {
+                Err(ControlError::new(
+                    "desktop_process_scan_failed",
+                    "Buzz Desktop process scan returned malformed output",
+                ))
+            }
+        }
+        Some(1) if output.stdout.is_empty() && output.stderr.is_empty() => Ok(false),
+        _ => Err(ControlError::new(
+            "desktop_process_scan_failed",
+            "Buzz Desktop process scan did not complete cleanly",
+        )),
+    }
 }
 
 struct SecureStore {
@@ -157,10 +281,26 @@ struct Candidate {
 
 /// Validate and, unless `dry_run` is set, atomically apply one bounded patch.
 pub fn execute(options: CliOptions) -> Result<Receipt, ControlError> {
+    let inspector = SystemProcessInspector;
     execute_with_context(
         options,
         &ExecutionContext {
             runtime_root: Path::new(PRODUCTION_RUNTIME_ROOT),
+            canonical_store_path: Path::new(CANONICAL_STORE_PATH),
+            desktop_executable: Path::new(DESKTOP_EXECUTABLE_PATH),
+            expected_agent_count: CANONICAL_AGENT_COUNT,
+            artifacts: ArtifactContract {
+                release_id: APPROVED_RELEASE_ID,
+                source_tree: APPROVED_SOURCE_TREE,
+                manifest_sha256: APPROVED_MANIFEST_SHA256,
+                command_sha256: APPROVED_COMMAND_SHA256,
+                command_size: APPROVED_COMMAND_SIZE,
+                libexec_sha256: APPROVED_LIBEXEC_SHA256,
+                libexec_size: APPROVED_LIBEXEC_SIZE,
+                owner: APPROVED_ARTIFACT_OWNER,
+                mode: APPROVED_ARTIFACT_MODE,
+            },
+            process_inspector: &inspector,
         },
     )
 }
@@ -177,13 +317,11 @@ fn execute_with_context(
             "request is not valid schemaVersion 1 JSON",
         )
     })?;
+    validate_request(&request, context)?;
+    validate_release_artifacts(&request, context)?;
+    ensure_desktop_stopped(request.expected_desktop_pid, context)?;
 
-    validate_request(&request)?;
-    require_expected_desktop_stopped(request.expected_desktop_pid)?;
-    validate_acp_command(&request.acp_command, context.runtime_root)?;
-    validate_receipt_path(request.receipt_path.as_deref(), &options.store_path)?;
-
-    let store = read_secure_store(&options.store_path)?;
+    let store = read_secure_store(&options.store_path, context.canonical_store_path)?;
     let actual_before_sha256 = sha256(&store.bytes);
     if actual_before_sha256 != request.expected_store_sha256 {
         return Err(ControlError::new(
@@ -191,7 +329,6 @@ fn execute_with_context(
             "store SHA-256 does not match expectedStoreSha256",
         ));
     }
-
     let candidate = build_candidate(&store.bytes, &request)?;
     let after_sha256 = sha256(&candidate.bytes);
     let receipt = Receipt {
@@ -211,30 +348,20 @@ fn execute_with_context(
         parallelism: request.parallelism,
         acp_command: request.acp_command.clone(),
         agent_count: candidate.agent_count,
+        release_id: request.expected_release_id.clone(),
+        source_tree: request.expected_source_tree.clone(),
+        manifest_sha256: request.expected_manifest_sha256.clone(),
+        acp_command_sha256: request.expected_acp_command_sha256.clone(),
+        libexec_sha256: request.expected_libexec_sha256.clone(),
     };
-
     if options.dry_run {
         return Ok(receipt);
     }
 
     let staged_store = stage_restricted_file(&options.store_path, &candidate.bytes)?;
-    let staged_receipt = match request.receipt_path.as_deref() {
-        Some(path) => {
-            let mut bytes = serde_json::to_vec_pretty(&receipt).map_err(|_| {
-                ControlError::new(
-                    "receipt_serialization_failed",
-                    "failed to serialize receipt",
-                )
-            })?;
-            bytes.push(b'\n');
-            Some(stage_restricted_file(path, &bytes)?)
-        }
-        None => None,
-    };
-
-    // The Desktop is stopped, but this last read closes the ordinary stale
-    // hash / concurrent writer window before the single atomic replacement.
-    let current = read_secure_store(&options.store_path)?;
+    validate_release_artifacts(&request, context)?;
+    ensure_desktop_stopped(request.expected_desktop_pid, context)?;
+    let current = read_secure_store(&options.store_path, context.canonical_store_path)?;
     if current.identity != store.identity || sha256(&current.bytes) != receipt.actual_before_sha256
     {
         return Err(ControlError::new(
@@ -242,19 +369,14 @@ fn execute_with_context(
             "store changed after validation; no mutation was applied",
         ));
     }
-    require_expected_desktop_stopped(request.expected_desktop_pid)?;
-
     commit_staged_file(staged_store, &options.store_path, "store_commit_failed")?;
-    if let (Some(staged), Some(receipt_path)) = (staged_receipt, request.receipt_path.as_deref()) {
-        // The store is already durably committed. A fully staged receipt can
-        // only fail here on an external filesystem change. Do not turn an
-        // applied store update into a false nonzero retry signal.
-        let _ = commit_staged_file(staged, receipt_path, "receipt_commit_failed");
-    }
     Ok(receipt)
 }
 
-fn validate_request(request: &ControlRequest) -> Result<(), ControlError> {
+fn validate_request(
+    request: &ControlRequest,
+    context: &ExecutionContext<'_>,
+) -> Result<(), ControlError> {
     if request.schema_version != SCHEMA_VERSION {
         return Err(ControlError::new(
             "unsupported_schema_version",
@@ -267,10 +389,18 @@ fn validate_request(request: &ControlRequest) -> Result<(), ControlError> {
             "expectedStoreSha256 must be 64 lowercase hexadecimal characters",
         ));
     }
-    if request.target_pubkeys.is_empty() {
+    if request.expected_agent_count != context.expected_agent_count
+        || context.expected_agent_count != CANONICAL_AGENT_COUNT
+    {
         return Err(ControlError::new(
-            "empty_target_list",
-            "targetPubkeys must contain at least one public key",
+            "invalid_expected_agent_count",
+            "expectedAgentCount must equal the canonical fleet size of 9",
+        ));
+    }
+    if request.target_pubkeys.len() != context.expected_agent_count {
+        return Err(ControlError::new(
+            "invalid_target_count",
+            "targetPubkeys must contain the complete canonical fleet of 9 identities",
         ));
     }
     let mut targets = HashSet::with_capacity(request.target_pubkeys.len());
@@ -329,13 +459,22 @@ fn validate_request(request: &ControlRequest) -> Result<(), ControlError> {
             ));
         }
     }
-    Ok(())
+    validate_requested_artifact_contract(request, context)
+}
+
+fn ensure_desktop_stopped(
+    expected_pid: Option<u32>,
+    context: &ExecutionContext<'_>,
+) -> Result<(), ControlError> {
+    require_expected_desktop_stopped(expected_pid)?;
+    context
+        .process_inspector
+        .ensure_desktop_absent(context.desktop_executable)
 }
 
 #[cfg(unix)]
 fn require_expected_desktop_stopped(pid: Option<u32>) -> Result<(), ControlError> {
     use nix::{errno::Errno, sys::signal, unistd::Pid};
-
     let pid = pid.ok_or_else(|| {
         ControlError::new(
             "missing_expected_desktop_pid",
@@ -369,161 +508,365 @@ fn require_expected_desktop_stopped(_pid: Option<u32>) -> Result<(), ControlErro
     Ok(())
 }
 
-fn validate_acp_command(command: &str, runtime_root: &Path) -> Result<(), ControlError> {
-    let path = Path::new(command);
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+fn validate_requested_artifact_contract(
+    request: &ControlRequest,
+    context: &ExecutionContext<'_>,
+) -> Result<(), ControlError> {
+    let approved = context.artifacts;
+    let exact_command = context
+        .runtime_root
+        .join(approved.release_id)
+        .join("bin/buzz-acp");
+    if request.expected_release_id != approved.release_id
+        || request.expected_source_tree != approved.source_tree
+        || request.expected_manifest_sha256 != approved.manifest_sha256
+        || request.expected_acp_command_sha256 != approved.command_sha256
+        || request.expected_acp_command_size != approved.command_size
+        || request.expected_libexec_sha256 != approved.libexec_sha256
+        || request.expected_libexec_size != approved.libexec_size
+        || request.expected_artifact_owner != approved.owner
+        || request.expected_artifact_mode != approved.mode
+        || Path::new(&request.acp_command) != exact_command
+        || !is_lower_hex(&request.expected_release_id, 40)
+        || !is_lower_hex(&request.expected_source_tree, 40)
+        || !is_lower_hex(&request.expected_manifest_sha256, 64)
+        || !is_lower_hex(&request.expected_acp_command_sha256, 64)
+        || !is_lower_hex(&request.expected_libexec_sha256, 64)
+        || request.env_set != approved_environment()
+        || !request.env_unset.is_empty()
     {
         return Err(ControlError::new(
-            "invalid_acp_command",
-            "acpCommand must be an absolute canonical path",
-        ));
-    }
-
-    let relative = path.strip_prefix(runtime_root).map_err(|_| {
-        ControlError::new(
-            "invalid_acp_command_root",
-            "acpCommand must be beneath the approved heartbeat runtime root",
-        )
-    })?;
-    let components: Vec<_> = relative.components().collect();
-    if components.len() < 2 {
-        return Err(ControlError::new(
-            "invalid_acp_command_layout",
-            "acpCommand does not identify a commit-pinned buzz-acp executable",
-        ));
-    }
-    let release_id = component_text(components[0]).ok_or_else(|| {
-        ControlError::new(
-            "invalid_acp_command_layout",
-            "acpCommand release component is invalid",
-        )
-    })?;
-    if !is_lower_hex(release_id, 40) {
-        return Err(ControlError::new(
-            "invalid_acp_release_id",
-            "acpCommand release must be a 40-character lowercase commit id",
-        ));
-    }
-    let suffix: Vec<&str> = components[1..]
-        .iter()
-        .map(|component| component_text(*component))
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| {
-            ControlError::new(
-                "invalid_acp_command_layout",
-                "acpCommand executable suffix is invalid",
-            )
-        })?;
-    let allowed_suffix = matches!(
-        suffix.as_slice(),
-        ["buzz-acp"] | ["bin", "buzz-acp"] | ["libexec", "buzz-acp"]
-    );
-    if !allowed_suffix {
-        return Err(ControlError::new(
-            "invalid_acp_command_layout",
-            "acpCommand must select the release buzz-acp executable",
-        ));
-    }
-
-    let release_path = runtime_root.join(release_id);
-    let canonical_runtime_root = fs::canonicalize(runtime_root).map_err(|_| {
-        ControlError::new(
-            "acp_runtime_root_not_found",
-            "approved heartbeat runtime root does not exist",
-        )
-    })?;
-    let canonical_release = fs::canonicalize(&release_path).map_err(|_| {
-        ControlError::new(
-            "acp_release_not_found",
-            "acpCommand release directory does not exist",
-        )
-    })?;
-    if canonical_release != canonical_runtime_root.join(release_id) {
-        return Err(ControlError::new(
-            "acp_release_symlink_escape",
-            "acpCommand release resolves outside its exact commit-pinned directory",
-        ));
-    }
-    let canonical_command = fs::canonicalize(path).map_err(|_| {
-        ControlError::new(
-            "acp_command_not_found",
-            "acpCommand executable does not exist",
-        )
-    })?;
-    if !canonical_command.starts_with(&canonical_release) {
-        return Err(ControlError::new(
-            "acp_command_symlink_escape",
-            "acpCommand resolves outside its commit-pinned release",
-        ));
-    }
-    if canonical_command.file_name().and_then(|name| name.to_str()) != Some("buzz-acp") {
-        return Err(ControlError::new(
-            "invalid_acp_command_layout",
-            "acpCommand must resolve to a file named buzz-acp",
-        ));
-    }
-    let metadata = fs::metadata(&canonical_command).map_err(|_| {
-        ControlError::new(
-            "acp_command_metadata_failed",
-            "failed to inspect acpCommand executable",
-        )
-    })?;
-    if !metadata.is_file() || !is_executable(&metadata) {
-        return Err(ControlError::new(
-            "acp_command_not_executable",
-            "acpCommand must resolve to an executable regular file",
+            "artifact_contract_mismatch",
+            "request does not match the approved immutable heartbeat release contract",
         ));
     }
     Ok(())
 }
 
-fn component_text(component: Component<'_>) -> Option<&str> {
-    match component {
-        Component::Normal(value) => value.to_str(),
-        _ => None,
+fn approved_environment() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("BUZZ_ACP_HEARTBEAT_INTERVAL".to_owned(), "900".to_owned()),
+        ("BUZZ_ACP_HEARTBEAT_MODE".to_owned(), "schedules".to_owned()),
+        ("BUZZ_ACP_LAZY_POOL".to_owned(), "true".to_owned()),
+        ("BUZZ_ACP_IDLE_POOL_SLEEP".to_owned(), "300".to_owned()),
+    ])
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeManifest {
+    schema: u32,
+    source: ManifestSource,
+    build: ManifestBuild,
+    desktop_contract: ManifestDesktopContract,
+    artifacts: Vec<ManifestArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestSource {
+    commit: String,
+    tree: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestBuild {
+    profile: String,
+    target: String,
+    toolchain: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestDesktopContract {
+    acp_command: String,
+    environment: BTreeMap<String, String>,
+    unchanged_desktop: String,
+    unchanged_global_cli: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestArtifact {
+    path: String,
+    sha256: String,
+    size: u64,
+}
+
+fn validate_release_artifacts(
+    request: &ControlRequest,
+    context: &ExecutionContext<'_>,
+) -> Result<(), ControlError> {
+    let approved = context.artifacts;
+    let release_root = context.runtime_root.join(approved.release_id);
+    require_exact_canonical_path(context.runtime_root, "runtime_root_symlink")?;
+    require_exact_canonical_path(&release_root, "release_root_symlink")?;
+    let owner_uid = expected_owner_uid(approved.owner)?;
+    let manifest_path = release_root.join("MANIFEST.json");
+    let manifest_bytes = read_restricted_artifact(
+        &manifest_path,
+        owner_uid,
+        None,
+        None,
+        "manifest_validation_failed",
+    )?;
+    if sha256(&manifest_bytes) != request.expected_manifest_sha256 {
+        return Err(ControlError::new(
+            "manifest_hash_mismatch",
+            "MANIFEST.json does not match the approved SHA-256",
+        ));
     }
+    let manifest: RuntimeManifest = serde_json::from_slice(&manifest_bytes).map_err(|_| {
+        ControlError::new(
+            "invalid_runtime_manifest",
+            "MANIFEST.json does not match the strict runtime manifest schema",
+        )
+    })?;
+    if manifest.schema != 1
+        || manifest.source.commit != request.expected_release_id
+        || manifest.source.tree != request.expected_source_tree
+        || manifest.build.profile != "release"
+        || manifest.build.target != "aarch64-apple-darwin"
+        || manifest.build.toolchain != "rustc 1.93.0"
+        || manifest.desktop_contract.acp_command != request.acp_command
+        || manifest.desktop_contract.environment != request.env_set
+        || manifest.desktop_contract.unchanged_desktop != "/Applications/Buzz.app 0.5.19"
+        || manifest.desktop_contract.unchanged_global_cli != "/Users/timi/.local/bin/buzz"
+    {
+        return Err(ControlError::new(
+            "runtime_manifest_contract_mismatch",
+            "MANIFEST.json does not declare the approved release and Desktop contract",
+        ));
+    }
+    let mut artifacts = HashMap::with_capacity(manifest.artifacts.len());
+    for artifact in &manifest.artifacts {
+        if artifacts.insert(artifact.path.as_str(), artifact).is_some() {
+            return Err(ControlError::new(
+                "duplicate_manifest_artifact",
+                "MANIFEST.json contains a duplicate artifact path",
+            ));
+        }
+    }
+    let wrapper_declaration = artifacts.get("bin/buzz-acp").ok_or_else(|| {
+        ControlError::new(
+            "missing_manifest_artifact",
+            "MANIFEST.json does not declare bin/buzz-acp",
+        )
+    })?;
+    let libexec_declaration = artifacts.get("libexec/buzz-acp").ok_or_else(|| {
+        ControlError::new(
+            "missing_manifest_artifact",
+            "MANIFEST.json does not declare libexec/buzz-acp",
+        )
+    })?;
+    if wrapper_declaration.sha256 != request.expected_acp_command_sha256
+        || wrapper_declaration.size != request.expected_acp_command_size
+        || libexec_declaration.sha256 != request.expected_libexec_sha256
+        || libexec_declaration.size != request.expected_libexec_size
+    {
+        return Err(ControlError::new(
+            "runtime_manifest_artifact_mismatch",
+            "MANIFEST.json artifact declarations do not match the approved request",
+        ));
+    }
+    let expected_mode = u32::from_str_radix(&request.expected_artifact_mode, 8).map_err(|_| {
+        ControlError::new(
+            "invalid_artifact_mode",
+            "expectedArtifactMode must be an octal permission string",
+        )
+    })?;
+    let wrapper_path = release_root.join("bin/buzz-acp");
+    if Path::new(&request.acp_command) != wrapper_path {
+        return Err(ControlError::new(
+            "acp_command_path_mismatch",
+            "acpCommand is not the manifest-declared wrapper path",
+        ));
+    }
+    let wrapper_bytes = read_restricted_artifact(
+        &wrapper_path,
+        owner_uid,
+        Some(expected_mode),
+        Some(request.expected_acp_command_size),
+        "acp_command_validation_failed",
+    )?;
+    if sha256(&wrapper_bytes) != request.expected_acp_command_sha256 {
+        return Err(ControlError::new(
+            "acp_command_hash_mismatch",
+            "bin/buzz-acp does not match the approved SHA-256",
+        ));
+    }
+    let libexec_path = release_root.join("libexec/buzz-acp");
+    let libexec_bytes = read_restricted_artifact(
+        &libexec_path,
+        owner_uid,
+        Some(expected_mode),
+        Some(request.expected_libexec_size),
+        "libexec_validation_failed",
+    )?;
+    if sha256(&libexec_bytes) != request.expected_libexec_sha256 {
+        return Err(ControlError::new(
+            "libexec_hash_mismatch",
+            "libexec/buzz-acp does not match the approved SHA-256",
+        ));
+    }
+    Ok(())
+}
+
+fn require_exact_regular_file(
+    path: &Path,
+    code: &'static str,
+    message: &'static str,
+) -> Result<(), ControlError> {
+    require_exact_canonical_path(path, code)?;
+    let metadata = fs::symlink_metadata(path).map_err(|_| ControlError::new(code, message))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ControlError::new(code, message));
+    }
+    Ok(())
+}
+
+fn require_exact_canonical_path(path: &Path, code: &'static str) -> Result<(), ControlError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        || fs::canonicalize(path).ok().as_deref() != Some(path)
+    {
+        return Err(ControlError::new(
+            code,
+            "path must exist canonically without symlink components",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
-fn is_executable(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    metadata.permissions().mode() & 0o111 != 0
+fn expected_owner_uid(owner: &str) -> Result<u32, ControlError> {
+    let user = nix::unistd::User::from_name(owner)
+        .map_err(|_| {
+            ControlError::new(
+                "artifact_owner_lookup_failed",
+                "failed to resolve the approved artifact owner",
+            )
+        })?
+        .ok_or_else(|| {
+            ControlError::new(
+                "artifact_owner_lookup_failed",
+                "approved artifact owner does not exist",
+            )
+        })?;
+    if user.uid != nix::unistd::geteuid() {
+        return Err(ControlError::new(
+            "artifact_owner_mismatch",
+            "approved artifact owner is not the current user",
+        ));
+    }
+    Ok(user.uid.as_raw())
 }
 
 #[cfg(not(unix))]
-fn is_executable(_metadata: &fs::Metadata) -> bool {
-    true
+fn expected_owner_uid(_owner: &str) -> Result<u32, ControlError> {
+    Ok(0)
 }
 
-fn validate_receipt_path(path: Option<&Path>, store_path: &Path) -> Result<(), ControlError> {
-    let Some(path) = path else {
-        return Ok(());
-    };
-    if !path.is_absolute() {
+fn read_restricted_artifact(
+    path: &Path,
+    owner_uid: u32,
+    expected_mode: Option<u32>,
+    expected_size: Option<u64>,
+    code: &'static str,
+) -> Result<Vec<u8>, ControlError> {
+    require_exact_canonical_path(path, code)?;
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|_| ControlError::new(code, "failed to inspect runtime artifact"))?;
+    validate_artifact_metadata(
+        &path_metadata,
+        owner_uid,
+        expected_mode,
+        expected_size,
+        code,
+    )?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| ControlError::new(code, "failed to securely open runtime artifact"))?;
+    let file_metadata = file
+        .metadata()
+        .map_err(|_| ControlError::new(code, "failed to inspect opened runtime artifact"))?;
+    validate_artifact_metadata(
+        &file_metadata,
+        owner_uid,
+        expected_mode,
+        expected_size,
+        code,
+    )?;
+    if file_identity(&path_metadata) != file_identity(&file_metadata) {
         return Err(ControlError::new(
-            "invalid_receipt_path",
-            "receiptPath must be absolute",
+            code,
+            "runtime artifact changed during secure open",
         ));
     }
-    if path == store_path {
-        return Err(ControlError::new(
-            "invalid_receipt_path",
-            "receiptPath must not be the managed-agent store",
-        ));
-    }
-    validate_existing_destination(path, "invalid_receipt_path")
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|_| ControlError::new(code, "failed to read runtime artifact"))?;
+    Ok(bytes)
 }
 
-fn read_secure_store(path: &Path) -> Result<SecureStore, ControlError> {
+fn validate_artifact_metadata(
+    metadata: &fs::Metadata,
+    owner_uid: u32,
+    expected_mode: Option<u32>,
+    expected_size: Option<u64>,
+    code: &'static str,
+) -> Result<(), ControlError> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ControlError::new(
+            code,
+            "runtime artifact must be a non-symlink regular file",
+        ));
+    }
+    if expected_size.is_some_and(|size| metadata.len() != size) {
+        return Err(ControlError::new(
+            code,
+            "runtime artifact size does not match the approved manifest",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = metadata.permissions().mode() & 0o777;
+        if metadata.uid() != owner_uid
+            || expected_mode.is_some_and(|expected| mode != expected)
+            || mode & 0o022 != 0
+        {
+            return Err(ControlError::new(
+                code,
+                "runtime artifact owner or permissions do not match the immutable contract",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn read_secure_store(
+    path: &Path,
+    canonical_store_path: &Path,
+) -> Result<SecureStore, ControlError> {
     if !path.is_absolute()
         || path.file_name().and_then(|name| name.to_str()) != Some(STORE_FILENAME)
+        || path != canonical_store_path
+        || fs::canonicalize(path).ok().as_deref() != Some(path)
     {
         return Err(ControlError::new(
             "invalid_store_path",
-            "store must be an absolute path ending in managed-agents.json",
+            "store must be the exact canonical managed-agents.json path without symlink components",
         ));
     }
     let path_metadata = fs::symlink_metadata(path).map_err(|_| {
@@ -533,7 +876,6 @@ fn read_secure_store(path: &Path) -> Result<SecureStore, ControlError> {
         )
     })?;
     validate_store_metadata(&path_metadata)?;
-
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -626,9 +968,7 @@ fn build_candidate(bytes: &[u8], request: &ControlRequest) -> Result<Candidate, 
             "managed-agent store must be a JSON array",
         )
     })?;
-
-    let mut keyed_indices: HashMap<&str, Vec<usize>> = HashMap::new();
-    let mut agent_count = 0usize;
+    let mut keyed_indices: HashMap<&str, usize> = HashMap::new();
     for (index, record) in original_records.iter().enumerate() {
         let object = record.as_object().ok_or_else(|| {
             ControlError::new(
@@ -645,55 +985,51 @@ fn build_candidate(bytes: &[u8], request: &ControlRequest) -> Result<Candidate, 
                     "every managed-agent store record must contain a string pubkey",
                 )
             })?;
-        if !pubkey.is_empty() {
-            agent_count += 1;
-            keyed_indices.entry(pubkey).or_default().push(index);
+        if pubkey.is_empty() {
+            continue;
+        }
+        if !is_lower_hex(pubkey, 64) {
+            return Err(ControlError::new(
+                "invalid_store_pubkey",
+                "every nonempty store public key must be 64 lowercase hexadecimal characters",
+            ));
+        }
+        if keyed_indices.insert(pubkey, index).is_some() {
+            return Err(ControlError::new(
+                "duplicate_store_pubkey",
+                "managed-agent store contains a duplicate nonempty public key",
+            ));
         }
     }
-    if keyed_indices.values().any(|indices| indices.len() != 1) {
-        return Err(ControlError::new(
-            "duplicate_store_pubkey",
-            "managed-agent store contains a duplicate nonempty public key",
-        ));
-    }
-    if agent_count != request.expected_agent_count {
+    if keyed_indices.len() != request.expected_agent_count {
         return Err(ControlError::new(
             "agent_count_mismatch",
             "managed-agent identity count does not match expectedAgentCount",
         ));
     }
-
-    let mut target_indices = Vec::with_capacity(request.target_pubkeys.len());
-    for target in &request.target_pubkeys {
-        let indices = keyed_indices.get(target.as_str()).ok_or_else(|| {
-            ControlError::new(
-                "target_not_found",
-                "a requested target public key is absent from the store",
-            )
-        })?;
-        target_indices.push(indices[0]);
+    let requested: HashSet<&str> = request.target_pubkeys.iter().map(String::as_str).collect();
+    let stored: HashSet<&str> = keyed_indices.keys().copied().collect();
+    if requested != stored {
+        return Err(ControlError::new(
+            "target_set_mismatch",
+            "targetPubkeys must exactly equal all nonempty store identities",
+        ));
     }
-
-    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let target_indices: Vec<usize> = request
+        .target_pubkeys
+        .iter()
+        .filter_map(|target| keyed_indices.get(target.as_str()).copied())
+        .collect();
     let mut candidate = original.clone();
     {
-        let candidate_records = candidate.as_array_mut().ok_or_else(|| {
-            ControlError::new(
-                "invalid_store_shape",
-                "managed-agent store must be a JSON array",
-            )
-        })?;
+        let candidate_records = candidate.as_array_mut().ok_or_else(diff_error)?;
         for index in &target_indices {
-            let object = candidate_records[*index].as_object_mut().ok_or_else(|| {
-                ControlError::new(
-                    "invalid_store_record",
-                    "target managed-agent record must be a JSON object",
-                )
-            })?;
-            patch_record(object, request, &timestamp)?;
+            let object = candidate_records[*index]
+                .as_object_mut()
+                .ok_or_else(diff_error)?;
+            patch_record(object, request)?;
         }
     }
-
     validate_semantic_diff(&original, &candidate, &target_indices)?;
     let candidate_records = candidate.as_array().ok_or_else(diff_error)?;
     let (changed_fields, changed_env_keys) =
@@ -707,19 +1043,17 @@ fn build_candidate(bytes: &[u8], request: &ControlRequest) -> Result<Candidate, 
     if bytes.ends_with(b"\n") {
         candidate_bytes.push(b'\n');
     }
-
     Ok(Candidate {
         bytes: candidate_bytes,
         changed_fields,
         changed_env_keys,
-        agent_count,
+        agent_count: keyed_indices.len(),
     })
 }
 
 fn patch_record(
     object: &mut Map<String, Value>,
     request: &ControlRequest,
-    timestamp: &str,
 ) -> Result<(), ControlError> {
     object.insert(
         "acp_command".to_owned(),
@@ -729,34 +1063,22 @@ fn patch_record(
         "parallelism".to_owned(),
         Value::Number(request.parallelism.into()),
     );
-
-    if !request.env_set.is_empty() || !request.env_unset.is_empty() {
-        let env = object
-            .entry("env_vars".to_owned())
-            .or_insert_with(|| Value::Object(Map::new()))
-            .as_object_mut()
-            .ok_or_else(|| {
-                ControlError::new(
-                    "invalid_store_env_vars",
-                    "target env_vars must be a JSON object when present",
-                )
-            })?;
-        for key in &request.env_unset {
-            env.remove(key);
-        }
-        for (key, value) in &request.env_set {
-            env.insert(key.clone(), Value::String(value.clone()));
-        }
-    } else if object
-        .get("env_vars")
-        .is_some_and(|value| !value.is_object())
-    {
-        return Err(ControlError::new(
-            "invalid_store_env_vars",
-            "target env_vars must be a JSON object when present",
-        ));
+    let env = object
+        .entry("env_vars".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            ControlError::new(
+                "invalid_store_env_vars",
+                "target env_vars must be a JSON object when present",
+            )
+        })?;
+    for key in &request.env_unset {
+        env.remove(key);
     }
-    object.insert("updated_at".to_owned(), Value::String(timestamp.to_owned()));
+    for (key, value) in &request.env_set {
+        env.insert(key.clone(), Value::String(value.clone()));
+    }
     Ok(())
 }
 
@@ -784,16 +1106,9 @@ fn validate_semantic_diff(
         }
         let before_object = before.as_object().ok_or_else(diff_error)?;
         let after_object = after.as_object().ok_or_else(diff_error)?;
-        if before_object.get("pubkey") != after_object.get("pubkey") {
-            return Err(diff_error());
-        }
-
-        let before_protected = protected_top_level(before_object);
-        let after_protected = protected_top_level(after_object);
-        if before_protected != after_protected {
-            return Err(diff_error());
-        }
-        if protected_env(before_object)? != protected_env(after_object)? {
+        if protected_top_level(before_object) != protected_top_level(after_object)
+            || protected_env(before_object)? != protected_env(after_object)?
+        {
             return Err(diff_error());
         }
     }
@@ -802,23 +1117,14 @@ fn validate_semantic_diff(
 
 fn protected_top_level(object: &Map<String, Value>) -> Map<String, Value> {
     let mut protected = object.clone();
-    for key in ["acp_command", "parallelism", "updated_at", "env_vars"] {
+    for key in ["acp_command", "parallelism", "env_vars"] {
         protected.remove(key);
     }
     protected
 }
 
 fn protected_env(object: &Map<String, Value>) -> Result<Map<String, Value>, ControlError> {
-    let mut env = match object.get("env_vars") {
-        None => Map::new(),
-        Some(Value::Object(env)) => env.clone(),
-        Some(_) => {
-            return Err(ControlError::new(
-                "invalid_store_env_vars",
-                "target env_vars must be a JSON object when present",
-            ))
-        }
-    };
+    let mut env = env_object_or_empty(object)?;
     for key in ALLOWED_ENV_KEYS {
         env.remove(key);
     }
@@ -835,7 +1141,7 @@ fn collect_changed_names(
     for index in targets {
         let before = original[*index].as_object().ok_or_else(diff_error)?;
         let after = candidate[*index].as_object().ok_or_else(diff_error)?;
-        for field in ["acp_command", "parallelism", "updated_at", "env_vars"] {
+        for field in ["acp_command", "parallelism", "env_vars"] {
             if before.get(field) != after.get(field) {
                 fields.insert(field.to_owned());
             }
@@ -869,53 +1175,10 @@ fn diff_error() -> ControlError {
     )
 }
 
-fn validate_existing_destination(path: &Path, code: &'static str) -> Result<(), ControlError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(ControlError::new(
-                    code,
-                    "existing destination must be a regular file and not a symlink",
-                ));
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::{MetadataExt, PermissionsExt};
-                if metadata.uid() != nix::unistd::geteuid().as_raw()
-                    || metadata.permissions().mode() & 0o077 != 0
-                {
-                    return Err(ControlError::new(
-                        code,
-                        "existing destination must be current-user owned and owner-only",
-                    ));
-                }
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let parent = path.parent().ok_or_else(|| {
-                ControlError::new(code, "destination must have an existing parent directory")
-            })?;
-            if !parent.is_dir() {
-                return Err(ControlError::new(
-                    code,
-                    "destination parent directory does not exist",
-                ));
-            }
-            Ok(())
-        }
-        Err(_) => Err(ControlError::new(
-            code,
-            "failed to inspect destination path",
-        )),
-    }
-}
-
 fn stage_restricted_file(
     destination: &Path,
     bytes: &[u8],
 ) -> Result<tempfile::NamedTempFile, ControlError> {
-    validate_existing_destination(destination, "invalid_write_destination")?;
     let parent = destination.parent().ok_or_else(|| {
         ControlError::new(
             "invalid_write_destination",
@@ -961,10 +1224,6 @@ fn commit_staged_file(
     staged
         .persist(destination)
         .map_err(|_| ControlError::new(code, "failed to atomically replace destination"))?;
-    // The staged regular file was already mode-0600 and fsync'd. Once rename
-    // succeeds, do not manufacture a failure that could prompt an unsafe
-    // retry after mutation. Directory fsync is a best-effort durability
-    // reinforcement because some filesystems do not support it.
     if let Some(parent) = destination.parent() {
         let _ = File::open(parent).and_then(|directory| directory.sync_all());
     }
