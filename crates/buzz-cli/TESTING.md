@@ -610,16 +610,18 @@ buzz schedules due \
   --at "$(rfc3339_after 86400)" --owner "$OWNER_PUBKEY" | jq -e 'length == 0'
 ```
 
-For a pre-existing schema-1 item, claim it normally and use that exact claim
-once with `buzz schedules bind`. Supply the same verified delegation fields,
-baseline receipt, material timestamp, and a due time 10–15 minutes ahead. The
-bind is CAS-protected and an exact retry after lost output is idempotent. After
-binding, only `schedules reconcile` may change its lifecycle; generic `mem set`,
-`mem patch`, and `mem rm` reject the schedule, archive, and binding-registry
-prefixes. Visible decisions use a prepare/publish/finalize outbox: the schedule
-head reserves the exact signed action before publication, and any retry resumes
-that stored event ID. Audit archives are immutable and content-addressed, so two
-rollover candidates at the same sequence cannot overwrite one another.
+For a pre-existing schema-1 item, claim it normally, read its stored thread and
+named evidence, then finish exactly one bounded cycle. Use `schedules complete`
+when the work is complete or obsolete, `schedules reschedule` with a due time
+10–15 minutes ahead when it remains live, or `schedules bind` when the thread
+already contains a precise current delegation suitable for schema 2. Exact
+retries of each transition are idempotent. After binding, only `schedules
+reconcile` may change its lifecycle; generic `mem set`, `mem patch`, and `mem
+rm` reject the schedule, archive, and binding-registry prefixes. Visible schema-2
+decisions use a prepare/publish/finalize outbox: the schedule head reserves the
+exact signed action before publication, and any retry resumes that stored event
+ID. Audit archives are immutable and content-addressed, so two rollover
+candidates at the same sequence cannot overwrite one another.
 
 ---
 

@@ -5161,19 +5161,25 @@ fn schedule_heartbeat_prompt() -> String {
          You have NO incoming message, active channel context, or automatically injected core\n\
          memory. This opted-in heartbeat processes only your private due follow-through schedule.\n\n\
          Follow-through tasks:\n\
-         1. Run `buzz schedules claim-due`. This claims only due items owned by this agent. A due\n\
-            item means you are the designated driver for that conversation. Any agent can be the\n\
+         1. Run `buzz schedules claim-due --limit 1 --lease-seconds 300`. This claims one due item\n\
+            owned by this agent for a five-minute recovery window. A due item means you are the\n\
+            designated driver for that conversation. Any agent can be the\n\
             driver, and any managed agent can be the assignee.\n\
-         2. For each claimed item, use its channel_id and thread_id with\n\
-            `buzz messages thread --channel <channel_id> --event <thread_id>`. Find the explicit\n\
-            delegation naming one assignee, its expected result, and the callback/evidence location.\n\
-            Verify that the stored task binding matches the exact assignee pubkey and delegation\n\
-            event, follow the item's `check` before its `action`, and inspect that named location.\n\
-            A valid delegation event is authored by this driver in the same channel/thread,\n\
-            p-tags exactly one assignee, and contains exact `Expected result: ...` and\n\
-            `Evidence locator: ...` lines. If a claimed item is legacy schema 1, use its claim\n\
-            with `buzz schedules bind`, that verified event, and an immutable baseline receipt;\n\
-            then stop processing that item until its next due claim.\n\
+         2. For the claimed item, use its channel_id and thread_id with\n\
+            `buzz messages thread --channel <channel_id> --event <thread_id>`. Follow the item's\n\
+            stored `check` before its `action`, and inspect the named thread, worktree, PR,\n\
+            document, Corpus record, or other evidence. Existing schema-1 work does not require a\n\
+            newly formatted delegation message. Read the conversation and named evidence to\n\
+            determine what is still owed. If it is complete or obsolete, run\n\
+            `buzz schedules complete`. If it is still live, perform only the safe Buzz\n\
+            coordination its stored action requires, then run `buzz schedules reschedule` with a\n\
+            due time 10 to 15 minutes away. Immediately before sending a schema-1 coordination\n\
+            message, re-read the thread and do not duplicate an equivalent message already there.\n\
+            Every claimed schema-1 item must end in exactly one bind, complete, or reschedule\n\
+            transition before this heartbeat exits. If the thread already contains a precise\n\
+            current delegation naming one assignee plus exact `Expected result: ...` and\n\
+            `Evidence locator: ...` lines, you may instead upgrade it with `buzz schedules bind`\n\
+            and an immutable baseline receipt.\n\
          3. Distinguish material progress from genuinely stopped work. A missing callback alone is\n\
             not evidence of a stop. Keep only for a newer task-bound receipt: a Buzz event,\n\
             Codex/Cursor turn, commit or PR head, document hash, worktree fingerprint, or external\n\
@@ -5211,9 +5217,11 @@ fn schedule_heartbeat_prompt() -> String {
             away so it is due by the next heartbeat. These transitions retain a durable decision audit.\n\
             Inspect only the claimed due items, and never blindly replay an external effect whose\n\
             outcome is unknown. A background schedule heartbeat may inspect evidence and manage\n\
-            its private schedule. Its only visible output is the signed reconciliation outbox for\n\
-            a claimed due obligation; do not call `buzz messages send` or publish an unclaimed\n\
-            status. It must not approve a workflow or perform a customer, production, financial,\n\
+            its private schedule. A schema-2 item's only visible output is its signed\n\
+            reconciliation outbox. A schema-1 item may use `buzz messages send` only for the\n\
+            claimed obligation's stored safe coordination action before completing or\n\
+            rescheduling it; never publish an unclaimed status. It must not approve a workflow or\n\
+            perform a customer, production, financial,\n\
             or other external effect. A foreground turn carrying explicit authority owns such an\n\
             action.\n\
          7. If the schedule result is `[]`, end immediately and publish nothing.\n\n\
@@ -5254,15 +5262,19 @@ mod heartbeat_prompt_tests {
     #[test]
     fn opted_in_schedule_prompt_requires_a_claimed_outbox_for_visibility() {
         let prompt = schedule_heartbeat_prompt();
-        assert!(prompt.contains("buzz schedules claim-due"));
+        assert!(prompt.contains("buzz schedules claim-due --limit 1 --lease-seconds 300"));
+        assert!(prompt.contains("five-minute recovery window"));
         assert!(prompt.contains("buzz messages thread --channel"));
         assert!(prompt.contains("designated driver"));
         assert!(prompt.contains("Any agent can be the"));
         assert!(prompt.contains("any managed agent can be the assignee"));
-        assert!(prompt.contains("delegation naming one assignee"));
-        assert!(prompt.contains("expected result"));
-        assert!(prompt.contains("callback/evidence location"));
-        assert!(prompt.contains("follow the item's `check` before its `action`"));
+        assert!(prompt.contains("Existing schema-1 work does not require"));
+        assert!(prompt.contains("Corpus record"));
+        assert!(prompt.contains("buzz schedules complete"));
+        assert!(prompt.contains("buzz schedules reschedule"));
+        assert!(prompt.contains("Every claimed schema-1 item must end"));
+        assert!(prompt.contains("one bind, complete, or reschedule"));
+        assert!(prompt.contains("stored `check` before its `action`"));
         assert!(prompt.contains("A missing callback alone"));
         assert!(prompt.contains("newer task-bound receipt"));
         assert!(prompt.contains("Generic online presence"));
@@ -5284,9 +5296,9 @@ mod heartbeat_prompt_tests {
         assert!(prompt.contains("durable decision audit"));
         assert!(!prompt.contains("buzz feed get --types needs_action"));
         assert!(!prompt.contains("buzz feed get --types mentions"));
-        assert!(prompt.contains("only visible output is the signed reconciliation outbox"));
-        assert!(prompt.contains("do not call `buzz messages send`"));
-        assert!(prompt.contains("claimed due obligation"));
+        assert!(prompt.contains("schema-2 item's only visible output"));
+        assert!(prompt.contains("schema-1 item may use `buzz messages send`"));
+        assert!(prompt.contains("claimed obligation"));
         assert!(prompt.contains("Immediately before any visible wake, redirect, or complete"));
         assert!(prompt.contains("already covers this exact claimed obligation and result"));
         assert!(prompt.contains("ordinary incoming-message turn owns"));

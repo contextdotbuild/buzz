@@ -1775,13 +1775,121 @@ async fn claim_due(
     Ok(())
 }
 
-fn retired_transition_error(schedule: &Schedule, transition: &str) -> CliError {
-    let command = if schedule.schema == LEGACY_SCHEMA_VERSION {
-        format!("legacy schedules must be bound with `buzz schedules bind` before {transition}")
-    } else {
-        format!("task-bound schedules must use `buzz schedules reconcile` for {transition}")
-    };
-    CliError::Usage(command)
+fn task_bound_transition_error(transition: &str) -> CliError {
+    CliError::Usage(format!(
+        "task-bound schedules must use `buzz schedules reconcile` for {transition}"
+    ))
+}
+
+fn legacy_completion_matches(schedule: &Schedule, token: &str) -> bool {
+    schedule.schema == LEGACY_SCHEMA_VERSION
+        && schedule.status == ScheduleStatus::Completed
+        && schedule.claim.is_none()
+        && schedule.last_transition.as_ref().is_some_and(|transition| {
+            transition.kind == TransitionKind::Completed && transition.claim_token == token
+        })
+}
+
+fn complete_legacy_schedule(
+    schedule: &mut Schedule,
+    token: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, CliError> {
+    if schedule.schema != LEGACY_SCHEMA_VERSION {
+        return Err(task_bound_transition_error("completion"));
+    }
+    if legacy_completion_matches(schedule, token) {
+        return Ok(true);
+    }
+    require_live_claim(schedule, token, now)?;
+    schedule.status = ScheduleStatus::Completed;
+    schedule.claim = None;
+    schedule.updated_at = canonical_time(now);
+    schedule.last_transition = Some(LastTransition {
+        kind: TransitionKind::Completed,
+        claim_token: token.to_owned(),
+        at: canonical_time(now),
+    });
+    validate_schedule(schedule)?;
+    Ok(false)
+}
+
+struct LegacyRescheduleInput<'a> {
+    due_at: &'a str,
+    expected_cause: Option<&'a str>,
+    action: Option<&'a str>,
+    check: Option<&'a str>,
+}
+
+fn legacy_reschedule_matches(
+    schedule: &Schedule,
+    token: &str,
+    input: &LegacyRescheduleInput<'_>,
+) -> bool {
+    schedule.schema == LEGACY_SCHEMA_VERSION
+        && schedule.status == ScheduleStatus::Pending
+        && schedule.last_transition.as_ref().is_some_and(|transition| {
+            transition.kind == TransitionKind::Rescheduled && transition.claim_token == token
+        })
+        && schedule.due_at == input.due_at
+        && input
+            .expected_cause
+            .is_none_or(|value| schedule.expected_cause == value)
+        && input.action.is_none_or(|value| schedule.action == value)
+        && input.check.is_none_or(|value| schedule.check == value)
+}
+
+fn legacy_reschedule_candidate_matches(
+    winner: &Schedule,
+    candidate: &Schedule,
+    token: &str,
+) -> bool {
+    legacy_reschedule_matches(
+        winner,
+        token,
+        &LegacyRescheduleInput {
+            due_at: &candidate.due_at,
+            expected_cause: Some(&candidate.expected_cause),
+            action: Some(&candidate.action),
+            check: Some(&candidate.check),
+        },
+    )
+}
+
+fn reschedule_legacy_schedule(
+    schedule: &mut Schedule,
+    token: &str,
+    now: DateTime<Utc>,
+    input: LegacyRescheduleInput<'_>,
+) -> Result<bool, CliError> {
+    if schedule.schema != LEGACY_SCHEMA_VERSION {
+        return Err(task_bound_transition_error("rescheduling"));
+    }
+    if legacy_reschedule_matches(schedule, token, &input) {
+        return Ok(true);
+    }
+    require_live_claim(schedule, token, now)?;
+    validate_next_due_at(now, input.due_at)?;
+    schedule.due_at = input.due_at.to_owned();
+    if let Some(value) = input.expected_cause {
+        schedule.expected_cause = value.to_owned();
+    }
+    if let Some(value) = input.action {
+        schedule.action = value.to_owned();
+    }
+    if let Some(value) = input.check {
+        schedule.check = value.to_owned();
+    }
+    schedule.status = ScheduleStatus::Pending;
+    schedule.claim = None;
+    schedule.updated_at = canonical_time(now);
+    schedule.last_transition = Some(LastTransition {
+        kind: TransitionKind::Rescheduled,
+        claim_token: token.to_owned(),
+        at: canonical_time(now),
+    });
+    validate_schedule(schedule)?;
+    Ok(false)
 }
 
 async fn complete(
@@ -1790,9 +1898,34 @@ async fn complete(
     claim: &str,
     owner: Option<&str>,
 ) -> Result<(), CliError> {
-    let (_, loaded) = load_one(client, owner, id).await?;
-    let _ = claim;
-    Err(retired_transition_error(&loaded.schedule, "completion"))
+    let (owner_pubkey, mut loaded) = load_one(client, owner, id).await?;
+    let idempotent = complete_legacy_schedule(&mut loaded.schedule, claim, Utc::now())?;
+    if idempotent {
+        return print_one(&loaded.schedule, &loaded.revision, true);
+    }
+    let value = serialized_schedule(&loaded.schedule)?;
+    let revision = put_stored_memory(
+        client,
+        &owner_pubkey,
+        &loaded.slug,
+        value,
+        ExpectedMemoryHead::Event(&loaded.revision),
+    )
+    .await;
+    match revision {
+        Ok(revision) => print_one(&loaded.schedule, &revision, false),
+        Err(CliError::Conflict(_)) => {
+            let (_, winner) = load_one(client, owner, id).await?;
+            if legacy_completion_matches(&winner.schedule, claim) {
+                print_one(&winner.schedule, &winner.revision, true)
+            } else {
+                Err(CliError::Conflict(format!(
+                    "schedule `{id}` completion lost its head CAS to different state"
+                )))
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1816,9 +1949,40 @@ async fn reschedule(
     let check = check
         .map(|value| validate_text(value, "check"))
         .transpose()?;
-    let (_, loaded) = load_one(client, owner, id).await?;
-    let _ = (claim, due_at, expected_cause, action, check);
-    Err(retired_transition_error(&loaded.schedule, "rescheduling"))
+    let (owner_pubkey, mut loaded) = load_one(client, owner, id).await?;
+    let input = LegacyRescheduleInput {
+        due_at: &due_at,
+        expected_cause: expected_cause.as_deref(),
+        action: action.as_deref(),
+        check: check.as_deref(),
+    };
+    let idempotent = reschedule_legacy_schedule(&mut loaded.schedule, claim, Utc::now(), input)?;
+    if idempotent {
+        return print_one(&loaded.schedule, &loaded.revision, true);
+    }
+    let value = serialized_schedule(&loaded.schedule)?;
+    let revision = put_stored_memory(
+        client,
+        &owner_pubkey,
+        &loaded.slug,
+        value,
+        ExpectedMemoryHead::Event(&loaded.revision),
+    )
+    .await;
+    match revision {
+        Ok(revision) => print_one(&loaded.schedule, &revision, false),
+        Err(CliError::Conflict(_)) => {
+            let (_, winner) = load_one(client, owner, id).await?;
+            if legacy_reschedule_candidate_matches(&winner.schedule, &loaded.schedule, claim) {
+                print_one(&winner.schedule, &winner.revision, true)
+            } else {
+                Err(CliError::Conflict(format!(
+                    "schedule `{id}` reschedule lost its head CAS to different state"
+                )))
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 struct BindInput<'a> {
@@ -3407,6 +3571,151 @@ mod tests {
     }
 
     #[test]
+    fn claimed_legacy_work_can_finish_or_continue_without_a_new_delegation() {
+        let now = DateTime::parse_from_rfc3339("2026-08-26T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut legacy = sample_legacy_schedule(now);
+        let claim = claim_schedule(&mut legacy, now, 300).unwrap().unwrap();
+        let due_at = canonical_time(now + chrono::Duration::minutes(10));
+        let input = || LegacyRescheduleInput {
+            due_at: &due_at,
+            expected_cause: None,
+            action: None,
+            check: None,
+        };
+
+        assert!(!reschedule_legacy_schedule(&mut legacy, &claim, now, input()).unwrap());
+        assert_eq!(legacy.status, ScheduleStatus::Pending);
+        assert!(legacy.claim.is_none());
+        assert!(reschedule_legacy_schedule(&mut legacy, &claim, now, input()).unwrap());
+
+        let second_claim = claim_schedule(&mut legacy, now + chrono::Duration::minutes(10), 300)
+            .unwrap()
+            .unwrap();
+        assert!(!complete_legacy_schedule(
+            &mut legacy,
+            &second_claim,
+            now + chrono::Duration::minutes(10),
+        )
+        .unwrap());
+        assert_eq!(legacy.status, ScheduleStatus::Completed);
+        assert!(legacy.claim.is_none());
+        assert!(complete_legacy_schedule(
+            &mut legacy,
+            &second_claim,
+            now + chrono::Duration::minutes(10),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn legacy_cas_winner_is_idempotent_only_for_the_exact_transition() {
+        let now = DateTime::parse_from_rfc3339("2026-08-26T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut completed = sample_legacy_schedule(now);
+        let completion_claim = claim_schedule(&mut completed, now, 300).unwrap().unwrap();
+        complete_legacy_schedule(&mut completed, &completion_claim, now).unwrap();
+        assert!(legacy_completion_matches(&completed, &completion_claim));
+        assert!(!legacy_completion_matches(&completed, &"f".repeat(32)));
+
+        let mut rescheduled = sample_legacy_schedule(now);
+        let reschedule_claim = claim_schedule(&mut rescheduled, now, 300).unwrap().unwrap();
+        let due_at = canonical_time(now + chrono::Duration::minutes(10));
+        let requested = || LegacyRescheduleInput {
+            due_at: &due_at,
+            expected_cause: None,
+            action: None,
+            check: None,
+        };
+        reschedule_legacy_schedule(&mut rescheduled, &reschedule_claim, now, requested()).unwrap();
+        assert!(legacy_reschedule_matches(
+            &rescheduled,
+            &reschedule_claim,
+            &requested(),
+        ));
+        let different_due_at = canonical_time(now + chrono::Duration::minutes(11));
+        assert!(!legacy_reschedule_matches(
+            &rescheduled,
+            &reschedule_claim,
+            &LegacyRescheduleInput {
+                due_at: &different_due_at,
+                expected_cause: None,
+                action: None,
+                check: None,
+            },
+        ));
+
+        let mut preserved_candidate = sample_legacy_schedule(now);
+        let preserved_claim = claim_schedule(&mut preserved_candidate, now, 300)
+            .unwrap()
+            .unwrap();
+        let claimed_base = preserved_candidate.clone();
+        let original_action = preserved_candidate.action.clone();
+        reschedule_legacy_schedule(
+            &mut preserved_candidate,
+            &preserved_claim,
+            now,
+            LegacyRescheduleInput {
+                due_at: &due_at,
+                expected_cause: None,
+                action: None,
+                check: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(preserved_candidate.action, original_action);
+
+        let mut different_winner = claimed_base;
+        reschedule_legacy_schedule(
+            &mut different_winner,
+            &preserved_claim,
+            now,
+            LegacyRescheduleInput {
+                due_at: &due_at,
+                expected_cause: None,
+                action: Some("different concurrent action"),
+                check: None,
+            },
+        )
+        .unwrap();
+        assert!(!legacy_reschedule_candidate_matches(
+            &different_winner,
+            &preserved_candidate,
+            &preserved_claim,
+        ));
+    }
+
+    #[test]
+    fn task_bound_work_rejects_legacy_transitions() {
+        let now = DateTime::parse_from_rfc3339("2026-08-26T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut schedule = sample_schedule(now);
+        let claim = claim_schedule(&mut schedule, now, 300).unwrap().unwrap();
+        assert!(complete_legacy_schedule(&mut schedule, &claim, now)
+            .unwrap_err()
+            .to_string()
+            .contains("must use `buzz schedules reconcile`"));
+        let due_at = canonical_time(now + chrono::Duration::minutes(10));
+        assert!(reschedule_legacy_schedule(
+            &mut schedule,
+            &claim,
+            now,
+            LegacyRescheduleInput {
+                due_at: &due_at,
+                expected_cause: None,
+                action: None,
+                check: None,
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("must use `buzz schedules reconcile`"));
+    }
+
+    #[test]
     fn receipts_reject_presence_labels_and_malformed_revisions() {
         assert!(validate_receipt("external-job:goji/campaign-1@online-1").is_err());
         assert!(validate_receipt("external-job:worker/task-9@running").is_err());
@@ -4069,17 +4378,9 @@ mod tests {
     }
 
     #[test]
-    fn retired_legacy_transition_commands_fail_closed() {
-        let now = DateTime::parse_from_rfc3339("2026-08-26T15:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+    fn task_bound_transition_commands_fail_closed() {
         for transition in ["completion", "rescheduling"] {
-            assert!(
-                retired_transition_error(&sample_legacy_schedule(now), transition)
-                    .to_string()
-                    .contains("must be bound")
-            );
-            assert!(retired_transition_error(&sample_schedule(now), transition)
+            assert!(task_bound_transition_error(transition)
                 .to_string()
                 .contains("must use `buzz schedules reconcile`"));
         }

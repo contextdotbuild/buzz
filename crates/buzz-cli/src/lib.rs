@@ -1944,10 +1944,10 @@ pub enum SchedulesCmd {
         #[arg(long)]
         at: Option<String>,
         /// Seconds before an abandoned claim can be recovered
-        #[arg(long, default_value_t = 1800)]
+        #[arg(long, default_value_t = 300)]
         lease_seconds: u64,
         /// Maximum schedules to claim in one heartbeat
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 1)]
         limit: usize,
         /// Owner pubkey (hex). Overrides BUZZ_AUTH_TAG.
         #[arg(long)]
@@ -1985,7 +1985,7 @@ pub enum SchedulesCmd {
         #[arg(long)]
         owner: Option<String>,
     },
-    /// Mark a claimed schedule complete
+    /// Mark a claimed schema-1 schedule complete after checking its work
     Complete {
         #[arg(long)]
         id: String,
@@ -1996,7 +1996,7 @@ pub enum SchedulesCmd {
         #[arg(long)]
         owner: Option<String>,
     },
-    /// Release a claimed schedule back to pending with a new due time
+    /// Release a claimed schema-1 schedule back to pending with a new due time
     Reschedule {
         #[arg(long)]
         id: String,
@@ -2275,6 +2275,24 @@ async fn run(cli: Cli) -> Result<(), CliError> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn schedule_claim_defaults_bound_abandoned_heartbeat_work() {
+        let cli = Cli::try_parse_from(["buzz", "schedules", "claim-due"])
+            .expect("claim-due defaults should parse");
+
+        let Cmd::Schedules(SchedulesCmd::ClaimDue {
+            lease_seconds,
+            limit,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected schedules claim-due");
+        };
+
+        assert_eq!(lease_seconds, 300);
+        assert_eq!(limit, 1);
+    }
 
     /// Raw shorthand `[auth,hex,,hex]` normalizes to strict JSON; the empty
     /// conditions field becomes `""`.

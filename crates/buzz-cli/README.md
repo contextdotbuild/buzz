@@ -129,10 +129,18 @@ stored rules in `validation_error` so an owner can remove and repair them.
 
 `buzz schedules` keeps one encrypted `mem/buzz-follow-through/<id>` entry per
 schedule in the calling bot's agent↔owner namespace. The CLI owns the schema and
-claim lifecycle; bots do not hand-edit it. `claim-due` leases returned items for
-30 minutes by default. Completed items never become due again, while an
+claim lifecycle; bots do not hand-edit it. `claim-due` claims one item with a
+five-minute lease by default, so a vanished heartbeat turn cannot hoard several
+follow-through obligations or block recovery for half an hour. Completed items
+never become due again, while an
 abandoned claim becomes recoverable after its lease. The schedule's `check`
 instruction must reconcile any external effect before it is repeated.
+
+Existing schema-1 schedules remain executable during cutover. After reading the
+stored thread plus its named evidence, the driver must either bind it to schema
+2, complete it, or reschedule it 10 to 15 minutes ahead. A schema-1 claim never
+requires inventing a replacement delegation merely to keep existing work
+moving. New schedules use schema 2 and its task-bound reconciliation audit.
 
 The creating agent is the conversation driver for that item. Any agent can be
 the driver, and any managed agent can be the assignee. Before creating one, the driver makes the
