@@ -212,6 +212,10 @@ buzz messages send --channel "$CHANNEL_ID" \
 echo 'Body with `backticks` and $vars stays literal.' \
   | buzz messages send --channel "$CHANNEL_ID" --content - | jq .
 
+# empty or whitespace-only content without a file fails before publishing
+printf '  \n' | buzz messages send --channel "$CHANNEL_ID" --content -
+# Expected: exit 1 with "message content must not be empty unless at least one file is attached"
+
 # messages get
 buzz messages get --channel "$CHANNEL_ID" | jq .
 buzz messages get --channel "$CHANNEL_ID" --limit 5 | jq .

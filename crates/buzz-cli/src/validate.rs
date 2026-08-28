@@ -72,6 +72,19 @@ pub fn validate_content_size(content: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Reject a message with no text unless it carries at least one file.
+///
+/// Media-only messages are valid because the send path appends each uploaded
+/// file URL to the signed event content before publishing.
+pub fn validate_message_content(content: &str, has_files: bool) -> Result<(), CliError> {
+    if content.trim().is_empty() && !has_files {
+        return Err(CliError::Usage(
+            "message content must not be empty unless at least one file is attached".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Percent-encode for URL path segments and query parameter values.
 /// Encodes all bytes except RFC 3986 unreserved: A-Z a-z 0-9 - _ . ~
 #[cfg(test)]
@@ -274,6 +287,26 @@ mod tests {
     #[test]
     fn validate_content_size_empty() {
         assert!(validate_content_size("").is_ok());
+    }
+
+    // --- validate_message_content ---
+
+    #[test]
+    fn validate_message_content_rejects_empty_text_without_files() {
+        for content in ["", "   ", "\n\t"] {
+            let err = validate_message_content(content, false).unwrap_err();
+            assert!(matches!(err, CliError::Usage(_)));
+            assert!(err
+                .to_string()
+                .contains("message content must not be empty"));
+        }
+    }
+
+    #[test]
+    fn validate_message_content_allows_text_or_a_file() {
+        assert!(validate_message_content("hello", false).is_ok());
+        assert!(validate_message_content("", true).is_ok());
+        assert!(validate_message_content("  ", true).is_ok());
     }
 
     // --- percent_encode ---
