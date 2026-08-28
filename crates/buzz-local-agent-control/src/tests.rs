@@ -701,15 +701,15 @@ fn production_inverse_contract_is_exactly_the_approved_immutable_release() {
     let inverse = production_rollback_artifacts();
     assert_eq!(
         inverse.release_id,
-        "0fe6a54b28195be7e2a188f800a0427b7b383513"
+        "d10de1f346242cf2615026764671bb2e73f577e8"
     );
     assert_eq!(
         inverse.source_tree,
-        "efd70f586e13086868c04842404f313cf6ff2144"
+        "fcab2055f7e6123245b2a125ee5bb0ea8a1f2071"
     );
     assert_eq!(
         inverse.manifest_sha256,
-        "f6e974d9ce1429be95fea77ca600b26c695bb1b549309760faa7a5647d7ded77"
+        "1326abc216818f51c419953992bf09a9df36c5e9a57f3c13e174aedcbf532a15"
     );
     assert_eq!(
         inverse.command_sha256,
@@ -718,13 +718,19 @@ fn production_inverse_contract_is_exactly_the_approved_immutable_release() {
     assert_eq!(inverse.command_size, 184);
     assert_eq!(
         inverse.libexec_sha256,
-        "ff3df3caaa8a8b69f5cd6307054f4d76abc8eaee5cb3ce91f9fa120e5a0e9ffe"
+        "336449c34c2a780b9db4fe1edbd6753f6e938976b8677ada4b1ef86f6e5cbec3"
     );
-    assert_eq!(inverse.libexec_size, 13_941_968);
+    assert_eq!(inverse.libexec_size, 13_889_392);
     assert_eq!(inverse.owner, "timi");
     assert_eq!(inverse.mode, "0555");
     assert_eq!(inverse.toolchain, "rustc 1.95.0");
-    assert!(matches!(inverse.mcp, McpContract::BundledCommand));
+    assert!(matches!(
+        inverse.mcp,
+        McpContract::RuntimeArtifact {
+            sha256: "adcb70b53513658f73961adfd6e0337e2a6fb519c3b58cf3892c7f12dcfe3572",
+            size: 19_951_152
+        }
+    ));
     assert_eq!(
         inverse.environment.env_set(),
         BTreeMap::from([

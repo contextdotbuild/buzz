@@ -24,29 +24,32 @@ const CANONICAL_STORE_PATH: &str =
     "/Users/timi/Library/Application Support/xyz.block.buzz.app/agents/managed-agents.json";
 const DESKTOP_EXECUTABLE_PATH: &str = "/Applications/Buzz.app/Contents/MacOS/buzz-desktop";
 const STORE_FILENAME: &str = "managed-agents.json";
-const FORWARD_RELEASE_ID: &str = "d10de1f346242cf2615026764671bb2e73f577e8";
-const FORWARD_SOURCE_TREE: &str = "fcab2055f7e6123245b2a125ee5bb0ea8a1f2071";
+const FORWARD_RELEASE_ID: &str = "89b17e44178a045651da91047653994557e9b886";
+const FORWARD_SOURCE_TREE: &str = "9dcb2f595fb9aeb4935809a49866671af45ee2e4";
 const FORWARD_MANIFEST_SHA256: &str =
-    "1326abc216818f51c419953992bf09a9df36c5e9a57f3c13e174aedcbf532a15";
+    "ba2d2abbe33ad077a974ad7a233ddc43b7a8ea4e6ea7abe6fe4055e3a365dead";
 const FORWARD_COMMAND_SHA256: &str =
     "8d2720ddde69d25a0d21c28bdd1308cf524243d8cdb86781965a7ade98858745";
 const FORWARD_COMMAND_SIZE: u64 = 184;
 const FORWARD_LIBEXEC_SHA256: &str =
-    "336449c34c2a780b9db4fe1edbd6753f6e938976b8677ada4b1ef86f6e5cbec3";
-const FORWARD_LIBEXEC_SIZE: u64 = 13_889_392;
-const FORWARD_MCP_SHA256: &str = "adcb70b53513658f73961adfd6e0337e2a6fb519c3b58cf3892c7f12dcfe3572";
-const FORWARD_MCP_SIZE: u64 = 19_951_152;
+    "834f1320cda652a22946698feb9525cef11907a7bfaecfaab7f76c5ee39f12af";
+const FORWARD_LIBEXEC_SIZE: u64 = 13_905_904;
+const FORWARD_MCP_SHA256: &str = "022f409747210715cd7a97b55309e4ce592e7ec520906b53b779b603cda7c0cd";
+const FORWARD_MCP_SIZE: u64 = 19_981_648;
 const FORWARD_TOOLCHAIN: &str = "rustc 1.95.0";
-const ROLLBACK_RELEASE_ID: &str = "0fe6a54b28195be7e2a188f800a0427b7b383513";
-const ROLLBACK_SOURCE_TREE: &str = "efd70f586e13086868c04842404f313cf6ff2144";
+const ROLLBACK_RELEASE_ID: &str = "d10de1f346242cf2615026764671bb2e73f577e8";
+const ROLLBACK_SOURCE_TREE: &str = "fcab2055f7e6123245b2a125ee5bb0ea8a1f2071";
 const ROLLBACK_MANIFEST_SHA256: &str =
-    "f6e974d9ce1429be95fea77ca600b26c695bb1b549309760faa7a5647d7ded77";
+    "1326abc216818f51c419953992bf09a9df36c5e9a57f3c13e174aedcbf532a15";
 const ROLLBACK_COMMAND_SHA256: &str =
     "8d2720ddde69d25a0d21c28bdd1308cf524243d8cdb86781965a7ade98858745";
 const ROLLBACK_COMMAND_SIZE: u64 = 184;
 const ROLLBACK_LIBEXEC_SHA256: &str =
-    "ff3df3caaa8a8b69f5cd6307054f4d76abc8eaee5cb3ce91f9fa120e5a0e9ffe";
-const ROLLBACK_LIBEXEC_SIZE: u64 = 13_941_968;
+    "336449c34c2a780b9db4fe1edbd6753f6e938976b8677ada4b1ef86f6e5cbec3";
+const ROLLBACK_LIBEXEC_SIZE: u64 = 13_889_392;
+const ROLLBACK_MCP_SHA256: &str =
+    "adcb70b53513658f73961adfd6e0337e2a6fb519c3b58cf3892c7f12dcfe3572";
+const ROLLBACK_MCP_SIZE: u64 = 19_951_152;
 const ROLLBACK_TOOLCHAIN: &str = "rustc 1.95.0";
 const APPROVED_ARTIFACT_OWNER: &str = "timi";
 const APPROVED_ARTIFACT_MODE: &str = "0555";
@@ -206,7 +209,13 @@ struct ArtifactContract<'a> {
 
 #[derive(Clone, Copy)]
 enum McpContract<'a> {
-    RuntimeArtifact { sha256: &'a str, size: u64 },
+    RuntimeArtifact {
+        sha256: &'a str,
+        size: u64,
+    },
+    // Kept for the fail-closed regression fixtures that exercise older
+    // approved contracts without a release-local MCP binary.
+    #[allow(dead_code)]
     BundledCommand,
 }
 
@@ -245,7 +254,10 @@ fn production_rollback_artifacts() -> ArtifactContract<'static> {
         command_size: ROLLBACK_COMMAND_SIZE,
         libexec_sha256: ROLLBACK_LIBEXEC_SHA256,
         libexec_size: ROLLBACK_LIBEXEC_SIZE,
-        mcp: McpContract::BundledCommand,
+        mcp: McpContract::RuntimeArtifact {
+            sha256: ROLLBACK_MCP_SHA256,
+            size: ROLLBACK_MCP_SIZE,
+        },
         owner: APPROVED_ARTIFACT_OWNER,
         mode: APPROVED_ARTIFACT_MODE,
         toolchain: ROLLBACK_TOOLCHAIN,
