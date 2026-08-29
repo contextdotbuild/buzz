@@ -701,15 +701,15 @@ fn production_forward_contract_is_exactly_the_approved_immutable_release() {
     let forward = production_forward_artifacts();
     assert_eq!(
         forward.release_id,
-        "cdec20d84ad612b6400da093bc5de7bf1395a553"
+        "e3867f718595c7f2077a3e9f7f379d78df156d9d"
     );
     assert_eq!(
         forward.source_tree,
-        "12a0cd15834cded190f98b37542ee1300db7ab23"
+        "73d927a860a62f2e4a6b991173f4392ebd8f58a2"
     );
     assert_eq!(
         forward.manifest_sha256,
-        "c0e57e057de5c20e1300a3d5d7c09df29778495949985a669ca4a1ed79c42873"
+        "1b71db9d2e38ddf71098c539137a48b81509c0bb4bcdace673d6b32f28d5687a"
     );
     assert_eq!(
         forward.command_sha256,
@@ -718,7 +718,7 @@ fn production_forward_contract_is_exactly_the_approved_immutable_release() {
     assert_eq!(forward.command_size, 184);
     assert_eq!(
         forward.libexec_sha256,
-        "8a538f135f3dd0cf6f03799d80a4d916c7ce131d4ee4175ccef8661b585971f3"
+        "e10afcc26073966eb5f2aa0c486990b29c80906fb09f62d3ce40d7548ca4e959"
     );
     assert_eq!(forward.libexec_size, 13_857_088);
     assert_eq!(forward.owner, "timi");
@@ -727,8 +727,8 @@ fn production_forward_contract_is_exactly_the_approved_immutable_release() {
     assert!(matches!(
         forward.mcp,
         McpContract::RuntimeArtifact {
-            sha256: "9588d705f4749c5d5df76ef3d661df826840282ae28d711311d3a0948f832709",
-            size: 20_062_096
+            sha256: "4e14a040ed3821257562eef3629423d5e1c1cc20faf49ec5bd710799f4a28a91",
+            size: 20_080_832
         }
     ));
     assert_eq!(
@@ -748,15 +748,15 @@ fn production_inverse_contract_is_exactly_the_approved_immutable_release() {
     let inverse = production_rollback_artifacts();
     assert_eq!(
         inverse.release_id,
-        "f43207297fdeeed6919563544b970930f9f1bdb1"
+        "cdec20d84ad612b6400da093bc5de7bf1395a553"
     );
     assert_eq!(
         inverse.source_tree,
-        "b3f4a4de4085e3fc8b74e8dcbb26919f26c1ee34"
+        "12a0cd15834cded190f98b37542ee1300db7ab23"
     );
     assert_eq!(
         inverse.manifest_sha256,
-        "32bfa32988249a08b59b761a6b2c6fa67995b828602689e495aaa84f2f7b186a"
+        "c0e57e057de5c20e1300a3d5d7c09df29778495949985a669ca4a1ed79c42873"
     );
     assert_eq!(
         inverse.command_sha256,
@@ -765,17 +765,17 @@ fn production_inverse_contract_is_exactly_the_approved_immutable_release() {
     assert_eq!(inverse.command_size, 184);
     assert_eq!(
         inverse.libexec_sha256,
-        "02852e83f379cd60b9f8f41e9708da46b10e828f35a364480defe8fd151ddd52"
+        "8a538f135f3dd0cf6f03799d80a4d916c7ce131d4ee4175ccef8661b585971f3"
     );
-    assert_eq!(inverse.libexec_size, 13_905_904);
+    assert_eq!(inverse.libexec_size, 13_857_088);
     assert_eq!(inverse.owner, "timi");
     assert_eq!(inverse.mode, "0555");
     assert_eq!(inverse.toolchain, "rustc 1.95.0");
     assert!(matches!(
         inverse.mcp,
         McpContract::RuntimeArtifact {
-            sha256: "9862b564e966a8a65d5f8fe5a376dd81bec8f09b81f0291897b0d6eb36ca684f",
-            size: 20_094_048
+            sha256: "9588d705f4749c5d5df76ef3d661df826840282ae28d711311d3a0948f832709",
+            size: 20_062_096
         }
     ));
     assert_eq!(
