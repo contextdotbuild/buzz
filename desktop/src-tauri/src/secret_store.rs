@@ -593,6 +593,27 @@ impl SecretStore {
         }
     }
 
+    /// Read one key from the current blob without running any legacy migration
+    /// or write-back path.
+    ///
+    /// This is the fail-closed read used by application-owned, one-shot helper
+    /// processes. A missing current blob/key stays missing; a helper must never
+    /// turn a read into a keychain mutation just because an old-format entry
+    /// might exist.
+    pub fn load_readonly(&self, key: &str) -> Result<Option<String>, String> {
+        #[cfg(feature = "system-keyring")]
+        {
+            Ok(self
+                .load_blob()?
+                .and_then(|entries| entries.get(key).cloned()))
+        }
+        #[cfg(not(feature = "system-keyring"))]
+        {
+            let _ = key;
+            Err("system-keyring feature disabled".to_string())
+        }
+    }
+
     /// Insert all entries from `entries` into the blob in a single mutation.
     ///
     /// Entries that already exist in the blob are overwritten; entries not

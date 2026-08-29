@@ -33,6 +33,7 @@ mod native_websocket_batch;
 mod nostr_bind;
 pub mod nostr_convert;
 mod observed_unread;
+mod operator_read;
 mod persona_catalog;
 mod prevent_sleep;
 mod ptt_shortcut;
@@ -83,6 +84,8 @@ use managed_agents::{
 };
 #[cfg(not(feature = "mesh-llm"))]
 use mesh_llm_stubs::*;
+#[doc(hidden)]
+pub use operator_read::run_operator_read_cli;
 #[cfg(all(feature = "mesh-llm", target_os = "macos"))]
 use shutdown::{hard_exit_after_mesh_shutdown, relaunch_after_mesh_shutdown};
 use shutdown::{is_restart_request, shut_down_app};
