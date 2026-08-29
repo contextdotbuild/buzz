@@ -10,7 +10,7 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::client::BuzzClient;
@@ -1724,10 +1724,47 @@ async fn load_all(
     client: &BuzzClient,
     owner: Option<&str>,
 ) -> Result<Vec<LoadedSchedule>, CliError> {
-    list_stored_memories(client, owner, SLUG_PREFIX)
+    let mut schedules: Vec<LoadedSchedule> = list_stored_memories(client, owner, SLUG_PREFIX)
         .await?
         .into_iter()
         .map(parse_stored)
+        .collect::<Result<_, _>>()?;
+
+    // Broad encrypted-memory listings are the only discovery path for legacy
+    // schema-1 schedules, but they can temporarily omit a recently written
+    // head. Every task-bound schema-2 schedule is also recorded in the exact
+    // binding registry, so use that registry as a bounded fallback and fetch
+    // only registered schedule IDs that the broad listing did not return.
+    let (_, stored_registry) = get_stored_memory(client, owner, BINDING_REGISTRY_SLUG).await?;
+    let Some(stored_registry) = stored_registry else {
+        return Ok(schedules);
+    };
+    let registry = serde_json::from_str::<TaskBindingRegistry>(&stored_registry.value)
+        .map_err(|error| CliError::Other(format!("task binding registry is invalid: {error}")))?;
+    let present: HashSet<String> = schedules
+        .iter()
+        .map(|loaded| loaded.schedule.id.clone())
+        .collect();
+    for id in missing_registered_schedule_ids(&registry, &present)? {
+        let slug = schedule_slug(&id);
+        let (_, stored) = get_stored_memory(client, owner, &slug).await?;
+        if let Some(stored) = stored {
+            schedules.push(parse_stored(stored)?);
+        }
+    }
+    Ok(schedules)
+}
+
+fn missing_registered_schedule_ids(
+    registry: &TaskBindingRegistry,
+    present: &HashSet<String>,
+) -> Result<Vec<String>, CliError> {
+    validate_binding_registry(registry)?;
+    registry
+        .by_schedule
+        .keys()
+        .filter(|id| !present.contains(*id))
+        .map(|id| validate_id(id))
         .collect()
 }
 
@@ -4973,6 +5010,43 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("lost its historical delegation reservation"));
+    }
+
+    #[test]
+    fn binding_registry_supplies_only_schedules_missing_from_broad_discovery() {
+        let delegation_a = "a".repeat(64);
+        let delegation_b = "b".repeat(64);
+        let registry = TaskBindingRegistry {
+            schema: 1,
+            by_delegation: BTreeMap::from([
+                (delegation_a.clone(), "schedule-a".into()),
+                (delegation_b.clone(), "schedule-b".into()),
+            ]),
+            by_schedule: BTreeMap::from([
+                ("schedule-a".into(), delegation_a),
+                ("schedule-b".into(), delegation_b),
+            ]),
+        };
+        let present = HashSet::from(["schedule-a".to_owned(), "legacy-only".to_owned()]);
+
+        assert_eq!(
+            missing_registered_schedule_ids(&registry, &present).unwrap(),
+            vec!["schedule-b"],
+        );
+    }
+
+    #[test]
+    fn binding_registry_fallback_fails_closed_on_inconsistent_state() {
+        let registry = TaskBindingRegistry {
+            schema: 1,
+            by_delegation: BTreeMap::from([("a".repeat(64), "schedule-a".into())]),
+            by_schedule: BTreeMap::new(),
+        };
+
+        assert!(missing_registered_schedule_ids(&registry, &HashSet::new())
+            .unwrap_err()
+            .to_string()
+            .contains("inconsistent mappings"));
     }
 
     #[test]
