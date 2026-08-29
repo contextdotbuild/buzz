@@ -16,6 +16,7 @@ use std::{
         net::UnixStream as StdUnixStream,
     },
     path::{Path, PathBuf},
+    sync::atomic::Ordering,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -34,7 +35,7 @@ use tokio::{
 };
 use url::Url;
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, IdentityStorage};
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
@@ -50,6 +51,9 @@ const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(45);
 const SOCKET_DIR_NAME: &str = "operator-read";
 const SOCKET_FILE_NAME: &str = "desktop.sock";
 const ALLOWED_RELAY_HOST: &str = "buildcontext.communities.buzz.xyz";
+const PRODUCTION_BUNDLE_IDENTIFIER: &str = "xyz.block.buzz.app";
+#[cfg(target_os = "macos")]
+const PRODUCTION_CODE_REQUIREMENT: &str = "identifier \"xyz.block.buzz.app\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = EYF346PHUG";
 const MESSAGE_KINDS: [u32; 4] = [9, 40002, 45001, 45003];
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -123,6 +127,13 @@ impl OperatorError {
 #[derive(Default)]
 struct ReplayGuard {
     consumed: Mutex<HashMap<String, i64>>,
+}
+
+struct ActiveScope {
+    relay: String,
+    keys: Keys,
+    identity_pubkey: String,
+    workspace_generation: u64,
 }
 
 impl ReplayGuard {
@@ -328,7 +339,7 @@ fn validate_request_at(request: &ReadRequest, now: i64) -> Result<(), OperatorEr
     uuid::Uuid::parse_str(&request.request_id)
         .map_err(|_| OperatorError::new("request_invalid", "request_id must be a UUID"))?;
     if request.issued_at > now + MAX_CLOCK_SKEW_SECONDS
-        || request.expires_at < now
+        || request.expires_at <= now
         || request.expires_at <= request.issued_at
         || request.expires_at - request.issued_at > MAX_REQUEST_LIFETIME_SECONDS
     {
@@ -387,6 +398,16 @@ fn validate_request_at(request: &ReadRequest, now: i64) -> Result<(), OperatorEr
     Ok(())
 }
 
+fn ensure_request_not_expired_at(expires_at: i64, now: i64) -> Result<(), OperatorError> {
+    if expires_at <= now {
+        return Err(OperatorError::new(
+            "request_stale",
+            "the read request expired before relay authentication",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_relay(value: &str) -> Result<Url, OperatorError> {
     let parsed = Url::parse(value)
         .map_err(|_| OperatorError::new("relay_rejected", "relay must be a valid URL"))?;
@@ -409,6 +430,20 @@ fn validate_relay(value: &str) -> Result<Url, OperatorError> {
 
 /// Start the owner-only Unix-socket service inside the signed Desktop process.
 pub fn start_operator_read_server(app: tauri::AppHandle) -> Result<(), String> {
+    if !is_production_bundle(&app) {
+        return Ok(());
+    }
+    let state = app.state::<AppState>();
+    if !production_credential_owner_allowed(
+        &app.config().identifier,
+        state.identity_storage(),
+        production_code_signature_valid(),
+    ) {
+        return Err(
+            "operator reads require Block's signed production app and keyring-backed identity"
+                .to_string(),
+        );
+    }
     let socket_path = resolve_socket_path().map_err(|error| error.message.to_string())?;
     prepare_socket_path(&socket_path).map_err(|error| error.message.to_string())?;
     let listener = UnixListener::bind(&socket_path)
@@ -442,20 +477,105 @@ pub fn start_operator_read_server(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+pub fn is_production_bundle(app: &tauri::AppHandle) -> bool {
+    app.config().identifier == PRODUCTION_BUNDLE_IDENTIFIER
+}
+
+/// Return whether this process is the trusted production credential owner.
+pub fn is_trusted_production_owner(app: &tauri::AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    production_credential_owner_allowed(
+        &app.config().identifier,
+        state.identity_storage(),
+        production_code_signature_valid(),
+    )
+}
+
+fn production_credential_owner_allowed(
+    identifier: &str,
+    storage: IdentityStorage,
+    code_signature_valid: bool,
+) -> bool {
+    if identifier != PRODUCTION_BUNDLE_IDENTIFIER || !code_signature_valid {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        storage == IdentityStorage::SystemKeyring
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = storage;
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn production_code_signature_valid() -> bool {
+    use security_framework::os::macos::code_signing::{Flags, SecCode, SecRequirement};
+
+    let Ok(requirement) = PRODUCTION_CODE_REQUIREMENT.parse::<SecRequirement>() else {
+        return false;
+    };
+    let Ok(code) = SecCode::for_self(Flags::NONE) else {
+        return false;
+    };
+    code.check_validity(
+        Flags::STRICT_VALIDATE | Flags::CHECK_TRUSTED_ANCHORS | Flags::NO_NETWORK_ACCESS,
+        &requirement,
+    )
+    .is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn production_code_signature_valid() -> bool {
+    false
+}
+
+/// Expose the bundled credentialless client on the normal local PATH.
+///
+/// Development bundles deliberately do not create this production command.
+/// Existing regular files are preserved; only a symlink in Buzz's own
+/// `buzz-read` namespace is refreshed on application boot.
+pub fn ensure_client_symlink(exe_parent: &Path) -> Result<(), String> {
+    let local_bin = dirs::home_dir()
+        .ok_or("cannot resolve home directory")?
+        .join(".local")
+        .join("bin");
+    ensure_client_symlink_at(exe_parent, &local_bin)
+}
+
+fn ensure_client_symlink_at(exe_parent: &Path, local_bin: &Path) -> Result<(), String> {
+    let bundled = exe_parent.join("buzz-read");
+    if !bundled.is_file() || bundled.is_symlink() {
+        return Ok(());
+    }
+    fs::create_dir_all(local_bin).map_err(|error| {
+        format!(
+            "create Buzz read client directory {}: {error}",
+            local_bin.display()
+        )
+    })?;
+    let link = local_bin.join("buzz-read");
+    match link.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::remove_file(&link)
+                .map_err(|error| format!("remove stale {}: {error}", link.display()))?;
+        }
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("stat {}: {error}", link.display())),
+    }
+    std::os::unix::fs::symlink(&bundled, &link)
+        .map_err(|error| format!("symlink {}: {error}", link.display()))
+}
+
 async fn handle_connection(
     mut stream: UnixStream,
     app: tauri::AppHandle,
     replay_guard: Arc<ReplayGuard>,
 ) -> Result<(), OperatorError> {
-    let credentials = stream
-        .peer_cred()
-        .map_err(|_| OperatorError::new("peer_rejected", "could not verify the local caller"))?;
-    if credentials.uid() != current_uid() {
-        return Err(OperatorError::new(
-            "peer_rejected",
-            "the local caller did not match the Buzz Desktop owner",
-        ));
-    }
+    validate_peer(&stream)?;
 
     let raw = timeout(
         SOCKET_IO_TIMEOUT,
@@ -468,13 +588,15 @@ async fn handle_connection(
         .as_ref()
         .map(|request| request.request_id.clone())
         .unwrap_or_else(|_| "unknown".to_string());
+    let request_expires_at = parsed.as_ref().ok().map(|request| request.expires_at);
     let result = async {
         let request = parsed
             .map_err(|_| OperatorError::new("request_invalid", "the read request was malformed"))?;
         let now = unix_now()?;
         validate_request_at(&request, now)?;
         replay_guard.consume(&request.request_id, request.expires_at, now)?;
-        execute_read(&app, request).await
+        let remaining = duration_until_expiry(request.expires_at)?;
+        run_with_expiry_timeout(remaining, execute_read(&app, request)).await
     }
     .await;
     let receipt = result.unwrap_or_else(|error| error_receipt(request_id, &error));
@@ -485,12 +607,33 @@ async fn handle_connection(
             "the Buzz read receipt could not be serialized",
         )
     })?;
+    let response_timeout = match request_expires_at {
+        Some(expires_at) => duration_until_expiry(expires_at)?.min(SOCKET_IO_TIMEOUT),
+        None => SOCKET_IO_TIMEOUT,
+    };
     timeout(
-        SOCKET_IO_TIMEOUT,
+        response_timeout,
         write_frame_async(&mut stream, &encoded, MAX_RECEIPT_BYTES),
     )
     .await
     .map_err(|_| OperatorError::new("response_timeout", "the read response timed out"))??;
+    Ok(())
+}
+
+fn validate_peer(stream: &UnixStream) -> Result<(), OperatorError> {
+    let credentials = stream
+        .peer_cred()
+        .map_err(|_| OperatorError::new("peer_rejected", "could not verify the local caller"))?;
+    ensure_peer_uid(credentials.uid(), current_uid())
+}
+
+fn ensure_peer_uid(peer_uid: u32, owner_uid: u32) -> Result<(), OperatorError> {
+    if peer_uid != owner_uid {
+        return Err(OperatorError::new(
+            "peer_rejected",
+            "the local caller did not match the Buzz Desktop owner",
+        ));
+    }
     Ok(())
 }
 
@@ -499,31 +642,10 @@ async fn execute_read(
     request: ReadRequest,
 ) -> Result<ReadReceipt, OperatorError> {
     let state = app.state::<AppState>();
-    let relay_before = crate::relay::relay_ws_url_with_override(&state);
-    validate_relay(&relay_before)?;
-    let keys = state.signing_keys().map_err(|_| {
-        OperatorError::new(
-            "identity_unavailable",
-            "the active Buzz Desktop identity was unavailable",
-        )
-    })?;
-    let relay_after = crate::relay::relay_ws_url_with_override(&state);
-    let keys_after = state.signing_keys().map_err(|_| {
-        OperatorError::new(
-            "identity_unavailable",
-            "the active Buzz Desktop identity was unavailable",
-        )
-    })?;
-    let identity_pubkey = keys.public_key().to_hex();
-    if relay_before != relay_after || identity_pubkey != keys_after.public_key().to_hex() {
-        return Err(OperatorError::new(
-            "active_scope_changed",
-            "the active Buzz workspace changed during the read",
-        ));
-    }
+    let scope = capture_active_scope(&state).await?;
     if let Some(expected) = request.expected_relay.as_deref() {
         if crate::relay::relay_http_base_url(expected)
-            != crate::relay::relay_http_base_url(&relay_before)
+            != crate::relay::relay_http_base_url(&scope.relay)
         {
             return Err(OperatorError::new(
                 "relay_mismatch",
@@ -534,7 +656,7 @@ async fn execute_read(
     if request
         .expected_identity_pubkey
         .as_deref()
-        .is_some_and(|expected| !expected.eq_ignore_ascii_case(&identity_pubkey))
+        .is_some_and(|expected| !expected.eq_ignore_ascii_case(&scope.identity_pubkey))
     {
         return Err(OperatorError::new(
             "identity_mismatch",
@@ -555,8 +677,16 @@ async fn execute_read(
         filter["search"] = serde_json::json!(search.trim());
     }
 
-    let api_base = crate::relay::relay_http_base_url(&relay_before);
-    let mut events = query_verified(&state, &api_base, &[filter], &keys).await?;
+    let api_base = crate::relay::relay_http_base_url(&scope.relay);
+    let mut events = query_verified(
+        &state,
+        &api_base,
+        &[filter],
+        &scope.keys,
+        request.expires_at,
+    )
+    .await?;
+    assert_active_scope_unchanged(&state, &scope).await?;
     if events.len() > request.limit.saturating_add(1) as usize {
         return Err(OperatorError::new(
             "response_oversize",
@@ -576,9 +706,12 @@ async fn execute_read(
     let truncated = events.len() > request.limit as usize;
     events.truncate(request.limit as usize);
 
-    let author_names = fetch_author_names(&state, &api_base, &keys, &events)
-        .await
-        .unwrap_or_default();
+    let author_names =
+        fetch_author_names(&state, &api_base, &scope.keys, &events, request.expires_at)
+            .await
+            .unwrap_or_default();
+    assert_active_scope_unchanged(&state, &scope).await?;
+    ensure_request_not_expired_at(request.expires_at, unix_now()?)?;
     let projected = events
         .iter()
         .map(|event| project_event(event, request.excerpt_chars, &author_names))
@@ -591,7 +724,7 @@ async fn execute_read(
         generated_at: unix_now()?,
         desktop_pid: std::process::id(),
         relay_host: ALLOWED_RELAY_HOST.to_string(),
-        identity_pubkey,
+        identity_pubkey: scope.identity_pubkey,
         requested_limit: request.limit,
         returned: projected.len(),
         truncated,
@@ -603,13 +736,99 @@ async fn execute_read(
     Ok(receipt)
 }
 
+async fn capture_active_scope(state: &AppState) -> Result<ActiveScope, OperatorError> {
+    let _workspace_guard = state.workspace_apply_lock.lock().await;
+    ensure_production_identity_owner(state)?;
+    let workspace_generation = state.workspace_apply_generation.load(Ordering::Acquire);
+    let relay = crate::relay::relay_ws_url_with_override(state);
+    validate_relay(&relay)?;
+    let keys = state.signing_keys().map_err(|_| {
+        OperatorError::new(
+            "identity_unavailable",
+            "the active Buzz Desktop identity was unavailable",
+        )
+    })?;
+    let identity_pubkey = keys.public_key().to_hex();
+    Ok(ActiveScope {
+        relay,
+        keys,
+        identity_pubkey,
+        workspace_generation,
+    })
+}
+
+async fn assert_active_scope_unchanged(
+    state: &AppState,
+    initial: &ActiveScope,
+) -> Result<(), OperatorError> {
+    let _workspace_guard = state.workspace_apply_lock.lock().await;
+    ensure_production_identity_owner(state)?;
+    let current_generation = state.workspace_apply_generation.load(Ordering::Acquire);
+    let current_relay = crate::relay::relay_ws_url_with_override(state);
+    let current_pubkey = state
+        .signing_keys()
+        .map_err(|_| {
+            OperatorError::new(
+                "identity_unavailable",
+                "the active Buzz Desktop identity was unavailable",
+            )
+        })?
+        .public_key()
+        .to_hex();
+    ensure_scope_values_unchanged(
+        initial.workspace_generation,
+        &initial.relay,
+        &initial.identity_pubkey,
+        current_generation,
+        &current_relay,
+        &current_pubkey,
+    )
+}
+
+fn ensure_production_identity_owner(state: &AppState) -> Result<(), OperatorError> {
+    if production_credential_owner_allowed(
+        PRODUCTION_BUNDLE_IDENTIFIER,
+        state.identity_storage(),
+        production_code_signature_valid(),
+    ) {
+        Ok(())
+    } else {
+        Err(OperatorError::new(
+            "identity_unavailable",
+            "the active identity is no longer owned by Block's signed production app keyring",
+        ))
+    }
+}
+
+fn ensure_scope_values_unchanged(
+    initial_generation: u64,
+    initial_relay: &str,
+    initial_pubkey: &str,
+    current_generation: u64,
+    current_relay: &str,
+    current_pubkey: &str,
+) -> Result<(), OperatorError> {
+    if initial_generation != current_generation
+        || initial_relay != current_relay
+        || initial_pubkey != current_pubkey
+    {
+        return Err(OperatorError::new(
+            "active_scope_changed",
+            "the active Buzz workspace changed during the read",
+        ));
+    }
+    Ok(())
+}
+
 async fn query_verified(
     state: &AppState,
     api_base: &str,
     filters: &[serde_json::Value],
     keys: &Keys,
+    expires_at: i64,
 ) -> Result<Vec<Event>, OperatorError> {
     crate::relay_admission::wait_for_rate_limit().await;
+    ensure_request_not_expired_at(expires_at, unix_now()?)?;
     let url = format!("{}/query", api_base.trim_end_matches('/'));
     let body = serde_json::to_vec(filters).map_err(|_| {
         OperatorError::new(
@@ -677,6 +896,7 @@ async fn query_verified(
         OperatorError::new("response_invalid", "the Buzz relay response was malformed")
     })?;
     verify_event_set(&events)?;
+    ensure_request_not_expired_at(expires_at, unix_now()?)?;
     Ok(events)
 }
 
@@ -697,6 +917,7 @@ async fn fetch_author_names(
     api_base: &str,
     keys: &Keys,
     events: &[Event],
+    expires_at: i64,
 ) -> Result<HashMap<String, String>, OperatorError> {
     let authors = events
         .iter()
@@ -712,7 +933,7 @@ async fn fetch_author_names(
         "authors": authors,
         "limit": authors.len().min(MAX_RESULTS as usize),
     });
-    let profiles = query_verified(state, api_base, &[filter], keys).await?;
+    let profiles = query_verified(state, api_base, &[filter], keys, expires_at).await?;
     if profiles.len() > MAX_RESULTS as usize {
         return Err(OperatorError::new(
             "response_oversize",
@@ -781,9 +1002,11 @@ fn project_event(
 fn event_channel(event: &Event) -> Option<String> {
     event.tags.iter().find_map(|tag| {
         let values = tag.as_slice();
-        (values.first().map(String::as_str) == Some("h"))
-            .then(|| values.get(1).cloned())
-            .flatten()
+        if values.first().map(String::as_str) != Some("h") {
+            return None;
+        }
+        let channel = values.get(1)?;
+        uuid::Uuid::parse_str(channel).ok().map(|_| channel.clone())
     })
 }
 
@@ -799,14 +1022,17 @@ fn bounded_excerpt(content: &str, max_chars: u32) -> String {
         })
         .collect::<String>();
     let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut excerpt = normalized
-        .chars()
-        .take(max_chars as usize)
-        .collect::<String>();
-    if normalized.chars().count() > max_chars as usize {
-        excerpt.push('…');
+    let redacted = redact_sensitive_text(&normalized);
+    let maximum = max_chars as usize;
+    if redacted.chars().count() <= maximum {
+        return redacted;
     }
-    redact_sensitive_text(&excerpt)
+    if maximum == 0 {
+        return String::new();
+    }
+    let mut excerpt = redacted.chars().take(maximum - 1).collect::<String>();
+    excerpt.push('…');
+    excerpt
 }
 
 fn redact_sensitive_text(input: &str) -> String {
@@ -890,13 +1116,12 @@ fn reject_secret_environment() -> Result<(), OperatorError> {
 }
 
 fn resolve_socket_path() -> Result<PathBuf, OperatorError> {
-    let home = dirs::home_dir().ok_or_else(|| {
+    let buzz_dir = crate::managed_agents::nest_dir().ok_or_else(|| {
         OperatorError::new(
             "home_unavailable",
-            "could not resolve the current user home",
+            "could not resolve the current Buzz application directory",
         )
     })?;
-    let buzz_dir = home.join(".buzz");
     validate_parent_dir(&buzz_dir)?;
     let socket_dir = buzz_dir.join(SOCKET_DIR_NAME);
     ensure_owner_only_dir(&socket_dir)?;
@@ -968,12 +1193,33 @@ fn prepare_socket_path(path: &Path) -> Result<(), OperatorError> {
             "another Buzz Desktop read service is already active",
         ));
     }
+    let current = fs::symlink_metadata(path).map_err(|_| {
+        OperatorError::new(
+            "socket_rejected",
+            "the stale Buzz read socket changed before cleanup",
+        )
+    })?;
+    if !same_socket_identity(&metadata, &current) {
+        return Err(OperatorError::new(
+            "socket_rejected",
+            "the stale Buzz read socket changed before cleanup",
+        ));
+    }
     fs::remove_file(path).map_err(|_| {
         OperatorError::new(
             "socket_rejected",
             "could not remove the stale Buzz read socket",
         )
     })
+}
+
+fn same_socket_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type().is_socket()
+        && right.file_type().is_socket()
+        && left.uid() == right.uid()
+        && left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.permissions().mode() & 0o777 == right.permissions().mode() & 0o777
 }
 
 fn validate_socket(path: &Path) -> Result<fs::Metadata, OperatorError> {
@@ -1101,6 +1347,32 @@ fn unix_now() -> Result<i64, OperatorError> {
         .map_err(|_| OperatorError::new("clock_invalid", "the system clock was invalid"))
 }
 
+fn duration_until_expiry(expires_at: i64) -> Result<Duration, OperatorError> {
+    let seconds = u64::try_from(expires_at).map_err(|_| {
+        OperatorError::new("request_stale", "the read request expired before execution")
+    })?;
+    let deadline = UNIX_EPOCH
+        .checked_add(Duration::from_secs(seconds))
+        .ok_or_else(|| {
+            OperatorError::new("request_stale", "the read request expiry was invalid")
+        })?;
+    deadline.duration_since(SystemTime::now()).map_err(|_| {
+        OperatorError::new("request_stale", "the read request expired before execution")
+    })
+}
+
+async fn run_with_expiry_timeout<F, T>(
+    remaining: Duration,
+    operation: F,
+) -> Result<T, OperatorError>
+where
+    F: std::future::Future<Output = Result<T, OperatorError>>,
+{
+    timeout(remaining, operation).await.map_err(|_| {
+        OperatorError::new("request_stale", "the read request expired during execution")
+    })?
+}
+
 fn current_uid() -> u32 {
     // SAFETY: getuid has no preconditions and cannot fail.
     unsafe { libc::getuid() }
@@ -1146,6 +1418,44 @@ mod tests {
     }
 
     #[test]
+    fn production_operator_rejects_nonproduction_and_nonkeyring_macos_owners() {
+        assert!(!production_credential_owner_allowed(
+            "xyz.contextdotbuild.buzz.client",
+            IdentityStorage::SystemKeyring,
+            true,
+        ));
+        assert!(!production_credential_owner_allowed(
+            PRODUCTION_BUNDLE_IDENTIFIER,
+            IdentityStorage::SystemKeyring,
+            false,
+        ));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!production_credential_owner_allowed(
+                PRODUCTION_BUNDLE_IDENTIFIER,
+                IdentityStorage::Environment,
+                true,
+            ));
+            assert!(!production_credential_owner_allowed(
+                PRODUCTION_BUNDLE_IDENTIFIER,
+                IdentityStorage::LocalFile,
+                true,
+            ));
+            assert!(production_credential_owner_allowed(
+                PRODUCTION_BUNDLE_IDENTIFIER,
+                IdentityStorage::SystemKeyring,
+                true,
+            ));
+            assert!(PRODUCTION_CODE_REQUIREMENT.contains("anchor apple generic"));
+            assert!(PRODUCTION_CODE_REQUIREMENT.contains("EYF346PHUG"));
+            use security_framework::os::macos::code_signing::SecRequirement;
+            assert!(PRODUCTION_CODE_REQUIREMENT
+                .parse::<SecRequirement>()
+                .is_ok());
+        }
+    }
+
+    #[test]
     fn request_freshness_fails_closed() {
         let now = 1_788_000_000;
         let mut stale = request(now);
@@ -1163,6 +1473,10 @@ mod tests {
             validate_request_at(&future, now).unwrap_err().code,
             "request_stale"
         );
+        assert_eq!(
+            ensure_request_not_expired_at(now, now).unwrap_err().code,
+            "request_stale"
+        );
     }
 
     #[test]
@@ -1177,6 +1491,20 @@ mod tests {
         let consumed = guard.consumed.lock().unwrap();
         assert!(!consumed.contains_key("one"));
         assert!(consumed.contains_key("two"));
+    }
+
+    #[test]
+    fn success_receipt_requires_unchanged_workspace_generation_relay_and_signer() {
+        let relay = "wss://buildcontext.communities.buzz.xyz";
+        let pubkey = "a".repeat(64);
+        assert!(ensure_scope_values_unchanged(7, relay, &pubkey, 7, relay, &pubkey).is_ok());
+        for result in [
+            ensure_scope_values_unchanged(7, relay, &pubkey, 8, relay, &pubkey),
+            ensure_scope_values_unchanged(7, relay, &pubkey, 7, "wss://other", &pubkey),
+            ensure_scope_values_unchanged(7, relay, &pubkey, 7, relay, &"b".repeat(64)),
+        ] {
+            assert_eq!(result.unwrap_err().code, "active_scope_changed");
+        }
     }
 
     #[test]
@@ -1230,10 +1558,13 @@ mod tests {
             .unwrap();
         let projected = project_event(&event, 160, &HashMap::new());
         let excerpt = projected.excerpt.unwrap();
-        assert!(excerpt.chars().count() <= 161);
+        assert!(excerpt.chars().count() <= 160);
         assert!(!excerpt.contains("nsec1"));
         assert!(!excerpt.contains("Bearer-abc"));
         assert!(!excerpt.contains("secret=shh"));
+        assert_eq!(bounded_excerpt("secret=shh", 4), "sec…");
+        assert_eq!(bounded_excerpt("secret=shh", 1), "…");
+        assert_eq!(bounded_excerpt("secret=shh", 0), "");
 
         let mut matching = request(1_788_000_000);
         matching.since = event.created_at.as_secs() as i64 - 1;
@@ -1243,6 +1574,14 @@ mod tests {
         assert!(event_matches_request(&event, &matching));
         matching.search = Some("missing".to_string());
         assert!(!event_matches_request(&event, &matching));
+
+        let invalid_channel = EventBuilder::new(Kind::Custom(40002), "safe")
+            .tags([Tag::parse(["h", "not-a-uuid\nsecret=bad"]).unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert!(project_event(&invalid_channel, 10, &HashMap::new())
+            .channel
+            .is_none());
     }
 
     #[test]
@@ -1293,6 +1632,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bundled_client_symlink_is_created_refreshed_and_never_clobbers_regular_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_bin = temp.path().join("Buzz.app/Contents/MacOS");
+        let local_bin = temp.path().join("local-bin");
+        fs::create_dir_all(&app_bin).unwrap();
+        fs::write(app_bin.join("buzz-read"), b"credentialless client").unwrap();
+
+        ensure_client_symlink_at(&app_bin, &local_bin).unwrap();
+        let link = local_bin.join("buzz-read");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_link(&link).unwrap(), app_bin.join("buzz-read"));
+
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("wrong"), &link).unwrap();
+        ensure_client_symlink_at(&app_bin, &local_bin).unwrap();
+        assert_eq!(fs::read_link(&link).unwrap(), app_bin.join("buzz-read"));
+
+        fs::remove_file(&link).unwrap();
+        fs::write(&link, b"user-owned client").unwrap();
+        ensure_client_symlink_at(&app_bin, &local_bin).unwrap();
+        assert_eq!(fs::read(&link).unwrap(), b"user-owned client");
+    }
+
     #[tokio::test]
     async fn framed_socket_io_is_bounded() {
         let (mut left, mut right) = UnixStream::pair().unwrap();
@@ -1311,6 +1674,45 @@ mod tests {
             "request_oversize"
         );
         writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unix_socket_peer_is_the_current_owner() {
+        let (left, _right) = UnixStream::pair().unwrap();
+        validate_peer(&left).unwrap();
+        assert_eq!(
+            ensure_peer_uid(current_uid().saturating_add(1), current_uid())
+                .unwrap_err()
+                .code,
+            "peer_rejected"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn whole_request_timeout_cancels_in_flight_execution_at_expiry() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropSignal(Arc<AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = DropSignal(cancelled.clone());
+        let task = tokio::spawn(run_with_expiry_timeout(
+            Duration::from_secs(5),
+            async move {
+                let _signal = signal;
+                std::future::pending::<Result<(), OperatorError>>().await
+            },
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        assert_eq!(task.await.unwrap().unwrap_err().code, "request_stale");
+        assert!(cancelled.load(Ordering::SeqCst));
     }
 
     #[test]
