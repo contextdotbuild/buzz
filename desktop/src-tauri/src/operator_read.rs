@@ -1,21 +1,23 @@
 //! Owner-only, read-only Buzz conversation operator.
 //!
-//! The public `buzz-read` process only writes a bounded, non-secret request and
-//! asks launchd to execute the hidden helper in the logged-in GUI session. The
-//! helper is part of the Buzz Desktop crate: it reads the existing human
-//! identity inside the desktop keyring boundary, performs one authenticated
-//! relay query, and writes a bounded mode-0600 receipt. The private key and the
-//! NIP-98 Authorization event never cross that process boundary.
+//! `buzz-read` is a credentialless Unix-socket client. The already-running
+//! Buzz Desktop process owns the socket, resolves the active relay and signer
+//! from `AppState`, performs the authenticated query, and returns a bounded
+//! response. No private key or Authorization header crosses the process
+//! boundary.
 
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
-    fs::{self, OpenOptions},
+    fs,
     io::{Read, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    os::unix::{
+        fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
+        net::UnixStream as StdUnixStream,
+    },
     path::{Path, PathBuf},
-    process::Command,
-    time::{Duration, Instant, SystemTime},
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use chrono::DateTime;
@@ -24,24 +26,31 @@ use nostr::{Event, Keys};
 use regex::Regex;
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{UnixListener, UnixStream},
+    time::timeout,
+};
 use url::Url;
-use zeroize::Zeroizing;
+
+use crate::app_state::AppState;
 
 const SCHEMA_VERSION: u32 = 1;
-const MAX_REQUEST_BYTES: u64 = 16 * 1024;
+const MAX_REQUEST_BYTES: usize = 16 * 1024;
 const MAX_RELAY_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RECEIPT_BYTES: usize = 128 * 1024;
 const MAX_RESULTS: u32 = 100;
 const MAX_EXCERPT_CHARS: u32 = 512;
 const MAX_SEARCH_CHARS: usize = 256;
 const MAX_RANGE_SECONDS: i64 = 31 * 24 * 60 * 60;
-const HELPER_TIMEOUT: Duration = Duration::from_secs(45);
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
-const MESSAGE_KINDS: [u32; 4] = [9, 40002, 45001, 45003];
-const IDENTITY_KEY_NAME: &str = "identity";
-const CONTROL_DIR_NAME: &str = "operator-read";
-const HELPER_FLAG: &str = "--buzz-read-helper";
+const MAX_REQUEST_LIFETIME_SECONDS: i64 = 30;
+const MAX_CLOCK_SKEW_SECONDS: i64 = 5;
+const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(45);
+const SOCKET_DIR_NAME: &str = "operator-read";
+const SOCKET_FILE_NAME: &str = "desktop.sock";
 const ALLOWED_RELAY_HOST: &str = "buildcontext.communities.buzz.xyz";
+const MESSAGE_KINDS: [u32; 4] = [9, 40002, 45001, 45003];
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -49,11 +58,16 @@ struct ReadRequest {
     schema_version: u32,
     request_id: String,
     operation: String,
-    relay: String,
+    issued_at: i64,
+    expires_at: i64,
     since: i64,
     until: i64,
     limit: u32,
     excerpt_chars: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_relay: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_identity_pubkey: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     channel: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -67,6 +81,7 @@ struct ReadReceipt {
     status: String,
     operation: String,
     generated_at: i64,
+    desktop_pid: u32,
     relay_host: String,
     identity_pubkey: String,
     requested_limit: u32,
@@ -105,75 +120,55 @@ impl OperatorError {
     }
 }
 
-struct ClientPaths {
-    root: PathBuf,
-    requests: PathBuf,
-    receipts: PathBuf,
-    launch_agents: PathBuf,
+#[derive(Default)]
+struct ReplayGuard {
+    consumed: Mutex<HashMap<String, i64>>,
 }
 
-impl ClientPaths {
-    fn resolve() -> Result<Self, OperatorError> {
-        let home = dirs::home_dir().ok_or_else(|| {
-            OperatorError::new(
-                "home_unavailable",
-                "could not resolve the current user home",
-            )
+impl ReplayGuard {
+    fn consume(&self, request_id: &str, expires_at: i64, now: i64) -> Result<(), OperatorError> {
+        let mut consumed = self.consumed.lock().map_err(|_| {
+            OperatorError::new("service_unavailable", "the replay fence was unavailable")
         })?;
-        let root = home.join(".buzz").join(CONTROL_DIR_NAME);
-        Ok(Self {
-            requests: root.join("requests"),
-            receipts: root.join("receipts"),
-            launch_agents: root.join("launch-agents"),
-            root,
-        })
-    }
-
-    fn ensure(&self) -> Result<(), OperatorError> {
-        ensure_owner_only_dir(&self.root)?;
-        ensure_owner_only_dir(&self.requests)?;
-        ensure_owner_only_dir(&self.receipts)?;
-        ensure_owner_only_dir(&self.launch_agents)?;
+        consumed.retain(|_, expiry| *expiry >= now);
+        if consumed.contains_key(request_id) {
+            return Err(OperatorError::new(
+                "request_replayed",
+                "the read request was already consumed",
+            ));
+        }
+        consumed.insert(request_id.to_string(), expires_at);
         Ok(())
     }
 }
 
-struct LaunchCleanup {
-    label: String,
-    domain: String,
-    request_path: PathBuf,
-    plist_path: PathBuf,
+struct SocketCleanup {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
 }
 
-impl Drop for LaunchCleanup {
+impl Drop for SocketCleanup {
     fn drop(&mut self) {
-        let _ = Command::new("/bin/launchctl")
-            .args(["bootout", &format!("{}/{}", self.domain, self.label)])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let _ = fs::remove_file(&self.request_path);
-        let _ = fs::remove_file(&self.plist_path);
+        let Ok(metadata) = fs::symlink_metadata(&self.path) else {
+            return;
+        };
+        if metadata.file_type().is_socket()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+        {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
-/// Entry point for the installed `buzz-read` binary.
-///
-/// The ordinary mode accepts only the `messages` read operation. The hidden
-/// helper mode is invoked by the ordinary mode through a one-shot GUI
-/// LaunchAgent and requires owner-only request and receipt paths.
+/// Entry point for the credentialless `buzz-read` binary.
 pub fn run_operator_read_cli<I>(args: I) -> i32
 where
     I: IntoIterator<Item = OsString>,
 {
-    let args: Vec<OsString> = args.into_iter().collect();
-    let result = if args.get(1).and_then(|value| value.to_str()) == Some(HELPER_FLAG) {
-        run_helper_args(&args)
-    } else {
-        run_client_args(&args)
-    };
-
-    match result {
+    let args = args.into_iter().collect::<Vec<_>>();
+    match run_client_args(&args) {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("buzz-read: {}", error.message);
@@ -183,79 +178,38 @@ where
 }
 
 fn run_client_args(args: &[OsString]) -> Result<(), OperatorError> {
-    let request = parse_client_args(args)?;
-    validate_request(&request)?;
+    reject_secret_environment()?;
+    let now = unix_now()?;
+    let request = parse_client_args(args, now)?;
+    validate_request_at(&request, now)?;
 
-    let paths = ClientPaths::resolve()?;
-    paths.ensure()?;
-    prune_old_receipts(&paths.receipts);
-
-    let request_path = paths.requests.join(format!("{}.json", request.request_id));
-    let receipt_path = paths.receipts.join(format!("{}.json", request.request_id));
-    let plist_path = paths
-        .launch_agents
-        .join(format!("{}.plist", request.request_id));
-    write_new_owner_only_json(&request_path, &request)?;
-
-    let helper = std::env::current_exe()
-        .ok()
-        .and_then(|path| fs::canonicalize(path).ok())
-        .ok_or_else(|| {
-            OperatorError::new(
-                "helper_unavailable",
-                "could not resolve the installed helper",
-            )
-        })?;
-    if !helper.is_absolute() {
-        return Err(OperatorError::new(
-            "helper_unavailable",
-            "the installed helper path is not absolute",
-        ));
-    }
-
-    let uid = current_uid();
-    let domain = format!("gui/{uid}");
-    let label = format!(
-        "xyz.block.buzz.operator-read.{}",
-        request.request_id.replace('-', "")
-    );
-    write_launch_agent(
-        &plist_path,
-        &label,
-        &helper,
-        &request_path,
-        &receipt_path,
-        &paths.root,
-    )?;
-    let _cleanup = LaunchCleanup {
-        label: label.clone(),
-        domain: domain.clone(),
-        request_path,
-        plist_path: plist_path.clone(),
-    };
-
-    let status = Command::new("/bin/launchctl")
-        .args(["bootstrap", &domain])
-        .arg(&plist_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+    let socket_path = resolve_socket_path()?;
+    validate_socket(&socket_path)?;
+    let mut stream = StdUnixStream::connect(&socket_path).map_err(|_| {
+        OperatorError::new(
+            "app_unavailable",
+            "the signed Buzz Desktop read service is not available",
+        )
+    })?;
+    stream
+        .set_read_timeout(Some(SOCKET_IO_TIMEOUT))
+        .and_then(|_| stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT)))
         .map_err(|_| {
             OperatorError::new(
-                "gui_bridge_unavailable",
-                "could not start the Buzz read helper in the GUI session",
+                "app_unavailable",
+                "could not configure the Buzz Desktop connection",
             )
         })?;
-    if !status.success() {
-        return Err(OperatorError::new(
-            "gui_bridge_unavailable",
-            "the Buzz GUI read bridge refused the request",
-        ));
-    }
 
-    wait_for_receipt(&receipt_path)?;
-    let bytes = read_bounded_owner_only_file(&receipt_path, MAX_RECEIPT_BYTES as u64)?;
-    let receipt: ReadReceipt = serde_json::from_slice(&bytes).map_err(|_| {
+    let bytes = serde_json::to_vec(&request).map_err(|_| {
+        OperatorError::new(
+            "request_invalid",
+            "the read request could not be serialized",
+        )
+    })?;
+    write_frame_sync(&mut stream, &bytes, MAX_REQUEST_BYTES)?;
+    let response = read_frame_sync(&mut stream, MAX_RECEIPT_BYTES)?;
+    let receipt: ReadReceipt = serde_json::from_slice(&response).map_err(|_| {
         OperatorError::new("receipt_invalid", "the Buzz read receipt was malformed")
     })?;
     if receipt.request_id != request.request_id {
@@ -283,67 +237,11 @@ fn run_client_args(args: &[OsString]) -> Result<(), OperatorError> {
     Ok(())
 }
 
-fn run_helper_args(args: &[OsString]) -> Result<(), OperatorError> {
-    if args.len() != 4 {
-        return Err(OperatorError::new(
-            "helper_invalid",
-            "the Buzz read helper request was invalid",
-        ));
-    }
-    reject_secret_environment()?;
-    let request_path = PathBuf::from(&args[2]);
-    let receipt_path = PathBuf::from(&args[3]);
-    let paths = ClientPaths::resolve()?;
-    validate_helper_paths(&paths, &request_path, &receipt_path)?;
-
-    let raw = read_bounded_owner_only_file(&request_path, MAX_REQUEST_BYTES)?;
-    let request_id = request_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let outcome = serde_json::from_slice::<ReadRequest>(&raw)
-        .map_err(|_| OperatorError::new("request_invalid", "the read request was malformed"))
-        .and_then(|request| {
-            validate_request(&request)?;
-            if request.request_id != request_id {
-                return Err(OperatorError::new(
-                    "request_invalid",
-                    "the read request id did not match its control file",
-                ));
-            }
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|_| {
-                    OperatorError::new(
-                        "runtime_unavailable",
-                        "could not start the Buzz read runtime",
-                    )
-                })?;
-            runtime.block_on(execute_read(request))
-        });
-
-    let receipt = match outcome {
-        Ok(receipt) => receipt,
-        Err(error) => error_receipt(request_id, &error),
-    };
-    write_receipt_atomic(&receipt_path, &receipt)?;
-    if receipt.status == "ok" {
-        Ok(())
-    } else {
-        Err(OperatorError::new(
-            "read_failed",
-            "the authenticated Buzz read failed",
-        ))
-    }
-}
-
-fn parse_client_args(args: &[OsString]) -> Result<ReadRequest, OperatorError> {
+fn parse_client_args(args: &[OsString], now: i64) -> Result<ReadRequest, OperatorError> {
     if args.len() < 2 || args[1].to_str() != Some("messages") {
         return Err(OperatorError::new(
             "usage",
-            "usage: buzz-read messages --relay <wss-url> --since <RFC3339|unix> --until <RFC3339|unix> [--channel <uuid>] [--search <text>] [--limit 1..100] [--excerpt-chars 0..512]",
+            "usage: buzz-read messages --since <RFC3339|unix> --until <RFC3339|unix> [--channel <uuid>] [--search <text>] [--limit 1..100] [--excerpt-chars 0..512] [--expected-relay <wss-url>] [--expected-pubkey <hex>]",
         ));
     }
 
@@ -355,13 +253,14 @@ fn parse_client_args(args: &[OsString]) -> Result<ReadRequest, OperatorError> {
             .ok_or_else(|| OperatorError::new("usage", "arguments must be valid UTF-8"))?;
         let known = matches!(
             flag,
-            "--relay"
-                | "--since"
+            "--since"
                 | "--until"
                 | "--channel"
                 | "--search"
                 | "--limit"
                 | "--excerpt-chars"
+                | "--expected-relay"
+                | "--expected-pubkey"
         );
         if !known || values.contains_key(flag) || index + 1 >= args.len() {
             return Err(OperatorError::new(
@@ -376,20 +275,18 @@ fn parse_client_args(args: &[OsString]) -> Result<ReadRequest, OperatorError> {
         index += 2;
     }
 
-    let relay = required_value(&values, "--relay")?;
-    let since = parse_time(&required_value(&values, "--since")?)?;
-    let until = parse_time(&required_value(&values, "--until")?)?;
-    let limit = optional_u32(&values, "--limit")?.unwrap_or(50);
-    let excerpt_chars = optional_u32(&values, "--excerpt-chars")?.unwrap_or(280);
     Ok(ReadRequest {
         schema_version: SCHEMA_VERSION,
         request_id: uuid::Uuid::new_v4().to_string(),
         operation: "messages".to_string(),
-        relay,
-        since,
-        until,
-        limit,
-        excerpt_chars,
+        issued_at: now,
+        expires_at: now + MAX_REQUEST_LIFETIME_SECONDS,
+        since: parse_time(&required_value(&values, "--since")?)?,
+        until: parse_time(&required_value(&values, "--until")?)?,
+        limit: optional_u32(&values, "--limit")?.unwrap_or(50),
+        excerpt_chars: optional_u32(&values, "--excerpt-chars")?.unwrap_or(280),
+        expected_relay: values.get("--expected-relay").cloned(),
+        expected_identity_pubkey: values.get("--expected-pubkey").cloned(),
         channel: values.get("--channel").cloned(),
         search: values.get("--search").cloned(),
     })
@@ -399,7 +296,7 @@ fn required_value(values: &HashMap<&str, String>, name: &str) -> Result<String, 
     values
         .get(name)
         .cloned()
-        .ok_or_else(|| OperatorError::new("usage", "relay, since, and until are required"))
+        .ok_or_else(|| OperatorError::new("usage", "since and until are required"))
 }
 
 fn optional_u32(values: &HashMap<&str, String>, name: &str) -> Result<Option<u32>, OperatorError> {
@@ -421,7 +318,7 @@ fn parse_time(value: &str) -> Result<i64, OperatorError> {
     })
 }
 
-fn validate_request(request: &ReadRequest) -> Result<(), OperatorError> {
+fn validate_request_at(request: &ReadRequest, now: i64) -> Result<(), OperatorError> {
     if request.schema_version != SCHEMA_VERSION || request.operation != "messages" {
         return Err(OperatorError::new(
             "operation_rejected",
@@ -430,7 +327,16 @@ fn validate_request(request: &ReadRequest) -> Result<(), OperatorError> {
     }
     uuid::Uuid::parse_str(&request.request_id)
         .map_err(|_| OperatorError::new("request_invalid", "request_id must be a UUID"))?;
-    validate_relay(&request.relay)?;
+    if request.issued_at > now + MAX_CLOCK_SKEW_SECONDS
+        || request.expires_at < now
+        || request.expires_at <= request.issued_at
+        || request.expires_at - request.issued_at > MAX_REQUEST_LIFETIME_SECONDS
+    {
+        return Err(OperatorError::new(
+            "request_stale",
+            "the read request was stale or had an invalid lifetime",
+        ));
+    }
     if request.since <= 0
         || request.until <= request.since
         || request.until - request.since > MAX_RANGE_SECONDS
@@ -451,6 +357,17 @@ fn validate_request(request: &ReadRequest) -> Result<(), OperatorError> {
             "limit_rejected",
             "excerpt_chars must be between 0 and 512",
         ));
+    }
+    if let Some(relay) = request.expected_relay.as_deref() {
+        validate_relay(relay)?;
+    }
+    if let Some(pubkey) = request.expected_identity_pubkey.as_deref() {
+        if pubkey.len() != 64 || !pubkey.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(OperatorError::new(
+                "identity_rejected",
+                "expected-pubkey must be a 64-character hexadecimal public key",
+            ));
+        }
     }
     if let Some(channel) = request.channel.as_deref() {
         uuid::Uuid::parse_str(channel)
@@ -480,26 +397,156 @@ fn validate_relay(value: &str) -> Result<Url, OperatorError> {
         || parsed.password().is_some()
         || parsed.fragment().is_some()
         || parsed.query().is_some()
+        || !matches!(parsed.path(), "" | "/")
     {
         return Err(OperatorError::new(
             "relay_rejected",
-            "relay must be the canonical credential-free Buzz wss or https origin",
+            "the active relay must be the canonical Buzz wss or https origin",
         ));
     }
     Ok(parsed)
 }
 
-async fn execute_read(request: ReadRequest) -> Result<ReadReceipt, OperatorError> {
-    let relay = validate_relay(&request.relay)?;
-    let relay_host = relay.host_str().unwrap_or_default().to_string();
-    let keys = load_identity_readonly()?;
+/// Start the owner-only Unix-socket service inside the signed Desktop process.
+pub fn start_operator_read_server(app: tauri::AppHandle) -> Result<(), String> {
+    let socket_path = resolve_socket_path().map_err(|error| error.message.to_string())?;
+    prepare_socket_path(&socket_path).map_err(|error| error.message.to_string())?;
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|error| format!("could not bind owner-only socket: {error}"))?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("could not protect owner-only socket: {error}"))?;
+    let metadata = validate_socket(&socket_path).map_err(|error| error.message.to_string())?;
+    let cleanup = SocketCleanup {
+        path: socket_path,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    let replay_guard = Arc::new(ReplayGuard::default());
+
+    tauri::async_runtime::spawn(async move {
+        let _cleanup = cleanup;
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                eprintln!("buzz-desktop: operator read service stopped accepting requests");
+                break;
+            };
+            let app = app.clone();
+            let replay_guard = replay_guard.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = handle_connection(stream, app, replay_guard).await {
+                    eprintln!("buzz-desktop: operator read request failed: {}", error.code);
+                }
+            });
+        }
+    });
+    Ok(())
+}
+
+async fn handle_connection(
+    mut stream: UnixStream,
+    app: tauri::AppHandle,
+    replay_guard: Arc<ReplayGuard>,
+) -> Result<(), OperatorError> {
+    let credentials = stream
+        .peer_cred()
+        .map_err(|_| OperatorError::new("peer_rejected", "could not verify the local caller"))?;
+    if credentials.uid() != current_uid() {
+        return Err(OperatorError::new(
+            "peer_rejected",
+            "the local caller did not match the Buzz Desktop owner",
+        ));
+    }
+
+    let raw = timeout(
+        SOCKET_IO_TIMEOUT,
+        read_frame_async(&mut stream, MAX_REQUEST_BYTES),
+    )
+    .await
+    .map_err(|_| OperatorError::new("request_timeout", "the read request timed out"))??;
+    let parsed = serde_json::from_slice::<ReadRequest>(&raw);
+    let request_id = parsed
+        .as_ref()
+        .map(|request| request.request_id.clone())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let result = async {
+        let request = parsed
+            .map_err(|_| OperatorError::new("request_invalid", "the read request was malformed"))?;
+        let now = unix_now()?;
+        validate_request_at(&request, now)?;
+        replay_guard.consume(&request.request_id, request.expires_at, now)?;
+        execute_read(&app, request).await
+    }
+    .await;
+    let receipt = result.unwrap_or_else(|error| error_receipt(request_id, &error));
+    ensure_receipt_bound(&receipt)?;
+    let encoded = serde_json::to_vec(&receipt).map_err(|_| {
+        OperatorError::new(
+            "receipt_invalid",
+            "the Buzz read receipt could not be serialized",
+        )
+    })?;
+    timeout(
+        SOCKET_IO_TIMEOUT,
+        write_frame_async(&mut stream, &encoded, MAX_RECEIPT_BYTES),
+    )
+    .await
+    .map_err(|_| OperatorError::new("response_timeout", "the read response timed out"))??;
+    Ok(())
+}
+
+async fn execute_read(
+    app: &tauri::AppHandle,
+    request: ReadRequest,
+) -> Result<ReadReceipt, OperatorError> {
+    let state = app.state::<AppState>();
+    let relay_before = crate::relay::relay_ws_url_with_override(&state);
+    validate_relay(&relay_before)?;
+    let keys = state.signing_keys().map_err(|_| {
+        OperatorError::new(
+            "identity_unavailable",
+            "the active Buzz Desktop identity was unavailable",
+        )
+    })?;
+    let relay_after = crate::relay::relay_ws_url_with_override(&state);
+    let keys_after = state.signing_keys().map_err(|_| {
+        OperatorError::new(
+            "identity_unavailable",
+            "the active Buzz Desktop identity was unavailable",
+        )
+    })?;
     let identity_pubkey = keys.public_key().to_hex();
+    if relay_before != relay_after || identity_pubkey != keys_after.public_key().to_hex() {
+        return Err(OperatorError::new(
+            "active_scope_changed",
+            "the active Buzz workspace changed during the read",
+        ));
+    }
+    if let Some(expected) = request.expected_relay.as_deref() {
+        if crate::relay::relay_http_base_url(expected)
+            != crate::relay::relay_http_base_url(&relay_before)
+        {
+            return Err(OperatorError::new(
+                "relay_mismatch",
+                "the active Buzz relay did not match the expected relay",
+            ));
+        }
+    }
+    if request
+        .expected_identity_pubkey
+        .as_deref()
+        .is_some_and(|expected| !expected.eq_ignore_ascii_case(&identity_pubkey))
+    {
+        return Err(OperatorError::new(
+            "identity_mismatch",
+            "the active Buzz identity did not match the expected public key",
+        ));
+    }
 
     let mut filter = serde_json::json!({
         "kinds": MESSAGE_KINDS,
         "since": request.since,
         "until": request.until,
-        "limit": request.limit,
+        "limit": request.limit.saturating_add(1),
     });
     if let Some(channel) = request.channel.as_deref() {
         filter["#h"] = serde_json::json!([channel]);
@@ -508,7 +555,14 @@ async fn execute_read(request: ReadRequest) -> Result<ReadReceipt, OperatorError
         filter["search"] = serde_json::json!(search.trim());
     }
 
-    let mut events = query_bounded(&keys, &request.relay, &filter).await?;
+    let api_base = crate::relay::relay_http_base_url(&relay_before);
+    let mut events = query_verified(&state, &api_base, &[filter], &keys).await?;
+    if events.len() > request.limit.saturating_add(1) as usize {
+        return Err(OperatorError::new(
+            "response_oversize",
+            "the Buzz relay returned more events than requested",
+        ));
+    }
     events.retain(|event| event_matches_request(event, &request));
     events.sort_by(|left, right| {
         right
@@ -522,7 +576,7 @@ async fn execute_read(request: ReadRequest) -> Result<ReadReceipt, OperatorError
     let truncated = events.len() > request.limit as usize;
     events.truncate(request.limit as usize);
 
-    let author_names = fetch_author_names(&keys, &request.relay, &events)
+    let author_names = fetch_author_names(&state, &api_base, &keys, &events)
         .await
         .unwrap_or_default();
     let projected = events
@@ -534,8 +588,9 @@ async fn execute_read(request: ReadRequest) -> Result<ReadReceipt, OperatorError
         request_id: request.request_id,
         status: "ok".to_string(),
         operation: "messages".to_string(),
-        generated_at: chrono::Utc::now().timestamp(),
-        relay_host,
+        generated_at: unix_now()?,
+        desktop_pid: std::process::id(),
+        relay_host: ALLOWED_RELAY_HOST.to_string(),
         identity_pubkey,
         requested_limit: request.limit,
         returned: projected.len(),
@@ -548,71 +603,43 @@ async fn execute_read(request: ReadRequest) -> Result<ReadReceipt, OperatorError
     Ok(receipt)
 }
 
-fn load_identity_readonly() -> Result<Keys, OperatorError> {
-    let store = crate::secret_store::SecretStore::keyring(crate::app_state::keyring_service());
-    let nsec = store
-        .load_readonly(IDENTITY_KEY_NAME)
-        .map_err(|_| {
-            OperatorError::new(
-                "identity_unavailable",
-                "Buzz Desktop identity storage was unavailable",
-            )
-        })?
-        .ok_or_else(|| {
-            OperatorError::new(
-                "identity_unavailable",
-                "Buzz Desktop has no current keyring identity",
-            )
-        })?;
-    let nsec = Zeroizing::new(nsec);
-    Keys::parse(nsec.trim()).map_err(|_| {
-        OperatorError::new(
-            "identity_unavailable",
-            "Buzz Desktop identity storage was invalid",
-        )
-    })
-}
-
-async fn query_bounded(
+async fn query_verified(
+    state: &AppState,
+    api_base: &str,
+    filters: &[serde_json::Value],
     keys: &Keys,
-    relay: &str,
-    filter: &serde_json::Value,
 ) -> Result<Vec<Event>, OperatorError> {
-    let mut base = validate_relay(relay)?;
-    base.set_scheme("https").map_err(|_| {
-        OperatorError::new("relay_rejected", "relay could not be converted to https")
-    })?;
-    base.set_path("/query");
-    let url = base.as_str().to_string();
-    let body = serde_json::to_vec(&[filter]).map_err(|_| {
+    crate::relay_admission::wait_for_rate_limit().await;
+    let url = format!("{}/query", api_base.trim_end_matches('/'));
+    let body = serde_json::to_vec(filters).map_err(|_| {
         OperatorError::new(
             "request_invalid",
-            "the relay filter could not be serialized",
+            "the Buzz relay filter could not be serialized",
         )
     })?;
-    let auth = crate::relay::build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body)
-        .map_err(|_| {
-            OperatorError::new(
-                "identity_unavailable",
-                "Buzz Desktop could not authenticate the read",
-            )
-        })?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| {
-            OperatorError::new("relay_unavailable", "the Buzz relay client was unavailable")
-        })?;
-    let response = client
+    let authorization =
+        crate::relay::build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body).map_err(
+            |_| {
+                OperatorError::new(
+                    "identity_unavailable",
+                    "Buzz Desktop could not authenticate the read",
+                )
+            },
+        )?;
+    let response = state
+        .media_fetch_client
         .post(url)
-        .header("Authorization", auth)
+        .header("Authorization", authorization)
         .header("Content-Type", "application/json")
         .timeout(Duration::from_secs(30))
         .body(body)
         .send()
         .await
         .map_err(|_| {
-            OperatorError::new("relay_unavailable", "the Buzz relay could not be reached")
+            OperatorError::new(
+                "relay_unavailable",
+                "the Buzz relay could not complete the authenticated read",
+            )
         })?;
     if !response.status().is_success() {
         return Err(OperatorError::new(
@@ -622,14 +649,13 @@ async fn query_bounded(
     }
     if response
         .content_length()
-        .is_some_and(|size| size > MAX_RELAY_RESPONSE_BYTES as u64)
+        .is_some_and(|length| length > MAX_RELAY_RESPONSE_BYTES as u64)
     {
         return Err(OperatorError::new(
             "response_oversize",
             "the Buzz relay response exceeded the read bound",
         ));
     }
-
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -650,13 +676,12 @@ async fn query_bounded(
     let events: Vec<Event> = serde_json::from_slice(&bytes).map_err(|_| {
         OperatorError::new("response_invalid", "the Buzz relay response was malformed")
     })?;
-    if events.len() > MAX_RESULTS as usize {
-        return Err(OperatorError::new(
-            "response_oversize",
-            "the Buzz relay returned more events than requested",
-        ));
-    }
-    for event in &events {
+    verify_event_set(&events)?;
+    Ok(events)
+}
+
+fn verify_event_set(events: &[Event]) -> Result<(), OperatorError> {
+    for event in events {
         event.verify().map_err(|_| {
             OperatorError::new(
                 "response_unverified",
@@ -664,12 +689,13 @@ async fn query_bounded(
             )
         })?;
     }
-    Ok(events)
+    Ok(())
 }
 
 async fn fetch_author_names(
+    state: &AppState,
+    api_base: &str,
     keys: &Keys,
-    relay: &str,
     events: &[Event],
 ) -> Result<HashMap<String, String>, OperatorError> {
     let authors = events
@@ -686,7 +712,13 @@ async fn fetch_author_names(
         "authors": authors,
         "limit": authors.len().min(MAX_RESULTS as usize),
     });
-    let profiles = query_bounded(keys, relay, &filter).await?;
+    let profiles = query_verified(state, api_base, &[filter], keys).await?;
+    if profiles.len() > MAX_RESULTS as usize {
+        return Err(OperatorError::new(
+            "response_oversize",
+            "the Buzz relay returned too many author profiles",
+        ));
+    }
     let mut names = HashMap::new();
     for profile in profiles {
         let pubkey = profile.pubkey.to_hex();
@@ -720,6 +752,12 @@ fn event_matches_request(event: &Event, request: &ReadRequest) -> bool {
             .channel
             .as_deref()
             .is_none_or(|expected| event_channel(event).as_deref() == Some(expected))
+        && request.search.as_deref().is_none_or(|search| {
+            event
+                .content
+                .to_lowercase()
+                .contains(&search.trim().to_lowercase())
+        })
 }
 
 fn project_event(
@@ -810,7 +848,8 @@ fn error_receipt(request_id: String, error: &OperatorError) -> ReadReceipt {
         request_id,
         status: "error".to_string(),
         operation: "messages".to_string(),
-        generated_at: chrono::Utc::now().timestamp(),
+        generated_at: unix_now().unwrap_or(0),
+        desktop_pid: std::process::id(),
         relay_host: String::new(),
         identity_pubkey: String::new(),
         requested_limit: 0,
@@ -843,37 +882,38 @@ fn reject_secret_environment() -> Result<(), OperatorError> {
         if std::env::var_os(name).is_some() {
             return Err(OperatorError::new(
                 "secret_input_rejected",
-                "the Buzz read helper refuses credential-bearing environment variables",
+                "buzz-read refuses credential-bearing environment variables",
             ));
         }
     }
     Ok(())
 }
 
-fn validate_helper_paths(
-    paths: &ClientPaths,
-    request: &Path,
-    receipt: &Path,
-) -> Result<(), OperatorError> {
-    paths.ensure()?;
-    let request_parent = request
-        .parent()
-        .and_then(|path| fs::canonicalize(path).ok());
-    let receipt_parent = receipt
-        .parent()
-        .and_then(|path| fs::canonicalize(path).ok());
-    let expected_requests = fs::canonicalize(&paths.requests).ok();
-    let expected_receipts = fs::canonicalize(&paths.receipts).ok();
-    if request_parent != expected_requests || receipt_parent != expected_receipts {
+fn resolve_socket_path() -> Result<PathBuf, OperatorError> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        OperatorError::new(
+            "home_unavailable",
+            "could not resolve the current user home",
+        )
+    })?;
+    let buzz_dir = home.join(".buzz");
+    validate_parent_dir(&buzz_dir)?;
+    let socket_dir = buzz_dir.join(SOCKET_DIR_NAME);
+    ensure_owner_only_dir(&socket_dir)?;
+    Ok(socket_dir.join(SOCKET_FILE_NAME))
+}
+
+fn validate_parent_dir(path: &Path) -> Result<(), OperatorError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        OperatorError::new(
+            "control_dir_unavailable",
+            "the Buzz application directory was unavailable",
+        )
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != current_uid() {
         return Err(OperatorError::new(
-            "control_path_rejected",
-            "the Buzz read helper paths were outside the owner-only control directory",
-        ));
-    }
-    if receipt.exists() {
-        return Err(OperatorError::new(
-            "receipt_exists",
-            "the Buzz read receipt target already exists",
+            "control_dir_rejected",
+            "the Buzz application directory failed type or owner checks",
         ));
     }
     Ok(())
@@ -883,245 +923,182 @@ fn ensure_owner_only_dir(path: &Path) -> Result<(), OperatorError> {
     if !path.exists() {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(false).mode(0o700);
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent).map_err(|_| {
-                    OperatorError::new(
-                        "control_dir_unavailable",
-                        "could not create the control directory",
-                    )
-                })?;
-            }
-        }
         builder.create(path).map_err(|_| {
             OperatorError::new(
                 "control_dir_unavailable",
-                "could not create the control directory",
+                "could not create the owner-only Buzz read directory",
             )
         })?;
     }
     let metadata = fs::symlink_metadata(path).map_err(|_| {
         OperatorError::new(
             "control_dir_unavailable",
-            "could not inspect the control directory",
+            "could not inspect the owner-only Buzz read directory",
         )
     })?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != current_uid()
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
         return Err(OperatorError::new(
             "control_dir_rejected",
-            "the Buzz read control path was not a real directory",
+            "the Buzz read directory must be a real owner-only directory",
         ));
-    }
-    use std::os::unix::fs::MetadataExt;
-    if metadata.uid() != current_uid() {
-        return Err(OperatorError::new(
-            "control_dir_rejected",
-            "the Buzz read control directory had the wrong owner",
-        ));
-    }
-    if metadata.permissions().mode() & 0o777 != 0o700 {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| {
-            OperatorError::new(
-                "control_dir_rejected",
-                "the Buzz read control directory was not owner-only",
-            )
-        })?;
     }
     Ok(())
 }
 
-fn write_new_owner_only_json<T: Serialize>(path: &Path, value: &T) -> Result<(), OperatorError> {
-    let bytes = serde_json::to_vec(value).map_err(|_| {
+fn prepare_socket_path(path: &Path) -> Result<(), OperatorError> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != current_uid()
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(OperatorError::new(
+            "socket_rejected",
+            "the Buzz read socket path was replaced by an unexpected object",
+        ));
+    }
+    if StdUnixStream::connect(path).is_ok() {
+        return Err(OperatorError::new(
+            "socket_active",
+            "another Buzz Desktop read service is already active",
+        ));
+    }
+    fs::remove_file(path).map_err(|_| {
         OperatorError::new(
-            "request_invalid",
-            "the Buzz read request could not be serialized",
+            "socket_rejected",
+            "could not remove the stale Buzz read socket",
+        )
+    })
+}
+
+fn validate_socket(path: &Path) -> Result<fs::Metadata, OperatorError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        OperatorError::new(
+            "app_unavailable",
+            "the signed Buzz Desktop read service is not available",
         )
     })?;
-    if bytes.len() as u64 > MAX_REQUEST_BYTES {
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != current_uid()
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(OperatorError::new(
+            "socket_rejected",
+            "the Buzz read socket failed type, owner, or mode checks",
+        ));
+    }
+    Ok(metadata)
+}
+
+fn write_frame_sync(
+    stream: &mut StdUnixStream,
+    payload: &[u8],
+    maximum: usize,
+) -> Result<(), OperatorError> {
+    if payload.len() > maximum || payload.len() > u32::MAX as usize {
+        return Err(OperatorError::new(
+            "request_oversize",
+            "the Buzz read frame exceeded its size bound",
+        ));
+    }
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .and_then(|_| stream.write_all(payload))
+        .map_err(|_| {
+            OperatorError::new(
+                "app_unavailable",
+                "could not send the request to Buzz Desktop",
+            )
+        })
+}
+
+fn read_frame_sync(stream: &mut StdUnixStream, maximum: usize) -> Result<Vec<u8>, OperatorError> {
+    let mut header = [0_u8; 4];
+    stream.read_exact(&mut header).map_err(|_| {
+        OperatorError::new(
+            "app_unavailable",
+            "could not read the response from Buzz Desktop",
+        )
+    })?;
+    let length = u32::from_be_bytes(header) as usize;
+    if length == 0 || length > maximum {
+        return Err(OperatorError::new(
+            "receipt_oversize",
+            "the Buzz read response exceeded its size bound",
+        ));
+    }
+    let mut payload = vec![0_u8; length];
+    stream.read_exact(&mut payload).map_err(|_| {
+        OperatorError::new(
+            "app_unavailable",
+            "the Buzz Desktop response was interrupted",
+        )
+    })?;
+    Ok(payload)
+}
+
+async fn read_frame_async(
+    stream: &mut UnixStream,
+    maximum: usize,
+) -> Result<Vec<u8>, OperatorError> {
+    let mut header = [0_u8; 4];
+    stream.read_exact(&mut header).await.map_err(|_| {
+        OperatorError::new("request_invalid", "the Buzz read request was interrupted")
+    })?;
+    let length = u32::from_be_bytes(header) as usize;
+    if length == 0 || length > maximum {
         return Err(OperatorError::new(
             "request_oversize",
             "the Buzz read request exceeded its input bound",
         ));
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|_| {
-            OperatorError::new(
-                "control_file_unavailable",
-                "could not create the read request",
-            )
-        })?;
-    file.write_all(&bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|_| {
-            OperatorError::new(
-                "control_file_unavailable",
-                "could not persist the read request",
-            )
-        })
-}
-
-fn read_bounded_owner_only_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, OperatorError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|_| {
-            OperatorError::new(
-                "control_file_unavailable",
-                "could not open an owner-only control file",
-            )
-        })?;
-    let metadata = file.metadata().map_err(|_| {
-        OperatorError::new(
-            "control_file_unavailable",
-            "could not inspect an owner-only control file",
-        )
+    let mut payload = vec![0_u8; length];
+    stream.read_exact(&mut payload).await.map_err(|_| {
+        OperatorError::new("request_invalid", "the Buzz read request was interrupted")
     })?;
-    use std::os::unix::fs::MetadataExt;
-    if !metadata.is_file()
-        || metadata.uid() != current_uid()
-        || metadata.permissions().mode() & 0o777 != 0o600
-        || metadata.len() > max_bytes
-    {
-        return Err(OperatorError::new(
-            "control_file_rejected",
-            "the Buzz read control file failed ownership, mode, type, or size checks",
-        ));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(max_bytes + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| {
-            OperatorError::new(
-                "control_file_unavailable",
-                "could not read the control file",
-            )
-        })?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(OperatorError::new(
-            "control_file_rejected",
-            "the Buzz read control file exceeded its size bound",
-        ));
-    }
-    Ok(bytes)
+    Ok(payload)
 }
 
-fn write_receipt_atomic(path: &Path, receipt: &ReadReceipt) -> Result<(), OperatorError> {
-    ensure_receipt_bound(receipt)?;
-    let bytes = serde_json::to_vec(receipt).map_err(|_| {
-        OperatorError::new(
-            "receipt_invalid",
-            "the Buzz read receipt could not be serialized",
-        )
-    })?;
-    let temp_path = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temp_path)
-        .map_err(|_| {
-            OperatorError::new(
-                "receipt_unavailable",
-                "could not create the Buzz read receipt",
-            )
-        })?;
-    let write_result = file.write_all(&bytes).and_then(|_| file.sync_all());
-    drop(file);
-    if write_result.is_err() || fs::rename(&temp_path, path).is_err() {
-        let _ = fs::remove_file(&temp_path);
-        return Err(OperatorError::new(
-            "receipt_unavailable",
-            "could not persist the Buzz read receipt",
-        ));
-    }
-    Ok(())
-}
-
-fn write_launch_agent(
-    path: &Path,
-    label: &str,
-    helper: &Path,
-    request: &Path,
-    receipt: &Path,
-    working_directory: &Path,
+async fn write_frame_async(
+    stream: &mut UnixStream,
+    payload: &[u8],
+    maximum: usize,
 ) -> Result<(), OperatorError> {
-    let xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>{}</string><string>{}</string><string>{}</string></array>\n<key>WorkingDirectory</key><string>{}</string>\n<key>RunAtLoad</key><true/>\n<key>LaunchOnlyOnce</key><true/>\n<key>ProcessType</key><string>Background</string>\n<key>StandardOutPath</key><string>/dev/null</string>\n<key>StandardErrorPath</key><string>/dev/null</string>\n</dict></plist>\n",
-        xml_escape(label),
-        xml_escape(&helper.to_string_lossy()),
-        HELPER_FLAG,
-        xml_escape(&request.to_string_lossy()),
-        xml_escape(&receipt.to_string_lossy()),
-        xml_escape(&working_directory.to_string_lossy()),
-    );
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
+    if payload.len() > maximum || payload.len() > u32::MAX as usize {
+        return Err(OperatorError::new(
+            "receipt_oversize",
+            "the Buzz read receipt exceeded its output bound",
+        ));
+    }
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .await
         .map_err(|_| {
             OperatorError::new(
-                "gui_bridge_unavailable",
-                "could not create the GUI bridge request",
+                "response_interrupted",
+                "could not return the Buzz read receipt",
             )
         })?;
-    file.write_all(xml.as_bytes())
-        .and_then(|_| file.sync_all())
-        .map_err(|_| {
-            OperatorError::new(
-                "gui_bridge_unavailable",
-                "could not persist the GUI bridge request",
-            )
-        })
+    stream.write_all(payload).await.map_err(|_| {
+        OperatorError::new(
+            "response_interrupted",
+            "could not return the Buzz read receipt",
+        )
+    })
 }
 
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-fn wait_for_receipt(path: &Path) -> Result<(), OperatorError> {
-    let deadline = Instant::now() + HELPER_TIMEOUT;
-    while Instant::now() < deadline {
-        if path.exists() {
-            return Ok(());
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    }
-    Err(OperatorError::new(
-        "helper_timeout",
-        "the Buzz read helper did not return a receipt before the timeout",
-    ))
-}
-
-fn prune_old_receipts(directory: &Path) {
-    let cutoff = SystemTime::now()
-        .checked_sub(Duration::from_secs(24 * 60 * 60))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten().take(500) {
-        let path = entry.path();
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if metadata.is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.modified().is_ok_and(|modified| modified < cutoff)
-        {
-            let _ = fs::remove_file(path);
-        }
-    }
+fn unix_now() -> Result<i64, OperatorError> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| OperatorError::new("clock_invalid", "the system clock was invalid"))?
+        .as_secs();
+    i64::try_from(seconds)
+        .map_err(|_| OperatorError::new("clock_invalid", "the system clock was invalid"))
 }
 
 fn current_uid() -> u32 {
@@ -1133,80 +1110,117 @@ fn current_uid() -> u32 {
 mod tests {
     use super::*;
     use nostr::{EventBuilder, Kind, Tag};
+    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
 
-    fn request() -> ReadRequest {
+    fn request(now: i64) -> ReadRequest {
         ReadRequest {
             schema_version: SCHEMA_VERSION,
             request_id: uuid::Uuid::new_v4().to_string(),
             operation: "messages".to_string(),
-            relay: "wss://buildcontext.communities.buzz.xyz".to_string(),
+            issued_at: now,
+            expires_at: now + MAX_REQUEST_LIFETIME_SECONDS,
             since: 1_787_872_400,
             until: 1_787_958_800,
             limit: 20,
             excerpt_chars: 280,
+            expected_relay: None,
+            expected_identity_pubkey: None,
             channel: None,
             search: None,
         }
     }
 
     #[test]
-    fn request_rejects_writes_unknown_fields_and_oversize_values() {
-        let mut value = serde_json::to_value(request()).unwrap();
-        value["operation"] = serde_json::json!("send");
-        let parsed: ReadRequest = serde_json::from_value(value).unwrap();
+    fn request_allows_only_messages_and_denies_unknown_fields() {
+        let now = 1_788_000_000;
+        let mut candidate = request(now);
+        candidate.operation = "send".to_string();
         assert_eq!(
-            validate_request(&parsed).unwrap_err().code,
+            validate_request_at(&candidate, now).unwrap_err().code,
             "operation_rejected"
         );
 
-        let mut value = serde_json::to_value(request()).unwrap();
+        let mut value = serde_json::to_value(request(now)).unwrap();
         value["content"] = serde_json::json!("write this");
         assert!(serde_json::from_value::<ReadRequest>(value).is_err());
+    }
 
-        let mut oversized = request();
-        oversized.limit = MAX_RESULTS + 1;
+    #[test]
+    fn request_freshness_fails_closed() {
+        let now = 1_788_000_000;
+        let mut stale = request(now);
+        stale.issued_at = now - 60;
+        stale.expires_at = now - 30;
         assert_eq!(
-            validate_request(&oversized).unwrap_err().code,
+            validate_request_at(&stale, now).unwrap_err().code,
+            "request_stale"
+        );
+
+        let mut future = request(now);
+        future.issued_at = now + MAX_CLOCK_SKEW_SECONDS + 1;
+        future.expires_at = future.issued_at + 1;
+        assert_eq!(
+            validate_request_at(&future, now).unwrap_err().code,
+            "request_stale"
+        );
+    }
+
+    #[test]
+    fn replay_guard_consumes_each_request_once() {
+        let guard = ReplayGuard::default();
+        guard.consume("one", 120, 100).unwrap();
+        assert_eq!(
+            guard.consume("one", 120, 100).unwrap_err().code,
+            "request_replayed"
+        );
+        guard.consume("two", 130, 121).unwrap();
+        let consumed = guard.consumed.lock().unwrap();
+        assert!(!consumed.contains_key("one"));
+        assert!(consumed.contains_key("two"));
+    }
+
+    #[test]
+    fn relay_is_assertion_only_and_canonical() {
+        assert!(validate_relay("wss://buildcontext.communities.buzz.xyz").is_ok());
+        assert!(validate_relay("https://buildcontext.communities.buzz.xyz/").is_ok());
+        for rejected in [
+            "wss://example.com",
+            "http://buildcontext.communities.buzz.xyz",
+            "wss://buildcontext.communities.buzz.xyz:8443",
+            "wss://buildcontext.communities.buzz.xyz/query",
+        ] {
+            assert_eq!(validate_relay(rejected).unwrap_err().code, "relay_rejected");
+        }
+    }
+
+    #[test]
+    fn request_bounds_identity_range_and_search() {
+        let now = 1_788_000_000;
+        let mut candidate = request(now);
+        candidate.limit = MAX_RESULTS + 1;
+        assert_eq!(
+            validate_request_at(&candidate, now).unwrap_err().code,
             "limit_rejected"
         );
-        oversized.limit = 1;
-        oversized.search = Some("x".repeat(MAX_SEARCH_CHARS + 1));
+        candidate.limit = 1;
+        candidate.search = Some("x".repeat(MAX_SEARCH_CHARS + 1));
         assert_eq!(
-            validate_request(&oversized).unwrap_err().code,
+            validate_request_at(&candidate, now).unwrap_err().code,
             "search_rejected"
         );
-    }
-
-    #[test]
-    fn request_rejects_credentials_and_unbounded_relays() {
-        let mut candidate = request();
-        candidate.relay = "https://user:pass@example.com".to_string();
+        candidate.search = None;
+        candidate.expected_identity_pubkey = Some("not-a-pubkey".to_string());
         assert_eq!(
-            validate_request(&candidate).unwrap_err().code,
-            "relay_rejected"
-        );
-        candidate.relay = "http://127.0.0.1:3000".to_string();
-        assert_eq!(
-            validate_request(&candidate).unwrap_err().code,
-            "relay_rejected"
-        );
-        candidate.relay = "wss://example.com".to_string();
-        assert_eq!(
-            validate_request(&candidate).unwrap_err().code,
-            "relay_rejected"
-        );
-        candidate.relay = "wss://buildcontext.communities.buzz.xyz:8443".to_string();
-        assert_eq!(
-            validate_request(&candidate).unwrap_err().code,
-            "relay_rejected"
+            validate_request_at(&candidate, now).unwrap_err().code,
+            "identity_rejected"
         );
     }
 
     #[test]
-    fn projection_bounds_and_redacts_secret_material() {
+    fn projection_bounds_redacts_and_filters_content() {
         let channel = "123e4567-e89b-12d3-a456-426614174000";
         let content = format!(
-            "work complete BUZZ_PRIVATE_KEY={} Authorization=Bearer-abc secret=shh {}",
+            "completed alpha BUZZ_PRIVATE_KEY={} Authorization=Bearer-abc secret=shh {}",
             "nsec1".to_string() + &"q".repeat(80),
             "x".repeat(800)
         );
@@ -1214,59 +1228,89 @@ mod tests {
             .tags([Tag::parse(["h", channel]).unwrap()])
             .sign_with_keys(&Keys::generate())
             .unwrap();
-        let projected = project_event(&event, 120, &HashMap::new());
+        let projected = project_event(&event, 160, &HashMap::new());
         let excerpt = projected.excerpt.unwrap();
-        assert!(excerpt.chars().count() <= 121);
+        assert!(excerpt.chars().count() <= 161);
         assert!(!excerpt.contains("nsec1"));
         assert!(!excerpt.contains("Bearer-abc"));
         assert!(!excerpt.contains("secret=shh"));
-        assert_eq!(projected.channel.as_deref(), Some(channel));
+
+        let mut matching = request(1_788_000_000);
+        matching.since = event.created_at.as_secs() as i64 - 1;
+        matching.until = event.created_at.as_secs() as i64 + 1;
+        matching.channel = Some(channel.to_string());
+        matching.search = Some("ALPHA".to_string());
+        assert!(event_matches_request(&event, &matching));
+        matching.search = Some("missing".to_string());
+        assert!(!event_matches_request(&event, &matching));
     }
 
     #[test]
-    fn owner_only_control_file_enforces_mode_type_and_size() {
+    fn event_signatures_are_verified() {
+        let event = EventBuilder::text_note("verified")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert!(verify_event_set(std::slice::from_ref(&event)).is_ok());
+        let mut value = serde_json::to_value(event).unwrap();
+        value["content"] = serde_json::json!("tampered");
+        let tampered: Event = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            verify_event_set(&[tampered]).unwrap_err().code,
+            "response_unverified"
+        );
+    }
+
+    #[test]
+    fn owner_only_directory_and_socket_replacement_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("request.json");
+        let directory = temp.path().join("operator-read");
+        ensure_owner_only_dir(&directory).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            ensure_owner_only_dir(&directory).unwrap_err().code,
+            "control_dir_rejected"
+        );
+
+        let socket_path = temp.path().join("desktop.sock");
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&path)
+            .open(&socket_path)
             .unwrap();
-        file.write_all(b"{}").unwrap();
-        drop(file);
-        assert_eq!(read_bounded_owner_only_file(&path, 2).unwrap(), b"{}");
-
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        file.write_all(b"replacement").unwrap();
         assert_eq!(
-            read_bounded_owner_only_file(&path, 2).unwrap_err().code,
-            "control_file_rejected"
-        );
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(
-            read_bounded_owner_only_file(&path, 1).unwrap_err().code,
-            "control_file_rejected"
+            prepare_socket_path(&socket_path).unwrap_err().code,
+            "socket_rejected"
         );
     }
 
-    #[test]
-    fn helper_paths_must_stay_in_owner_only_control_tree() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ClientPaths {
-            root: temp.path().join("root"),
-            requests: temp.path().join("root/requests"),
-            receipts: temp.path().join("root/receipts"),
-            launch_agents: temp.path().join("root/launch-agents"),
-        };
-        paths.ensure().unwrap();
-        let request_path = paths.requests.join("request.json");
-        let outside = temp.path().join("outside.json");
+    #[tokio::test]
+    async fn framed_socket_io_is_bounded() {
+        let (mut left, mut right) = UnixStream::pair().unwrap();
+        let writer = tokio::spawn(async move {
+            write_frame_async(&mut left, b"hello", 5).await.unwrap();
+        });
+        assert_eq!(read_frame_async(&mut right, 5).await.unwrap(), b"hello");
+        writer.await.unwrap();
+
+        let (mut left, mut right) = UnixStream::pair().unwrap();
+        let writer = tokio::spawn(async move {
+            left.write_all(&6_u32.to_be_bytes()).await.unwrap();
+        });
         assert_eq!(
-            validate_helper_paths(&paths, &request_path, &outside)
-                .unwrap_err()
-                .code,
-            "control_path_rejected"
+            read_frame_async(&mut right, 5).await.unwrap_err().code,
+            "request_oversize"
         );
+        writer.await.unwrap();
     }
 
     #[test]

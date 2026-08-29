@@ -33,6 +33,7 @@ mod native_websocket_batch;
 mod nostr_bind;
 pub mod nostr_convert;
 mod observed_unread;
+#[cfg(unix)]
 mod operator_read;
 mod persona_catalog;
 mod prevent_sleep;
@@ -84,6 +85,7 @@ use managed_agents::{
 };
 #[cfg(not(feature = "mesh-llm"))]
 use mesh_llm_stubs::*;
+#[cfg(unix)]
 #[doc(hidden)]
 pub use operator_read::run_operator_read_cli;
 #[cfg(all(feature = "mesh-llm", target_os = "macos"))]
@@ -333,6 +335,17 @@ pub fn run() {
             // through every call site.
             if let Ok(mut guard) = state.app_handle.lock() {
                 *guard = Some(app_handle.clone());
+            }
+
+            // Keep authenticated operator reads inside the already-running
+            // Desktop process that owns the in-memory identity. The external
+            // `buzz-read` client is credentialless and can only submit a
+            // bounded read request through this owner-only local socket.
+            #[cfg(unix)]
+            if !recovery_mode {
+                if let Err(error) = operator_read::start_operator_read_server(app_handle.clone()) {
+                    eprintln!("buzz-desktop: operator read service unavailable: {error}");
+                }
             }
 
             let (tts_settings, tts_settings_load_error) =
