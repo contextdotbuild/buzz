@@ -453,6 +453,7 @@ fn validate_receipt(raw: &str) -> Result<String, CliError> {
     };
     match kind {
         "buzz-event" if valid_lower_hex(revision, &[64]) => {}
+        "source-event" if valid_lower_hex(revision, &[64]) => {}
         "codex-turn" | "cursor-turn" => {
             let parsed = Uuid::parse_str(revision).map_err(|_| {
                 CliError::Usage("--receipt codex-turn/cursor-turn revisions must be UUIDs".into())
@@ -464,7 +465,7 @@ fn validate_receipt(raw: &str) -> Result<String, CliError> {
         "external-job" if validate_external_job_revision(revision) => {}
         _ => {
             return Err(CliError::Usage(
-                "--receipt must contain a canonical immutable revision: buzz-event uses 64 lowercase hex; codex-turn/cursor-turn use UUIDs; git-commit/pr-head use 40 or 64 lowercase hex; document-hash/worktree-fingerprint use 64 lowercase hex; external-job uses provider/job-id@revision"
+                "--receipt must contain a canonical immutable revision: buzz-event/source-event use 64 lowercase hex; codex-turn/cursor-turn use UUIDs; git-commit/pr-head use 40 or 64 lowercase hex; document-hash/worktree-fingerprint use 64 lowercase hex; external-job uses provider/job-id@revision"
                     .into(),
                 ));
         }
@@ -855,6 +856,119 @@ async fn fetch_and_validate_delegation(
         thread_id,
         task,
     )
+}
+
+fn validate_adopted_source_event(
+    event: &nostr::Event,
+    assignee: &nostr::PublicKey,
+) -> Result<(String, String), CliError> {
+    let kind = event.kind.as_u16() as u32;
+    if kind != KIND_STREAM_MESSAGE && kind != KIND_STREAM_MESSAGE_V2 {
+        return Err(CliError::Usage(
+            "adopted source must be a Buzz stream message".into(),
+        ));
+    }
+    if event.content.trim().is_empty() {
+        return Err(CliError::Usage(
+            "adopted source must contain a nonempty obligation".into(),
+        ));
+    }
+    let channels = tag_values(event, "h");
+    if channels.len() != 1 || Uuid::parse_str(channels[0]).is_err() {
+        return Err(CliError::Usage(
+            "adopted source must carry exactly one valid channel h-tag".into(),
+        ));
+    }
+    let assignee = assignee.to_hex();
+    if !tag_values(event, "p")
+        .iter()
+        .any(|pubkey| pubkey.eq_ignore_ascii_case(&assignee))
+    {
+        return Err(CliError::Usage(
+            "adopted source must be addressed to this identity".into(),
+        ));
+    }
+    let thread_id = event_thread_root(event).ok_or_else(|| {
+        CliError::Usage("adopted source must belong to one unambiguous Buzz thread".into())
+    })?;
+    Ok((channels[0].to_owned(), thread_id))
+}
+
+fn adopted_schedule_id(event_id: &str) -> Result<String, CliError> {
+    let event_id = validate_thread_id(event_id)?;
+    Ok(format!("adopt-{}", &event_id[..40]))
+}
+
+async fn adopt(
+    client: &BuzzClient,
+    source_event: &str,
+    due_at: &str,
+    expected_result: &str,
+    evidence_locator: &str,
+    owner: Option<&str>,
+) -> Result<(), CliError> {
+    let source_event = validate_thread_id(source_event)?;
+    let event = fetch_event(client, &source_event).await?;
+    let (channel_id, thread_id) =
+        validate_adopted_source_event(&event, &client.keys().public_key())?;
+    let id = adopted_schedule_id(&source_event)?;
+    let material_at = chrono::DateTime::<Utc>::from_timestamp(event.created_at.as_secs() as i64, 0)
+        .ok_or_else(|| CliError::Other("adopted source timestamp is out of range".into()))?;
+    let task = TaskBinding {
+        assignee_pubkey: client.keys().public_key().to_hex(),
+        delegation_event_id: source_event.clone(),
+        expected_result: validate_task_text(expected_result, "expected-result")?,
+        evidence_locator: validate_task_text(evidence_locator, "evidence-locator")?,
+    };
+    let decision_at = Utc::now();
+    let due_at = canonical_time(parse_time(due_at, "due-at")?);
+    validate_next_due_at(decision_at, &due_at)?;
+    let schedule = Schedule {
+        schema: TASK_SCHEMA_VERSION,
+        id: id.clone(),
+        due_at,
+        channel_id,
+        thread_id,
+        task: Some(task),
+        checkpoint: Some(MaterialCheckpoint {
+            receipt: format!("source-event:{source_event}"),
+            material_at: canonical_time(material_at),
+        }),
+        phase: Some(FollowThroughPhase::Monitoring),
+        audit: Vec::new(),
+        audit_archive: None,
+        pending_action: None,
+        expected_cause: "The adopted obligation remains unfinished at its next check".into(),
+        action: "Inspect the exact conversation and named evidence; continue the same work or recover it without duplicating an active owner".into(),
+        check: "Read the source thread and exact evidence locator; require a newer task-bound material receipt, not generic presence".into(),
+        status: ScheduleStatus::Pending,
+        created_at: canonical_time(decision_at),
+        updated_at: canonical_time(decision_at),
+        claim: None,
+        last_transition: None,
+    };
+    validate_schedule(&schedule)?;
+    let slug = schedule_slug(&id);
+    let (owner_pubkey, existing) = get_stored_memory(client, owner, &slug).await?;
+    if let Some(existing) = existing {
+        let loaded = parse_stored(existing)?;
+        if create_definition_matches(&loaded.schedule, &schedule) {
+            return print_one(&loaded.schedule, &loaded.revision, true);
+        }
+        return Err(CliError::Conflict(format!(
+            "adopted obligation `{source_event}` already has different state or instructions"
+        )));
+    }
+    reserve_task_binding(client, &owner_pubkey, &source_event, &id).await?;
+    let revision = put_stored_memory(
+        client,
+        &owner_pubkey,
+        &slug,
+        serialized_schedule(&schedule)?,
+        ExpectedMemoryHead::Missing,
+    )
+    .await?;
+    print_one(&schedule, &revision, false)
 }
 
 async fn verify_task_receipt(
@@ -3278,6 +3392,23 @@ async fn reconcile(
 
 pub async fn dispatch(command: SchedulesCmd, client: &BuzzClient) -> Result<(), CliError> {
     match command {
+        SchedulesCmd::Adopt {
+            source_event,
+            due_at,
+            expected_result,
+            evidence_locator,
+            owner,
+        } => {
+            adopt(
+                client,
+                &source_event,
+                &due_at,
+                &expected_result,
+                &evidence_locator,
+                owner.as_deref(),
+            )
+            .await
+        }
         SchedulesCmd::Create {
             id,
             due_at,
@@ -3570,6 +3701,37 @@ mod tests {
             ])
             .sign_with_keys(driver)
             .unwrap()
+    }
+
+    #[test]
+    fn adoption_accepts_an_addressed_message_and_derives_a_stable_private_id() {
+        let author = Keys::generate();
+        let assignee = Keys::generate();
+        let other = Keys::generate();
+        let channel = "94b69f8a-59ab-4bd7-a049-e898ae1f624e";
+        let thread = "a".repeat(64);
+        let event = EventBuilder::new(
+            Kind::Custom(KIND_STREAM_MESSAGE as u16),
+            "Please finish the existing mobile release.",
+        )
+        .tags([
+            Tag::parse(["h", channel]).unwrap(),
+            Tag::parse(["e", &thread, "", "reply"]).unwrap(),
+            Tag::parse(["p", &assignee.public_key().to_hex()]).unwrap(),
+            Tag::parse(["p", &other.public_key().to_hex()]).unwrap(),
+        ])
+        .sign_with_keys(&author)
+        .unwrap();
+
+        let (parsed_channel, parsed_thread) =
+            validate_adopted_source_event(&event, &assignee.public_key()).unwrap();
+        assert_eq!(parsed_channel, channel);
+        assert_eq!(parsed_thread, thread);
+        assert_eq!(
+            adopted_schedule_id(&event.id.to_hex()).unwrap(),
+            format!("adopt-{}", &event.id.to_hex()[..40])
+        );
+        assert!(validate_adopted_source_event(&event, &Keys::generate().public_key()).is_err());
     }
 
     fn task_state_event(
@@ -4093,6 +4255,8 @@ mod tests {
         assert!(validate_receipt(&format!("document-hash:{}", "A".repeat(64))).is_err());
         assert!(validate_receipt("external-job:github/run-123@attempt-02").is_ok());
         assert!(validate_receipt(&format!("worktree-fingerprint:{}", "a".repeat(64))).is_ok());
+        assert!(validate_receipt(&format!("source-event:{}", "b".repeat(64))).is_ok());
+        assert!(validate_receipt(&format!("source-event:{}", "B".repeat(64))).is_err());
     }
 
     #[test]

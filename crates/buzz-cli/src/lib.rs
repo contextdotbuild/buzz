@@ -1875,6 +1875,24 @@ pub enum ScheduleDecisionArg {
 /// Subcommands for `buzz schedules`.
 #[derive(Subcommand)]
 pub enum SchedulesCmd {
+    /// Adopt an unfinished obligation from an existing Buzz message into this agent's private follow-through queue
+    Adopt {
+        /// Existing Buzz message that created the obligation
+        #[arg(long)]
+        source_event: String,
+        /// First recheck, 10 to 15 minutes from now
+        #[arg(long)]
+        due_at: String,
+        /// Concrete result this identity still owes
+        #[arg(long)]
+        expected_result: String,
+        /// Exact thread, session, worktree, branch, PR, document, or receipt to inspect
+        #[arg(long)]
+        evidence_locator: String,
+        /// Owner pubkey (hex). Overrides BUZZ_AUTH_TAG.
+        #[arg(long)]
+        owner: Option<String>,
+    },
     /// Create a durable follow-through schedule
     Create {
         /// Stable lowercase schedule identifier (1..=64 chars)
@@ -2683,6 +2701,7 @@ mod tests {
         assert_eq!(
             names(&cmd, "schedules"),
             vec![
+                "adopt",
                 "assigned",
                 "bind",
                 "claim-due",
@@ -2727,7 +2746,7 @@ mod tests {
             ("projects", 7),
             ("reactions", 3),
             ("repos", 5),
-            ("schedules", 9),
+            ("schedules", 10),
             ("social", 7),
             ("upload", 1),
             ("users", 5),
