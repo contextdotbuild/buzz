@@ -34,6 +34,7 @@ const MAX_RECEIPT_BYTES: usize = 256;
 const ACTIVE_HEAD_ROLLOVER_BYTES: usize = 48_000;
 const MIN_NEXT_CHECK_SECONDS: i64 = 10 * 60;
 const MAX_NEXT_CHECK_SECONDS: i64 = 15 * 60;
+const MAX_KEEP_MATERIAL_AGE_SECONDS: i64 = 15 * 60;
 const TASK_STATE_PREFIX: &str = "buzz-follow-through:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2976,6 +2977,14 @@ fn reconcile_schedule(
                 ));
             }
             let due_at = require_due_at(input)?;
+            if now.signed_duration_since(material_at)
+                > chrono::Duration::seconds(MAX_KEEP_MATERIAL_AGE_SECONDS)
+            {
+                return Err(CliError::Conflict(
+                    "keep requires task-bound material no more than 15 minutes old; stale evidence must not defer recovery"
+                        .into(),
+                ));
+            }
             if let Some(previous) = &schedule.checkpoint {
                 let previous_at = parse_time(&previous.material_at, "material-at")?;
                 let next_at = parse_time(&input.material_at, "material-at")?;
@@ -3901,6 +3910,61 @@ mod tests {
         );
         let error = reconcile_schedule(&schedule, &claim, now, &input, true).unwrap_err();
         assert!(error.to_string().contains("unchanged work is not progress"));
+    }
+
+    #[test]
+    fn stale_newer_receipt_cannot_defer_recovery() {
+        let now = DateTime::parse_from_rfc3339("2026-08-26T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut schedule = sample_schedule(now);
+        schedule.checkpoint = Some(MaterialCheckpoint {
+            receipt: format!("git-commit:{}", "a".repeat(40)),
+            material_at: canonical_time(now - chrono::Duration::minutes(30)),
+        });
+        let claim = claim_schedule(&mut schedule, now, DEFAULT_LEASE_SECONDS)
+            .unwrap()
+            .unwrap();
+        let keep = reconciliation(
+            ScheduleDecision::Keep,
+            &format!("git-commit:{}", "b".repeat(40)),
+            now - chrono::Duration::minutes(16),
+            Some(now + chrono::Duration::minutes(15)),
+        );
+
+        let error = reconcile_schedule(&schedule, &claim, now, &keep, true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("task-bound material no more than 15 minutes old"));
+    }
+
+    #[test]
+    fn changed_receipt_at_freshness_boundary_can_keep_work_alive() {
+        let now = DateTime::parse_from_rfc3339("2026-08-26T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut schedule = sample_schedule(now);
+        schedule.checkpoint = Some(MaterialCheckpoint {
+            receipt: format!("git-commit:{}", "a".repeat(40)),
+            material_at: canonical_time(now - chrono::Duration::minutes(30)),
+        });
+        let claim = claim_schedule(&mut schedule, now, DEFAULT_LEASE_SECONDS)
+            .unwrap()
+            .unwrap();
+        let keep = reconciliation(
+            ScheduleDecision::Keep,
+            &format!("git-commit:{}", "b".repeat(40)),
+            now - chrono::Duration::minutes(15),
+            Some(now + chrono::Duration::minutes(15)),
+        );
+
+        let (kept, idempotent) = reconcile_schedule(&schedule, &claim, now, &keep, true).unwrap();
+        assert!(!idempotent);
+        assert_eq!(kept.status, ScheduleStatus::Pending);
+        assert_eq!(
+            kept.checkpoint.unwrap().receipt,
+            format!("git-commit:{}", "b".repeat(40))
+        );
     }
 
     #[test]

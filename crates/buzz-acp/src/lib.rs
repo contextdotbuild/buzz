@@ -5161,8 +5161,8 @@ fn schedule_heartbeat_prompt() -> String {
     format!(
         "[System: Follow-through heartbeat]\nTime: {now}\n\n\
          You have NO incoming message, active channel context, or automatically injected core\n\
-         memory. This opted-in heartbeat checks work assigned to this identity, then processes at\n\
-         most one private due follow-through schedule.\n\n\
+         memory. This opted-in heartbeat checks work assigned to this identity, then drains a\n\
+         bounded batch of up to four private due follow-through schedules.\n\n\
          Follow-through tasks:\n\
          1. Run `buzz mem get buzz-follow-through-catch-up-v1`. If it is absent, perform one bounded\n\
             catch-up before normal follow-through: run\n\
@@ -5186,10 +5186,13 @@ fn schedule_heartbeat_prompt() -> String {
             identity's material result or blocker after the delegation, the expected result is already\n\
             present, or the work is obsolete. Never scan the whole Corpus; read only a Corpus record\n\
             named by the assignment's evidence locator.\n\
-         3. Run `buzz schedules claim-due --limit 1 --lease-seconds 300`. This claims one due item\n\
-            owned by this agent for a five-minute recovery window. A due item means you are the\n\
-            designated driver for that conversation. Any agent can be the\n\
-            driver, and any managed agent can be the assignee.\n\
+         3. Run `buzz schedules claim-due --limit 1 --lease-seconds 300`. Claim and reconcile only\n\
+            one due item at a time. After that item reaches its required transition, repeat this\n\
+            command until it returns `[]` or four claimed items have been processed during this\n\
+            heartbeat. Never hold more than one schedule lease at once. This gives each item a\n\
+            five-minute recovery window without letting one overdue conversation hide the rest.\n\
+            A due item means this identity is the designated driver for that conversation.\n\
+            Any agent can be the driver, and any managed agent can be the assignee.\n\
          4. For the claimed item, use its channel_id and thread_id with\n\
             `buzz messages thread --channel <channel_id> --event <thread_id>`. Follow the item's\n\
             stored `check` before its `action`, and inspect the named thread, worktree, PR,\n\
@@ -5216,6 +5219,10 @@ fn schedule_heartbeat_prompt() -> String {
             job revision tied to this delegation. Use the canonical receipt shape required by the\n\
             CLI; a caller-invented status or presence label is not a revision. Generic online presence,\n\
             an open session, an ended foreground command, or an unchanged dirty worktree is not progress.\n\
+            The receipt's material timestamp must also be no more than 15 minutes old at the\n\
+            decision time. A stale receipt cannot defer recovery merely because it is newer than the\n\
+            previous checkpoint; treat it as no current progress and wake or recover against the\n\
+            stored checkpoint.\n\
             Use\n\
             `buzz schedules reconcile --decision keep` with that exact receipt, `--material-at`,\n\
             and a `--due-at` 10 to 15 minutes away. Keep has no `--message` and publishes nothing.\n\
@@ -5254,8 +5261,8 @@ fn schedule_heartbeat_prompt() -> String {
             perform a customer, production, financial,\n\
             or other external effect. A foreground turn carrying explicit authority owns such an\n\
             action.\n\
-         9. After the claimed driver schedule has reached its required transition, or immediately\n\
-            when `claim-due` returned `[]`, continue at most one retained assignment that is\n\
+         9. Only after the due loop returned `[]`, or after four claimed items each reached their\n\
+            required transition, continue at most one retained assignment that is\n\
             genuinely unfinished. First inspect its named evidence\n\
             and verify that no existing process, Codex/Cursor turn, or other owner is still actively\n\
             producing that exact result. Resume preserved work instead of starting it again. Do not\n\
@@ -5312,9 +5319,13 @@ mod heartbeat_prompt_tests {
         assert!(prompt.contains("one retained assignment"));
         assert!(prompt.contains("Resume preserved work instead of starting it again"));
         assert!(prompt.contains("post a pickup, acknowledgement, or routine status"));
-        assert!(prompt.contains("when `claim-due` returned `[]`"));
+        assert!(prompt.contains("due loop returned `[]`"));
         assert!(prompt.contains("normal callback mention to"));
         assert!(prompt.contains("buzz schedules claim-due --limit 1 --lease-seconds 300"));
+        assert!(prompt.contains("up to four private due follow-through schedules"));
+        assert!(prompt.contains("repeat this"));
+        assert!(prompt.contains("four claimed items have been processed"));
+        assert!(prompt.contains("Never hold more than one schedule lease at once"));
         assert!(prompt.contains("five-minute recovery window"));
         assert!(prompt.contains("buzz messages thread --channel"));
         assert!(prompt.contains("designated driver"));
@@ -5333,6 +5344,9 @@ mod heartbeat_prompt_tests {
         assert!(prompt.contains("newer task-bound receipt"));
         assert!(prompt.contains("Generic online presence"));
         assert!(prompt.contains("unchanged dirty worktree is not progress"));
+        assert!(prompt.contains("no more than 15 minutes old"));
+        assert!(prompt.contains("stale receipt cannot defer recovery"));
+        assert!(prompt.contains("after four claimed items each reached"));
         assert!(prompt.contains("buzz schedules reconcile --decision keep"));
         assert!(prompt.contains("buzz schedules reconcile --decision wake"));
         assert!(prompt.contains("`--decision redirect`"));
