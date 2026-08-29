@@ -41,6 +41,7 @@ const MESSAGE_KINDS: [u32; 4] = [9, 40002, 45001, 45003];
 const IDENTITY_KEY_NAME: &str = "identity";
 const CONTROL_DIR_NAME: &str = "operator-read";
 const HELPER_FLAG: &str = "--buzz-read-helper";
+const ALLOWED_RELAY_HOST: &str = "buildcontext.communities.buzz.xyz";
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -473,7 +474,8 @@ fn validate_relay(value: &str) -> Result<Url, OperatorError> {
     let parsed = Url::parse(value)
         .map_err(|_| OperatorError::new("relay_rejected", "relay must be a valid URL"))?;
     if !matches!(parsed.scheme(), "wss" | "https")
-        || parsed.host_str().is_none()
+        || parsed.host_str() != Some(ALLOWED_RELAY_HOST)
+        || parsed.port().is_some()
         || !parsed.username().is_empty()
         || parsed.password().is_some()
         || parsed.fragment().is_some()
@@ -481,7 +483,7 @@ fn validate_relay(value: &str) -> Result<Url, OperatorError> {
     {
         return Err(OperatorError::new(
             "relay_rejected",
-            "relay must be a credential-free wss or https origin",
+            "relay must be the canonical credential-free Buzz wss or https origin",
         ));
     }
     Ok(parsed)
@@ -1184,6 +1186,16 @@ mod tests {
             "relay_rejected"
         );
         candidate.relay = "http://127.0.0.1:3000".to_string();
+        assert_eq!(
+            validate_request(&candidate).unwrap_err().code,
+            "relay_rejected"
+        );
+        candidate.relay = "wss://example.com".to_string();
+        assert_eq!(
+            validate_request(&candidate).unwrap_err().code,
+            "relay_rejected"
+        );
+        candidate.relay = "wss://buildcontext.communities.buzz.xyz:8443".to_string();
         assert_eq!(
             validate_request(&candidate).unwrap_err().code,
             "relay_rejected"
