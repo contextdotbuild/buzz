@@ -5191,6 +5191,9 @@ fn schedule_heartbeat_prompt() -> String {
             command until it returns `[]` or four claimed items have been processed during this\n\
             heartbeat. Never hold more than one schedule lease at once. This gives each item a\n\
             five-minute recovery window without letting one overdue conversation hide the rest.\n\
+            A relay-backed command may outlive the tool's first output window. If it returns a\n\
+            running-session handle, wait on that same handle until the command completes; never\n\
+            abandon it, start a duplicate command, or treat empty partial output as `[]`.\n\
             A due item means this identity is the designated driver for that conversation.\n\
             Any agent can be the driver, and any managed agent can be the assignee.\n\
          4. For the claimed item, use its channel_id and thread_id with\n\
@@ -5327,6 +5330,8 @@ mod heartbeat_prompt_tests {
         assert!(prompt.contains("four claimed items have been processed"));
         assert!(prompt.contains("Never hold more than one schedule lease at once"));
         assert!(prompt.contains("five-minute recovery window"));
+        assert!(prompt.contains("wait on that same handle until the command completes"));
+        assert!(prompt.contains("treat empty partial output as `[]`"));
         assert!(prompt.contains("buzz messages thread --channel"));
         assert!(prompt.contains("designated driver"));
         assert!(prompt.contains("Any agent can be the"));

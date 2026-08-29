@@ -1735,17 +1735,27 @@ async fn load_all(
     // head. Every task-bound schema-2 schedule is also recorded in the exact
     // binding registry, so use that registry as a bounded fallback and fetch
     // only registered schedule IDs that the broad listing did not return.
-    let (_, stored_registry) = get_stored_memory(client, owner, BINDING_REGISTRY_SLUG).await?;
-    let Some(stored_registry) = stored_registry else {
-        return Ok(schedules);
-    };
-    let registry = serde_json::from_str::<TaskBindingRegistry>(&stored_registry.value)
-        .map_err(|error| CliError::Other(format!("task binding registry is invalid: {error}")))?;
     let present: HashSet<String> = schedules
         .iter()
         .map(|loaded| loaded.schedule.id.clone())
         .collect();
-    for id in missing_registered_schedule_ids(&registry, &present)? {
+    schedules.extend(load_registered_schedules(client, owner, &present).await?);
+    Ok(schedules)
+}
+
+async fn load_registered_schedules(
+    client: &BuzzClient,
+    owner: Option<&str>,
+    present: &HashSet<String>,
+) -> Result<Vec<LoadedSchedule>, CliError> {
+    let (_, stored_registry) = get_stored_memory(client, owner, BINDING_REGISTRY_SLUG).await?;
+    let Some(stored_registry) = stored_registry else {
+        return Ok(Vec::new());
+    };
+    let registry = serde_json::from_str::<TaskBindingRegistry>(&stored_registry.value)
+        .map_err(|error| CliError::Other(format!("task binding registry is invalid: {error}")))?;
+    let mut schedules = Vec::new();
+    for id in missing_registered_schedule_ids(&registry, present)? {
         let slug = schedule_slug(&id);
         let (_, stored) = get_stored_memory(client, owner, &slug).await?;
         if let Some(stored) = stored {
@@ -1780,6 +1790,14 @@ fn only_due(
             Err(error) => Some(Err(error)),
         })
         .collect()
+}
+
+fn registered_due_candidates(
+    schedules: Vec<LoadedSchedule>,
+    now: DateTime<Utc>,
+) -> Result<Option<Vec<LoadedSchedule>>, CliError> {
+    let schedules = only_due(schedules, now)?;
+    Ok((!schedules.is_empty()).then_some(schedules))
 }
 
 async fn load_one(
@@ -2115,7 +2133,15 @@ async fn claim_due(
         Some(value) => parse_time(value, "at")?,
         None => Utc::now(),
     };
-    let mut candidates = only_due(load_all(client, owner).await?, now)?;
+    // Task-bound schedules have exact coordinates in the binding registry.
+    // Claim them before the broad legacy-memory scan: a large or temporarily
+    // failing broad response must not hide registered due work. Only fall back
+    // to broad discovery when no registered schema-2 schedule is due.
+    let registered = load_registered_schedules(client, owner, &HashSet::new()).await?;
+    let mut candidates = match registered_due_candidates(registered, now)? {
+        Some(candidates) => candidates,
+        None => only_due(load_all(client, owner).await?, now)?,
+    };
     candidates.sort_by(|a, b| {
         a.schedule
             .due_at
@@ -3655,6 +3681,14 @@ mod tests {
         }
     }
 
+    fn loaded_schedule(schedule: Schedule) -> LoadedSchedule {
+        LoadedSchedule {
+            slug: schedule_slug(&schedule.id),
+            schedule,
+            revision: "1".repeat(64),
+        }
+    }
+
     #[test]
     fn lifecycle_survives_serialization_and_transitions_are_idempotent() {
         let now = DateTime::parse_from_rfc3339("2026-08-26T15:00:00Z")
@@ -5047,6 +5081,26 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("inconsistent mappings"));
+    }
+
+    #[test]
+    fn registered_due_work_short_circuits_legacy_discovery() {
+        let now = DateTime::parse_from_rfc3339("2026-08-26T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let due = registered_due_candidates(vec![loaded_schedule(sample_schedule(now))], now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].schedule.schema, TASK_SCHEMA_VERSION);
+
+        let mut future = sample_schedule(now);
+        future.due_at = canonical_time(now + chrono::Duration::minutes(15));
+        assert!(
+            registered_due_candidates(vec![loaded_schedule(future)], now)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
