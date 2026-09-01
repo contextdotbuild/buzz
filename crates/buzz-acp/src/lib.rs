@@ -5113,7 +5113,43 @@ mod agent_draft_prompt_tests {
     fn shared_base_prompt_teaches_driver_neutral_delegation_follow_through() {
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("Any agent may delegate work"));
-        assert!(prompt.contains("the **driver** is the one agent"));
+        assert!(prompt.contains("received the owner's initial request"));
+        assert!(prompt.contains("was appointed as driver to own the outcome"));
+        assert!(prompt.contains("initially appointed driver remains responsible"));
+        assert!(prompt.contains("downstream assignee does not become a competing driver"));
+        assert!(prompt.contains("merely by receiving a delegation"));
+        assert!(prompt.contains("exact user journey succeeds on the real surface"));
+        assert!(prompt.contains("live success receipt"));
+        assert!(prompt.contains("may replace the doer"));
+        assert!(prompt.contains("never transfers the driver role"));
+        assert!(prompt.contains("thinnest useful live outcome and its proof"));
+        assert!(prompt.contains("Inspect the available context first"));
+        assert!(prompt.contains("ask the requesting human"));
+        assert!(prompt.contains("one consolidated batch of questions"));
+        assert!(prompt.contains("each with a recommended default"));
+        assert!(prompt.contains("continue without further prompting"));
+        assert!(prompt.contains("never use the requesting human as a routine courier"));
+        assert!(prompt.contains("Shipping speed is the default"));
+        assert!(prompt.contains("company's current small scale"));
+        assert!(prompt.contains("Defer speculative generality"));
+        assert!(prompt.contains("redundant or non-required checks"));
+        assert!(prompt.contains("full test suite for the touched package"));
+        assert!(prompt.contains("proof of the accepted user journey"));
+        assert!(prompt.contains("concrete safety, authority, data, or recoverability boundary"));
+        assert!(prompt.contains("For a repair, regression, or reported failure"));
+        assert!(prompt.contains("prove the exact broken transition before implementation"));
+        assert!(
+            prompt.contains("do not require a nonexistent broken transition for greenfield work")
+        );
+        assert!(prompt.contains("one repair and one final review"));
+        assert!(prompt.contains("repeated `MUST_FIX` churn"));
+        assert!(prompt.contains("smaller complete live outcome"));
+        assert!(prompt.contains("not harden indefinitely"));
+        assert!(prompt.contains("supporting evidence, not completion"));
+        assert!(prompt.contains("material status update is welcome"));
+        assert!(prompt.contains("current driver or owner, and the next action"));
+        assert!(prompt.contains("never hands responsibility back"));
+        assert!(prompt.contains("continue automatically afterward"));
         assert!(prompt.contains("name exactly one assignee, the expected result"));
         assert!(prompt.contains("where the callback or evidence will appear"));
         assert!(prompt.contains("15 minutes after each delegation or recheck"));
@@ -5194,8 +5230,12 @@ fn schedule_heartbeat_prompt() -> String {
             A relay-backed command may outlive the tool's first output window. If it returns a\n\
             running-session handle, wait on that same handle until the command completes; never\n\
             abandon it, start a duplicate command, or treat empty partial output as `[]`.\n\
-            A due item means this identity is the designated driver for that conversation.\n\
-            Any agent can be the driver, and any managed agent can be the assignee.\n\
+            A due item means this identity is the initially appointed driver for that conversation,\n\
+            not merely a downstream assignee. Any agent can be appointed driver. Any managed agent\n\
+            can be the assignee. The same driver\n\
+            remains responsible until the exact user journey succeeds on the real surface with a\n\
+            live success receipt. A redirect may replace the assignee or doer, but never transfers\n\
+            the driver role.\n\
          4. For the claimed item, use its channel_id and thread_id with\n\
             `buzz messages thread --channel <channel_id> --event <thread_id>`. Follow the item's\n\
             stored `check` before its `action`, and inspect the named thread, worktree, PR,\n\
@@ -5263,7 +5303,8 @@ fn schedule_heartbeat_prompt() -> String {
             rescheduling it; never publish an unclaimed status. It must not approve a workflow or\n\
             perform a customer, production, financial,\n\
             or other external effect. A foreground turn carrying explicit authority owns such an\n\
-            action.\n\
+            action. Tests, commits, candidates, reviews, schedules, and deployments are evidence,\n\
+            not completion of the user journey.\n\
          9. Only after the due loop returned `[]`, or after four claimed items each reached their\n\
             required transition, continue at most one retained assignment that is\n\
             genuinely unfinished. First inspect its named evidence\n\
@@ -5333,9 +5374,17 @@ mod heartbeat_prompt_tests {
         assert!(prompt.contains("wait on that same handle until the command completes"));
         assert!(prompt.contains("treat empty partial output as `[]`"));
         assert!(prompt.contains("buzz messages thread --channel"));
-        assert!(prompt.contains("designated driver"));
-        assert!(prompt.contains("Any agent can be the"));
-        assert!(prompt.contains("any managed agent can be the assignee"));
+        assert!(prompt.contains("initially appointed driver"));
+        assert!(prompt.contains("not merely a downstream assignee"));
+        assert!(prompt.contains("Any agent can be appointed driver"));
+        assert!(prompt.contains("Any managed agent"));
+        assert!(prompt.contains("can be the assignee"));
+        assert!(prompt.contains("same driver"));
+        assert!(prompt.contains("exact user journey succeeds on the real surface"));
+        assert!(prompt.contains("live success receipt"));
+        assert!(prompt.contains("redirect may replace the assignee or doer"));
+        assert!(prompt.contains("never transfers"));
+        assert!(prompt.contains("driver role"));
         assert!(prompt.contains("Existing schema-1 work does not require"));
         assert!(prompt.contains("source-event:"));
         assert!(prompt.contains("never publish a wake addressed to yourself"));
@@ -5376,6 +5425,10 @@ mod heartbeat_prompt_tests {
         assert!(prompt.contains("ordinary incoming-message turn owns"));
         assert!(prompt.contains("must not approve a"));
         assert!(prompt.contains("foreground turn carrying explicit authority"));
+        assert!(prompt.contains(
+            "Tests, commits, candidates, reviews, schedules, and deployments are evidence"
+        ));
+        assert!(prompt.contains("not completion of the user journey"));
         assert!(prompt.contains("publish nothing"));
         assert!(!prompt.contains("search the whole Corpus"));
         assert!(!prompt.contains("continue every retained assignment"));
