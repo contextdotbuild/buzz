@@ -5199,6 +5199,50 @@ fn schedule_heartbeat_prompt() -> String {
          You have NO incoming message, active channel context, or automatically injected core\n\
          memory. This opted-in heartbeat checks work assigned to this identity, then drains a\n\
          bounded batch of up to four private due follow-through schedules.\n\n\
+         Outcome-driven delivery activation:\n\
+         - Run `buzz mem get buzz-outcome-driven-delivery-bootstrap-v1`. If it is absent, perform\n\
+           one activation review before the normal follow-through tasks below. Run\n\
+           `buzz schedules list` once and take the unfinished, non-completed schedule heads in that\n\
+           snapshot as the bounded activation cohort. These private schedules were created by this\n\
+           identity as the initially appointed driver and are the canonical driver inventory. The\n\
+           legacy catch-up below remains the only feed-based discovery path. You may consult\n\
+           `buzz schedules assigned --limit 100` only to detect downstream work or active ownership;\n\
+           an assignment never makes its assignee a competing driver or adds it to this activation\n\
+           cohort. Do not adopt unrelated work, redistribute ownership, or invent a new task.\n\
+         - For every driver-owned unfinished obligation in the cohort, read its exact Buzz thread\n\
+           and only the worktree, PR, document, Corpus record, or other evidence specifically named\n\
+           there. Discard only work that is complete, obsolete, or duplicated. Every unfinished\n\
+           private schedule remains driver-owned, including after an ordinary assignee redirect or\n\
+           any conversation-level handoff or transfer wording, until the schedule is genuinely\n\
+           completed or obsolete. When a\n\
+           downstream assignee is actively producing the result, preserve that ownership and let\n\
+           the ordinary assigned-work step below continue or report to this driver. Otherwise the\n\
+           driver proceeds without asking Timi when the existing authority, evidence, and safe tools\n\
+           are enough. Perform the next safe action now and use the existing schedule path for any\n\
+           continuation; preserve every customer, production, financial, credential, data, and\n\
+           recoverability boundary below.\n\
+         - Only this driver may ask Timi during activation. A current explicit assignee must proceed\n\
+           or report to its driver through the ordinary assigned-work step and must not independently\n\
+           ask the human under this bootstrap. Only when a genuinely irreducible human-only gap\n\
+           remains may the driver ask one consolidated batch of questions in that task's conversation,\n\
+           each with a recommended default. Immediately before asking, re-read the exact thread and\n\
+           named evidence and consolidate every currently knowable human-only gap. If this driver\n\
+           already posted an activation question for this task, whether answered or unanswered,\n\
+           never post a second activation question for that task, including on marker-absent retries.\n\
+           Use the answer and continue, or retain the concrete blocker without another question. The\n\
+           first consolidated batch is the only activation question batch for the lifetime of the\n\
+           task. It is the sole narrow direct-visible-output exception for both schema-1 and schema-2\n\
+           cohort items, including an unclaimed activation review before `claim-due`. After the answer,\n\
+           continue without making Timi a routine courier.\n\
+         - Only after every driver-owned obligation review in that bounded cohort has finished, including\n\
+           its exact thread and named-evidence read and any required durable continuation or single\n\
+           consolidated human question, run\n\
+           `buzz mem set buzz-outcome-driven-delivery-bootstrap-v1 <current-RFC3339-time>`. Never\n\
+           set this marker while a driver-owned cohort item remains unreviewed or a required evidence read\n\
+           is unfinished. If the bounded activation review cannot finish during this heartbeat,\n\
+           leave the marker absent so the next schedule heartbeat resumes it. The marker records\n\
+           completion of the one-time review, not completion of still-scheduled work; ordinary\n\
+           post-bootstrap heartbeat behavior remains unchanged.\n\n\
          Follow-through tasks:\n\
          1. Run `buzz mem get buzz-follow-through-catch-up-v1`. If it is absent, perform one bounded\n\
             catch-up before normal follow-through: run\n\
@@ -5297,8 +5341,9 @@ fn schedule_heartbeat_prompt() -> String {
             away so it is due by the next heartbeat. These transitions retain a durable decision audit.\n\
             Inspect only the claimed due items, and never blindly replay an external effect whose\n\
             outcome is unknown. A background schedule heartbeat may inspect evidence and manage\n\
-            its private schedule. A schema-2 item's only visible output is its signed\n\
-            reconciliation outbox. A schema-1 item may use `buzz messages send` only for the\n\
+            its private schedule. Outside the one-time activation exception above, a schema-2 item's\n\
+            only visible output is its signed reconciliation outbox. Separately, a claimed schema-1\n\
+            item may use `buzz messages send` only for the\n\
             claimed obligation's stored safe coordination action before completing or\n\
             rescheduling it; never publish an unclaimed status. It must not approve a workflow or\n\
             perform a customer, production, financial,\n\
@@ -5315,7 +5360,8 @@ fn schedule_heartbeat_prompt() -> String {
             its driver. Do not perform a customer, production, financial, or other external effect\n\
             from this background heartbeat. If both command results are `[]`, end immediately and\n\
             publish nothing.\n\n\
-         After the one-time bounded catch-up, schedule heartbeats do not query the mentions feed:\n\
+         After the one-time bounded activation and catch-up, schedule heartbeats do not query the\n\
+         mentions feed:\n\
          normal relay delivery owns new human messages. Do not scan channels, search for unrelated\n\
          work, or invent tasks."
     )
@@ -5347,6 +5393,62 @@ mod heartbeat_prompt_tests {
         assert!(!prompt.contains("buzz workflows approve"));
         assert!(prompt.contains("Do not approve a workflow"));
         assert!(prompt.contains("foreground turn"));
+    }
+
+    #[test]
+    fn schedule_prompt_bootstraps_outcome_driven_delivery_once() {
+        let prompt = schedule_heartbeat_prompt();
+        assert!(prompt.contains("buzz-outcome-driven-delivery-bootstrap-v1"));
+        assert!(prompt.contains("buzz schedules list"));
+        assert!(prompt.contains("unfinished, non-completed schedule heads"));
+        assert!(prompt.contains("canonical driver inventory"));
+        assert!(prompt.contains("legacy catch-up below remains the only feed-based discovery path"));
+        assert!(prompt.contains("buzz schedules assigned --limit 100"));
+        assert!(prompt.contains("only to detect downstream work or active ownership"));
+        assert!(prompt.contains("assignment never makes its assignee a competing driver"));
+        assert!(prompt.contains("driver-owned unfinished obligation"));
+        assert!(prompt.contains("read its exact Buzz thread"));
+        assert!(prompt.contains("evidence specifically named"));
+        assert!(prompt.contains("Discard only work that is complete, obsolete, or duplicated"));
+        assert!(prompt.contains("Every unfinished"));
+        assert!(prompt.contains("private schedule remains driver-owned"));
+        assert!(prompt.contains("including after an ordinary assignee redirect"));
+        assert!(prompt.contains("conversation-level handoff or transfer wording"));
+        assert!(prompt.contains("until the schedule is genuinely"));
+        assert!(!prompt.contains("driver role was explicitly transferred and accepted"));
+        assert!(!prompt.contains("complete, obsolete, redirected, or duplicated"));
+        assert!(prompt.contains("Only this driver may ask Timi during activation"));
+        assert!(prompt.contains("must not independently"));
+        assert!(prompt.contains("ask the human under this bootstrap"));
+        assert!(prompt.contains("genuinely irreducible human-only gap"));
+        assert!(prompt.contains("one consolidated batch of questions"));
+        assert!(prompt.contains("each with a recommended default"));
+        assert!(prompt.contains("in that task's conversation"));
+        assert!(prompt.contains("Immediately before asking, re-read the exact thread"));
+        assert!(prompt.contains("consolidate every currently knowable human-only gap"));
+        assert!(prompt.contains("already posted an activation question for this task"));
+        assert!(prompt.contains("whether answered or unanswered"));
+        assert!(prompt.contains("never post a second activation question for that task"));
+        assert!(prompt.contains("including on marker-absent retries"));
+        assert!(prompt.contains("Use the answer and continue"));
+        assert!(prompt.contains("retain the concrete blocker without another question"));
+        assert!(prompt.contains("first consolidated batch is the only activation question batch"));
+        assert!(prompt.contains("lifetime of the"));
+        assert!(prompt.contains("sole narrow direct-visible-output exception"));
+        assert!(prompt.contains("both schema-1 and schema-2"));
+        assert!(prompt.contains("unclaimed activation review before `claim-due`"));
+        assert!(prompt.contains("Only after every driver-owned obligation review"));
+        assert!(
+            prompt.contains("set this marker while a driver-owned cohort item remains unreviewed")
+        );
+        assert!(prompt.contains("leave the marker absent"));
+        assert!(prompt.contains("post-bootstrap heartbeat behavior remains unchanged"));
+        assert!(prompt.contains("buzz-follow-through-catch-up-v1"));
+        assert!(prompt.contains("After the one-time bounded activation and catch-up"));
+        assert!(prompt.contains("Outside the one-time activation exception above"));
+        assert!(prompt.contains("only visible output is its signed reconciliation outbox"));
+        assert!(prompt.contains("Separately, a claimed schema-1"));
+        assert!(prompt.contains("item may use `buzz messages send`"));
     }
 
     #[test]
@@ -5417,8 +5519,10 @@ mod heartbeat_prompt_tests {
         assert!(prompt.contains("That command publishes the"));
         assert!(prompt.contains("durable decision audit"));
         assert!(!prompt.contains("buzz feed get --types needs_action`"));
-        assert!(prompt.contains("schema-2 item's only visible output"));
-        assert!(prompt.contains("schema-1 item may use `buzz messages send`"));
+        assert!(prompt.contains("Outside the one-time activation exception above"));
+        assert!(prompt.contains("only visible output is its signed reconciliation outbox"));
+        assert!(prompt.contains("Separately, a claimed schema-1"));
+        assert!(prompt.contains("item may use `buzz messages send`"));
         assert!(prompt.contains("claimed obligation"));
         assert!(prompt.contains("Immediately before any visible wake, redirect, or complete"));
         assert!(prompt.contains("already covers this exact claimed obligation and result"));
