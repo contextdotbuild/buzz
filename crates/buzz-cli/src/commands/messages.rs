@@ -176,8 +176,11 @@ async fn resolve_content_mentions(
         "#d": [channel_id],
         "limit": 1,
     });
+    // A relay/network failure here must surface as a retryable network error,
+    // not a dead-end message: agents lost whole replies when the relay blipped
+    // during this lookup and the CLI reported a non-retryable failure.
     let member_pubkeys = fetch_member_pubkeys(client, &members_filter)
-        .await
+        .await?
         .ok_or_else(|| {
             CliError::Other("could not load channel membership for mention preflight".into())
         })?;
@@ -192,7 +195,7 @@ async fn resolve_content_mentions(
         "limit": member_pubkeys.len(),
     });
     let profile_events = fetch_events(client, &profiles_filter)
-        .await
+        .await?
         .ok_or_else(|| {
             CliError::Other("could not load member profiles for mention resolution".into())
         })?;
@@ -296,22 +299,31 @@ fn event_mention_pubkeys(event: &nostr::Event) -> Vec<String> {
 
 /// Fetch raw events for `filter` via the relay's `/query` endpoint.
 /// Returns `None` on any I/O or parse failure.
+/// Query the relay for `filter`. Network and relay errors propagate (they are
+/// retryable and reported as such); `Ok(None)` means the relay answered with
+/// something that is not an event array.
 async fn fetch_events(
     client: &BuzzClient,
     filter: &serde_json::Value,
-) -> Option<Vec<serde_json::Value>> {
-    let raw = client.query(filter).await.ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    parsed.as_array().cloned()
+) -> Result<Option<Vec<serde_json::Value>>, CliError> {
+    let raw = client.query(filter).await?;
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    Ok(parsed.as_array().cloned())
 }
 
 /// Extract member pubkeys (the `p` tag values) from a single 39002 event.
 async fn fetch_member_pubkeys(
     client: &BuzzClient,
     filter: &serde_json::Value,
-) -> Option<Vec<String>> {
+) -> Result<Option<Vec<String>>, CliError> {
     let events = fetch_events(client, filter).await?;
-    Some(parse_member_pubkeys(events.first()?))
+    Ok(events
+        .as_ref()
+        .and_then(|events| events.first())
+        .map(parse_member_pubkeys))
 }
 
 /// Parse member pubkeys from a kind 39002 event JSON value.

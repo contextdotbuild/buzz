@@ -118,20 +118,29 @@ fn relay_server_tag(relay_url: &str) -> Option<String> {
     }
 }
 
-/// Maximum number of attempts per request (initial attempt + two retries).
-const RETRY_MAX_ATTEMPTS: u32 = 3;
+/// Maximum number of attempts per request (initial attempt + four retries).
+///
+/// Transient relay outages seen from the iMac agents (DNS lookup failures,
+/// dropped connections) last several seconds, not milliseconds. The earlier
+/// three-attempt window of under two seconds lost whole replies; the window
+/// now spans roughly eight to fifteen seconds before giving up.
+const RETRY_MAX_ATTEMPTS: u32 = 5;
 
-/// Base sleep durations for full-jitter exponential backoff.
-/// `RETRY_BASE_SECS[i]` is the ceiling for attempt `i` before attempt `i+1`.
-const RETRY_BASE_SECS: [f64; 2] = [0.5, 1.5];
+/// Base sleep durations for equal-jitter exponential backoff.
+/// `RETRY_BASE_SECS[i]` is the ceiling for attempt `i` before attempt `i+1`;
+/// the actual delay is at least half of it.
+const RETRY_BASE_SECS: [f64; 4] = [1.0, 2.0, 4.0, 8.0];
 
 /// Maximum seconds to honour a relay-provided `retry in Ns` hint from a 429.
 /// Defensive cap against pathological hints; real relay hints observed up to ~24 s.
 const RETRY_IN_MAX_SECS: u64 = 30;
 
-/// Returns a full-jitter delay for attempt `i`: a random duration in `[0, RETRY_BASE_SECS[i])`.
+/// Returns an equal-jitter delay for attempt `i`: a random duration in
+/// `[RETRY_BASE_SECS[i] / 2, RETRY_BASE_SECS[i])`, so a retry never fires
+/// instantly against a resolver or relay that is still recovering.
 fn jitter_delay(attempt: u32) -> Duration {
-    Duration::from_secs_f64(RETRY_BASE_SECS[attempt as usize] * rand::random::<f64>())
+    let base = RETRY_BASE_SECS[attempt as usize];
+    Duration::from_secs_f64(base / 2.0 + base / 2.0 * rand::random::<f64>())
 }
 
 /// Read an env var as a `u64` of seconds and return the corresponding `Duration`.
@@ -1556,8 +1565,16 @@ mod retry_tests {
 
     #[test]
     fn retry_constants_are_sensible() {
-        assert_eq!(RETRY_MAX_ATTEMPTS, 3);
+        assert_eq!(RETRY_MAX_ATTEMPTS, 5);
         assert_eq!(RETRY_BASE_SECS.len(), (RETRY_MAX_ATTEMPTS - 1) as usize);
+        // The whole window must outlast the multi-second relay blips seen in
+        // production (a two-second window lost replies) without stalling a
+        // turn for minutes.
+        let max_window: f64 = RETRY_BASE_SECS.iter().sum();
+        assert!(
+            (8.0..=20.0).contains(&max_window),
+            "max window {max_window}s"
+        );
         const { assert!(RETRY_IN_MAX_SECS > 0) };
     }
 
@@ -1592,6 +1609,7 @@ mod retry_tests {
 /// through `BuzzClient` to verify behavioural properties — not implementation details.
 #[cfg(test)]
 mod retry_policy_tests {
+    use super::RETRY_MAX_ATTEMPTS;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
@@ -1800,7 +1818,7 @@ mod retry_policy_tests {
         // All RETRY_MAX_ATTEMPTS must have been tried.
         assert_eq!(
             attempts.load(Ordering::SeqCst),
-            3,
+            RETRY_MAX_ATTEMPTS,
             "all retry attempts must fire for exhausted ingest 429"
         );
     }
@@ -2304,8 +2322,8 @@ mod retry_policy_tests {
         // All RETRY_MAX_ATTEMPTS must have fired.
         assert_eq!(
             counter.load(Ordering::SeqCst),
-            3,
-            "all 3 attempts must be made before surfacing DeliveryUnknown"
+            RETRY_MAX_ATTEMPTS,
+            "all attempts must be made before surfacing DeliveryUnknown"
         );
         // All attempts must have sent identical serialized event bytes.
         let captured = bodies.lock().unwrap();
@@ -2334,8 +2352,8 @@ mod retry_policy_tests {
         );
         assert_eq!(
             attempts.load(Ordering::SeqCst),
-            3,
-            "all 3 attempts must fire before surfacing DeliveryUnknown"
+            RETRY_MAX_ATTEMPTS,
+            "all attempts must fire before surfacing DeliveryUnknown"
         );
     }
 }
