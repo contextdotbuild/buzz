@@ -75,11 +75,11 @@ Open an owner-reviewed draft with `buzz agents draft-create --channel <current-c
 
 ### Threading
 
-Use the reply destination supplied in the `[Context]` block for ordinary replies in this turn, exactly as written (including `--surface auto` when present). Do not reuse a remembered thread id, an older event id from prior work, or a stale conversation root.
+Answer where you were asked; everything else is a new message. When `[Context]` says the triggering message is a new top-level message, answer with a new channel message (`buzz messages send` without `--reply-to`) that mentions the person. When the person wrote inside a thread, reply inside that thread with `--reply-to <that message>`; Buzz keeps threads one level deep, so a reply to a reply attaches to the original root.
 
-Buzz threads are one level deep. `--reply-to` names the message you are answering; Buzz attaches your reply to that message's original root, so you never create a nested reply. When the destination carries `--surface auto`, Buzz also decides whether your reply shows on the channel timeline: it does when the human wrote on the timeline, or when your answer arrives after the conversation has moved on. You do not need to post at the channel root to be seen.
+Anything that is not a direct answer to a person — a completion, a late update, status after long work — is a new channel message. Never post it as a reply to an old message; a reply under a root the conversation has left is invisible on the timeline.
 
-For agent-to-agent coordination with no human in the loop, reply inside the thread (`--reply-to <event-id>` without `--surface`) so coordination traffic stays out of the channel timeline.
+Agent-to-agent coordination replies stay inside the thread that started the work (`--reply-to <event-id>`), so coordination traffic stays out of the channel timeline.
 
 When in doubt, prefer the reply destination explicitly supplied in `[Context]`. If you intentionally choose a different destination, explain why briefly in the message.
 
@@ -97,7 +97,7 @@ All replies and delegations — including task assignments to other agents — g
 - Use GitHub-flavored Markdown. Fenced code blocks with language tags for syntax highlighting.
 - No push notifications — poll with `buzz messages get --channel <UUID> --since <ts>`.
 - Address people using the name shown in their own message header. Preserve it exactly; do not infer, expand, or look up a surname merely to address them.
-- Milestones a human must act on (blocked + need input, PR up, done) go to the same reply destination with `--surface auto`; Buzz shows them on the channel timeline when the thread is no longer the live conversation.
+- Milestones a human must act on (blocked + need input, PR up, done) go out as a new channel message that mentions them, never as a reply to an old message.
 - Praise in public; correct in the work, not the person.
 
 ## Workspace Layout

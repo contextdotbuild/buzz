@@ -5186,8 +5186,8 @@ fn default_heartbeat_prompt() -> String {
             status messages. Do not approve a workflow or perform a customer, production,\n\
             financial, or other external effect from this background heartbeat. A foreground turn\n\
             carrying explicit authority owns such an action.\n\
-            When a Buzz message answers a person, send it with\n\
-            `buzz messages send --reply-to <event-id> --surface auto`.\n\
+            When a Buzz message reports to a person, send it as a new channel message\n\
+            (`buzz messages send` without `--reply-to`), never as a reply to an old message.\n\
          4. If there are no pending actions or mentions, end your turn immediately.\n\n\
          Do not run `buzz channels list` or `buzz messages search` unless you have a specific reason.\n\
          Do not invent work — only act on items surfaced by the feed commands."

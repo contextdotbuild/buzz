@@ -1180,31 +1180,28 @@ pub(crate) fn format_event_block(
 /// top level.
 fn append_reply_instruction(s: &mut String, event_id: &str) {
     s.push_str(&format!(
-        "\nIMPORTANT: For ordinary replies in this turn, use \
-         `--reply-to {event_id} --surface auto` on `buzz messages send`. \
-         Buzz keeps the thread one level deep and shows your reply on the \
-         channel timeline when the conversation has moved on, so do not post \
-         at the channel root just to be seen. Only if the human explicitly asks \
-         for a separate channel-root, top-level, or broadcast post, send that \
+        "\nIMPORTANT: The person wrote inside this thread, so answer inside it: \
+         use `--reply-to {event_id}` on `buzz messages send`. Buzz keeps the \
+         thread one level deep. Only if the human explicitly asks for a \
+         separate channel-root, top-level, or broadcast post, send that \
          message without `--reply-to`. \
          If the requested destination is ambiguous, ask before sending."
     ));
 }
 
-/// Append a new-thread reply instruction for a human-facing top-level mention.
+/// Append the channel-answer instruction for a human-facing top-level message.
 ///
-/// The triggering mention has no thread tags, so the agent's reply becomes the
-/// thread root. Anchoring to the triggering event (rather than leaving the
-/// choice open) prevents replying into a stale/unrelated prior thread.
-fn append_new_thread_reply_instruction(s: &mut String, event_id: &str) {
+/// The person wrote on the channel timeline, so the answer goes there too: a
+/// new channel message with no `--reply-to`. Threading the answer under the
+/// question would hide it behind a reply count, and replying into an older
+/// thread would bury it.
+fn append_channel_answer_instruction(s: &mut String, event_id: &str) {
     s.push_str(&format!(
-        "\nIMPORTANT: This is a new top-level message. For ordinary replies in \
-         this turn, use `--reply-to {event_id} --surface auto` on \
-         `buzz messages send` — the triggering message is the thread root and \
-         your reply will also show on the channel timeline. Do NOT reply into \
-         any other (older) thread. Only if the human explicitly asks for a \
-         separate channel-root, top-level, or broadcast post, send that \
-         message without `--reply-to`."
+        "\nIMPORTANT: This is a new top-level message ({event_id}). Answer it \
+         with a new channel message: run `buzz messages send` WITHOUT \
+         `--reply-to`, mentioning the person. Do NOT thread your answer under \
+         the triggering message and do NOT reply into any other (older) thread. \
+         Use `--reply-to` only for agent-to-agent coordination inside a thread."
     ));
 }
 
@@ -1238,13 +1235,9 @@ fn turn_is_human_facing(
 /// Resolve the `--reply-to` anchor for a non-DM turn.
 ///
 /// Returns `Some(triggering_event_id)` only for human-facing turns (see
-/// [`turn_is_human_facing`]), whether the trigger is top-level or inside a
-/// thread. The CLI collapses a reply to an in-thread message onto that
-/// message's original root (threads are one level deep), and with
-/// `--surface auto` it reads the trigger's own shape and age to decide whether
-/// the reply also shows on the channel timeline. Anchoring to the root here
-/// would erase that signal and make every answer look like a reply to a
-/// top-level message.
+/// [`turn_is_human_facing`]). Inside a thread the agent replies to that event
+/// (the CLI collapses it onto the thread root); for a top-level trigger the
+/// channel branch turns the anchor into a "new channel message" instruction.
 ///
 /// Returns `None` for agent↔agent turns; those replies stay inside the thread.
 fn resolve_reply_anchor(
@@ -1396,7 +1389,7 @@ fn format_context_hints(
             "\nHint: Use `buzz messages get --channel <UUID>` for recent messages if needed.",
         );
         if let Some(event_id) = reply_anchor {
-            append_new_thread_reply_instruction(&mut s, event_id);
+            append_channel_answer_instruction(&mut s, event_id);
         }
         s
     }
@@ -1599,9 +1592,9 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
 
     // 2. Context hints (with a human-aware reply anchor).
     //
-    // Human-facing turns are anchored so replies stay readable at layer 1:
-    //   - in a thread  → anchor to the triggering event (CLI collapses to depth one)
-    //   - top-level     → anchor to the triggering event (it becomes the root)
+    // Human-facing turns answer where the person asked:
+    //   - in a thread  → reply to the triggering event (CLI collapses to depth one)
+    //   - top-level     → a new channel message, no reply target
     // Agent↔agent turns get no forced anchor — deep nesting is intentional
     // there. DMs are always 1:1 with a human, so they always anchor.
     let sender_pubkey = last_event.event.pubkey.to_hex();
@@ -1942,8 +1935,8 @@ mod tests {
         let newest_id = batch.events[1].event.id.to_hex();
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {newest_id}")),
-            "reply anchor must target the newest event; prompt was:\n{prompt}"
+            prompt.contains(&format!("new top-level message ({newest_id})")),
+            "channel-answer instruction must name the newest event; prompt was:\n{prompt}"
         );
     }
 
@@ -2245,7 +2238,7 @@ mod tests {
         // Reply instruction points at the steering message itself (the CLI
         // collapses it onto thread_b's root), never at the original thread.
         assert!(
-            prompt.contains(&format!("--reply-to {steering_id} --surface auto")),
+            prompt.contains(&format!("--reply-to {steering_id}")),
             "reply instruction should target the steering message: {prompt}"
         );
         assert!(
@@ -3638,7 +3631,7 @@ mod tests {
     #[test]
     fn test_anchor_human_in_thread_uses_triggering_event() {
         // Human asks inside a thread → anchor to the triggering message. The
-        // CLI collapses it to the root; `--surface auto` needs the trigger.
+        // CLI collapses it to the root.
         let tags = thread_tags(Some(ROOT_ID), &[AGENT_A_PK]);
         let anchor = resolve_reply_anchor(HUMAN_PK, &tags, TRIGGER_ID, Some(&id_lookup()));
         assert_eq!(anchor.as_deref(), Some(TRIGGER_ID));
@@ -4340,11 +4333,11 @@ mod tests {
         };
 
         // No profile lookup → sender treated as human → human-facing thread
-        // reply anchors to the triggering message with `--surface auto`; the
+        // reply anchors to the triggering message; the
         // CLI collapses it onto the root.
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {event_id} --surface auto")),
+            prompt.contains(&format!("--reply-to {event_id}")),
             "human-facing thread reply should anchor to the triggering message"
         );
         assert!(
@@ -4352,8 +4345,8 @@ mod tests {
             "instruction should not anchor to the thread root"
         );
         assert!(
-            prompt.contains("For ordinary replies in this turn"),
-            "channel thread reply should describe reply-to as the default"
+            prompt.contains("answer inside it"),
+            "channel thread reply should tell the agent to answer inside the thread"
         );
         assert!(
             prompt.contains("send that message without `--reply-to`"),
@@ -4420,17 +4413,17 @@ mod tests {
             cancel_reason: None,
         };
 
-        // Top-level human message (no lookup → human): the reply opens a new
-        // thread anchored to the triggering event, preventing replies into a
-        // stale older thread.
+        // Top-level human message (no lookup → human): the answer is a new
+        // channel message, never a reply under the question or into an older
+        // thread.
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {event_id}")),
-            "top-level human message should anchor a new thread at the triggering event"
+            !prompt.contains(&format!("--reply-to {event_id}")),
+            "top-level human message must not be answered as a reply"
         );
         assert!(
-            prompt.contains("new top-level message"),
-            "top-level human message should use the new-thread instruction"
+            prompt.contains("new top-level message") && prompt.contains("new channel message"),
+            "top-level human message should use the channel-answer instruction"
         );
     }
 
@@ -4496,7 +4489,7 @@ mod tests {
         // message — NOT the root or the parent. The CLI collapses onto the root.
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {event_id} --surface auto")),
+            prompt.contains(&format!("--reply-to {event_id}")),
             "human-facing nested reply should anchor to the triggering event"
         );
         assert!(
@@ -4531,7 +4524,7 @@ mod tests {
 
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {event_id} --surface auto")),
+            prompt.contains(&format!("--reply-to {event_id}")),
             "human-facing thread reply should anchor to the triggering message"
         );
         assert!(
@@ -4576,7 +4569,7 @@ mod tests {
         // to that event (the CLI collapses onto its root).
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {threaded_id} --surface auto")),
+            prompt.contains(&format!("--reply-to {threaded_id}")),
             "batched prompt should anchor to the last (threaded) event"
         );
         assert!(
@@ -4613,16 +4606,16 @@ mod tests {
             cancel_reason: None,
         };
 
-        // Last event is top-level and human-facing → opens a new thread
-        // anchored to that top-level event (NOT the earlier thread's root).
+        // Last event is top-level and human-facing → answered with a new
+        // channel message that names the last event (NOT the earlier thread).
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {plain_id}")),
-            "batched top-level-last prompt should anchor to the last (top-level) event"
+            prompt.contains(&format!("new top-level message ({plain_id})")),
+            "batched top-level-last prompt should name the last (top-level) event"
         );
         assert!(
-            prompt.contains("new top-level message"),
-            "batched top-level-last prompt should use the new-thread instruction"
+            !prompt.contains("--reply-to "),
+            "batched top-level-last prompt must not instruct a reply"
         );
     }
 

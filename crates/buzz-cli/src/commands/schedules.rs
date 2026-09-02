@@ -1468,6 +1468,7 @@ fn validate_pending_action(schedule: &Schedule, pending: &PendingAction) -> Resu
             &schedule.channel_id,
             &schedule.thread_id,
             &[pending.assignee_pubkey.as_str()],
+            false,
         )?,
         ScheduleDecision::Redirect => {
             let replacement = pending.replacement_pubkey.as_ref().ok_or_else(|| {
@@ -1493,6 +1494,7 @@ fn validate_pending_action(schedule: &Schedule, pending: &PendingAction) -> Resu
             &schedule.channel_id,
             &schedule.thread_id,
             &[],
+            true,
         )?,
         ScheduleDecision::Keep => {
             return Err(invalid_stored(&schedule.id, "keep cannot be pending"));
@@ -2812,6 +2814,7 @@ fn validate_action_event_scope(
     channel_id: &str,
     thread_id: &str,
     expected_mentions: &[&str],
+    allow_channel_message: bool,
 ) -> Result<(), CliError> {
     let kind = event.kind.as_u16() as u32;
     if kind != KIND_STREAM_MESSAGE && kind != KIND_STREAM_MESSAGE_V2 {
@@ -2843,7 +2846,9 @@ fn validate_action_event_scope(
     let root = buzz_core::nip10::parse_thread_markers(&event.tags)
         .resolve()
         .map(|(root, _)| root);
-    if root.as_deref() != Some(thread_id) {
+    let in_task_thread = root.as_deref() == Some(thread_id);
+    let is_channel_message = root.is_none();
+    if !(in_task_thread || (allow_channel_message && is_channel_message)) {
         return Err(CliError::Usage(
             "follow-through action must reply directly in the exact task thread".into(),
         ));
@@ -2900,6 +2905,14 @@ fn build_action_event(
         root_event_id: root,
         parent_event_id: root,
     };
+    // A completion reports to the person who opened the obligation, usually
+    // long after that thread left the channel timeline, so it is a new
+    // channel message. Wake and redirect are agent-to-agent coordination and
+    // stay inside the task thread.
+    let thread_ref = match input.decision {
+        ScheduleDecision::Completed => None,
+        _ => Some(&thread),
+    };
     let task = schedule
         .task
         .as_ref()
@@ -2920,17 +2933,12 @@ fn build_action_event(
     let created_at = u64::try_from(now.timestamp())
         .map_err(|_| CliError::Other("decision time predates the Nostr epoch".into()))?;
     let task_state_tags = task_state_tags(task, input.decision);
-    // A completion answers the human who opened the obligation, usually long
-    // after the thread left the channel timeline, so it is surfaced as a
-    // channel row (NIP-CW broadcast). Wake and redirect are agent-to-agent
-    // coordination and stay inside the thread.
-    let surface_on_channel = matches!(input.decision, ScheduleDecision::Completed);
     let builder = buzz_sdk::build_message(
         channel,
         content,
-        Some(&thread),
+        thread_ref,
         &mentions,
-        surface_on_channel,
+        false,
         &task_state_tags,
     )
     .map_err(|error| CliError::Other(format!("action message build failed: {error}")))?
@@ -2960,6 +2968,7 @@ fn build_action_event(
             &schedule.channel_id,
             &schedule.thread_id,
             &[task.assignee_pubkey.as_str()],
+            false,
         )?,
         ScheduleDecision::Completed => validate_action_event_scope(
             &event,
@@ -2967,6 +2976,7 @@ fn build_action_event(
             &schedule.channel_id,
             &schedule.thread_id,
             &[],
+            true,
         )?,
         ScheduleDecision::Keep => {
             return Err(CliError::Usage(
@@ -3876,15 +3886,14 @@ mod tests {
         assert!(after_restart.action.contains("redirect exactly once"));
     }
 
-    fn has_broadcast_tag(event: &nostr::Event) -> bool {
-        event
-            .tags
-            .iter()
-            .any(|tag| tag.as_slice() == ["broadcast", "1"])
+    fn reply_root_of(event: &nostr::Event) -> Option<String> {
+        buzz_core::nip10::parse_thread_markers(&event.tags)
+            .resolve()
+            .map(|(root, _)| root)
     }
 
     #[test]
-    fn completion_action_is_surfaced_on_channel_but_wake_stays_in_thread() {
+    fn completion_action_is_a_channel_message_but_wake_stays_in_thread() {
         let now = Utc::now();
         let schedule = sample_schedule(now);
         let client = BuzzClient::new(
@@ -3898,10 +3907,27 @@ mod tests {
 
         let complete = reconciliation(ScheduleDecision::Completed, &receipt, now, None);
         let event = build_action_event(&client, &schedule, &complete, now).expect("complete event");
-        assert!(
-            has_broadcast_tag(&event),
-            "a completion answers the human and must be a channel-timeline row"
+        assert_eq!(
+            reply_root_of(&event),
+            None,
+            "a completion reports to the person and must be a new channel message"
         );
+        assert!(
+            !event
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["broadcast", "1"]),
+            "a channel message needs no broadcast tag"
+        );
+        validate_action_event_scope(
+            &event,
+            &event.pubkey,
+            &schedule.channel_id,
+            &schedule.thread_id,
+            &[],
+            true,
+        )
+        .expect("channel-message completion is accepted");
 
         let wake = reconciliation(
             ScheduleDecision::Wake,
@@ -3910,9 +3936,10 @@ mod tests {
             Some(now + chrono::Duration::minutes(12)),
         );
         let event = build_action_event(&client, &schedule, &wake, now).expect("wake event");
-        assert!(
-            !has_broadcast_tag(&event),
-            "a wake is agent-to-agent coordination and stays inside the thread"
+        assert_eq!(
+            reply_root_of(&event).as_deref(),
+            Some(schedule.thread_id.as_str()),
+            "a wake is agent-to-agent coordination and stays inside the task thread"
         );
     }
 
