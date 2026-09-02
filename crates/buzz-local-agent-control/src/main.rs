@@ -6,10 +6,10 @@ use clap::{error::ErrorKind, Parser};
 #[derive(Debug, Parser)]
 #[command(
     name = "buzz-local-agent-control",
-    about = "Patch existing managed Buzz agents while Buzz Desktop is stopped"
+    about = "Patch existing managed Buzz agents while Buzz Desktop and buzz-acp are stopped"
 )]
 struct Cli {
-    /// JSON request conforming to the schemaVersion 1 control contract.
+    /// JSON request conforming to a supported bounded control contract.
     #[arg(long)]
     request: PathBuf,
 

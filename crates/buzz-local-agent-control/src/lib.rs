@@ -1,9 +1,10 @@
 //! A deliberately narrow offline control surface for Buzz-managed agents.
 //!
 //! The binary edits the exact production `managed-agents.json` only while the
-//! caller's expected Desktop PID and independent Desktop process scans prove
-//! Buzz is stopped. Opaque records stay as JSON values so credentials, prompts,
-//! and arbitrary environment values never enter typed output fields.
+//! caller's expected Desktop PID and independent process scans prove Buzz
+//! Desktop and every `buzz-acp` worker are stopped. Opaque records stay as JSON
+//! values so credentials, prompts, and arbitrary environment values never enter
+//! typed output fields.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -13,11 +14,12 @@ use std::{
     process::Command,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeStruct, Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 const SCHEMA_VERSION: u32 = 1;
+const MODEL_EFFORT_SCHEMA_VERSION: u32 = 2;
 const REQUIRED_PARALLELISM: u32 = 10;
 const PRODUCTION_RUNTIME_ROOT: &str = "/Users/timi/.buzz/RUNTIMES/buzz-heartbeat";
 const CANONICAL_STORE_PATH: &str =
@@ -54,6 +56,18 @@ const ROLLBACK_TOOLCHAIN: &str = "rustc 1.95.0";
 const APPROVED_ARTIFACT_OWNER: &str = "timi";
 const APPROVED_ARTIFACT_MODE: &str = "0555";
 const CANONICAL_AGENT_COUNT: usize = 9;
+const CANONICAL_MODEL: &str = "gpt-5.6-terra";
+const CANONICAL_AGENT_EFFORTS: [(&str, &str); CANONICAL_AGENT_COUNT] = [
+    ("PM Bot", "medium"),
+    ("Mobile PM", "medium"),
+    ("Design Panda", "medium"),
+    ("Customer Comms Bot", "medium"),
+    ("Growth Bot", "medium"),
+    ("Raise Bot", "medium"),
+    ("Ops Bot", "medium"),
+    ("Contessa", "medium"),
+    ("Koder", "high"),
+];
 const ALLOWED_ENV_KEYS: [&str; 5] = [
     "BUZZ_ACP_HEARTBEAT_INTERVAL",
     "BUZZ_ACP_HEARTBEAT_MODE",
@@ -102,8 +116,34 @@ struct ControlRequest {
     env_unset: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ModelEffortRequest {
+    schema_version: u32,
+    expected_store_sha256: String,
+    expected_agent_count: usize,
+    #[serde(default)]
+    expected_desktop_pid: Option<u32>,
+    targets: Vec<ModelEffortTarget>,
+    desired_model: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ModelEffortTarget {
+    name: String,
+    pubkey: String,
+    effort_level: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestSchema {
+    schema_version: u32,
+}
+
 /// Secret-free success or dry-run receipt emitted only on stdout.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Receipt {
     schema_version: u32,
@@ -125,6 +165,55 @@ pub struct Receipt {
     acp_command_sha256: String,
     libexec_sha256: String,
     mcp_command_sha256: String,
+    #[serde(default)]
+    desired_model: Option<String>,
+    #[serde(default)]
+    medium_count: Option<usize>,
+    #[serde(default)]
+    high_count: Option<usize>,
+}
+
+impl Serialize for Receipt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.schema_version == MODEL_EFFORT_SCHEMA_VERSION {
+            let mut receipt = serializer.serialize_struct("Receipt", 9)?;
+            receipt.serialize_field("schemaVersion", &self.schema_version)?;
+            receipt.serialize_field("status", &self.status)?;
+            receipt.serialize_field("actualBeforeSha256", &self.actual_before_sha256)?;
+            receipt.serialize_field("afterSha256", &self.after_sha256)?;
+            receipt.serialize_field("agentCount", &self.agent_count)?;
+            receipt.serialize_field("changedFields", &self.changed_fields)?;
+            receipt.serialize_field("desiredModel", &self.desired_model)?;
+            receipt.serialize_field("mediumCount", &self.medium_count)?;
+            receipt.serialize_field("highCount", &self.high_count)?;
+            return receipt.end();
+        }
+
+        let mut receipt = serializer.serialize_struct("Receipt", 19)?;
+        receipt.serialize_field("schemaVersion", &self.schema_version)?;
+        receipt.serialize_field("status", &self.status)?;
+        receipt.serialize_field("expectedStoreSha256", &self.expected_store_sha256)?;
+        receipt.serialize_field("actualBeforeSha256", &self.actual_before_sha256)?;
+        receipt.serialize_field("afterSha256", &self.after_sha256)?;
+        receipt.serialize_field("storePath", &self.store_path)?;
+        receipt.serialize_field("targetPubkeys", &self.target_pubkeys)?;
+        receipt.serialize_field("changedFields", &self.changed_fields)?;
+        receipt.serialize_field("changedEnvKeys", &self.changed_env_keys)?;
+        receipt.serialize_field("parallelism", &self.parallelism)?;
+        receipt.serialize_field("acpCommand", &self.acp_command)?;
+        receipt.serialize_field("mcpCommand", &self.mcp_command)?;
+        receipt.serialize_field("agentCount", &self.agent_count)?;
+        receipt.serialize_field("releaseId", &self.release_id)?;
+        receipt.serialize_field("sourceTree", &self.source_tree)?;
+        receipt.serialize_field("manifestSha256", &self.manifest_sha256)?;
+        receipt.serialize_field("acpCommandSha256", &self.acp_command_sha256)?;
+        receipt.serialize_field("libexecSha256", &self.libexec_sha256)?;
+        receipt.serialize_field("mcpCommandSha256", &self.mcp_command_sha256)?;
+        receipt.end()
+    }
 }
 
 /// Secret-free structured failure written to stderr.
@@ -162,19 +251,29 @@ impl ErrorReceipt {
 /// An execution failure with a deliberately redacted public representation.
 #[derive(Debug)]
 pub struct ControlError {
+    schema_version: u32,
     code: &'static str,
     message: &'static str,
 }
 
 impl ControlError {
     fn new(code: &'static str, message: &'static str) -> Self {
-        Self { code, message }
+        Self {
+            schema_version: SCHEMA_VERSION,
+            code,
+            message,
+        }
+    }
+
+    fn with_schema_version(mut self, schema_version: u32) -> Self {
+        self.schema_version = schema_version;
+        self
     }
 
     /// Convert the failure into the only representation permitted on stderr.
     pub fn receipt(&self) -> ErrorReceipt {
         ErrorReceipt {
-            schema_version: SCHEMA_VERSION,
+            schema_version: self.schema_version,
             status: "error",
             code: self.code,
             message: self.message,
@@ -268,6 +367,7 @@ fn production_rollback_artifacts() -> ArtifactContract<'static> {
 
 trait ProcessInspector {
     fn ensure_desktop_absent(&self, executable: &Path) -> Result<(), ControlError>;
+    fn ensure_acp_absent(&self) -> Result<(), ControlError>;
 }
 
 struct SystemProcessInspector;
@@ -298,6 +398,16 @@ impl ProcessInspector for SystemProcessInspector {
             return Err(ControlError::new(
                 "desktop_process_alive",
                 "the canonical Buzz Desktop executable path is still live",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_acp_absent(&self) -> Result<(), ControlError> {
+        if pgrep_has_match(&["-x", "buzz-acp"])? {
+            return Err(ControlError::new(
+                "acp_process_alive",
+                "a buzz-acp worker process is still alive",
             ));
         }
         Ok(())
@@ -387,6 +497,23 @@ fn execute_with_context(
 ) -> Result<Receipt, ControlError> {
     let request_bytes = fs::read(&options.request_path)
         .map_err(|_| ControlError::new("request_read_failed", "failed to read request file"))?;
+    let schema: RequestSchema = serde_json::from_slice(&request_bytes).map_err(|_| {
+        ControlError::new(
+            "invalid_request_json",
+            "request is not valid schemaVersion 1 JSON",
+        )
+    })?;
+    if schema.schema_version == MODEL_EFFORT_SCHEMA_VERSION {
+        let request: ModelEffortRequest = serde_json::from_slice(&request_bytes).map_err(|_| {
+            ControlError::new(
+                "invalid_request_json",
+                "request is not valid schemaVersion 2 JSON",
+            )
+            .with_schema_version(MODEL_EFFORT_SCHEMA_VERSION)
+        })?;
+        return execute_model_effort(options, context, request)
+            .map_err(|error| error.with_schema_version(MODEL_EFFORT_SCHEMA_VERSION));
+    }
     let request: ControlRequest = serde_json::from_slice(&request_bytes).map_err(|_| {
         ControlError::new(
             "invalid_request_json",
@@ -431,6 +558,9 @@ fn execute_with_context(
         acp_command_sha256: request.expected_acp_command_sha256.clone(),
         libexec_sha256: request.expected_libexec_sha256.clone(),
         mcp_command_sha256: request.expected_mcp_command_sha256.clone(),
+        desired_model: None,
+        medium_count: None,
+        high_count: None,
     };
     if options.dry_run {
         return Ok(receipt);
@@ -439,6 +569,70 @@ fn execute_with_context(
     let staged_store = stage_restricted_file(&options.store_path, &candidate.bytes)?;
     validate_release_artifacts(&request, context, artifacts)?;
     ensure_desktop_stopped(request.expected_desktop_pid, context)?;
+    let current = read_secure_store(&options.store_path, context.canonical_store_path)?;
+    if current.identity != store.identity || sha256(&current.bytes) != receipt.actual_before_sha256
+    {
+        return Err(ControlError::new(
+            "store_changed_before_commit",
+            "store changed after validation; no mutation was applied",
+        ));
+    }
+    commit_staged_file(staged_store, &options.store_path, "store_commit_failed")?;
+    Ok(receipt)
+}
+
+fn execute_model_effort(
+    options: CliOptions,
+    context: &ExecutionContext<'_>,
+    request: ModelEffortRequest,
+) -> Result<Receipt, ControlError> {
+    ensure_model_effort_stopped(request.expected_desktop_pid, context)?;
+    validate_model_effort_request(&request, context)?;
+
+    let store = read_secure_store(&options.store_path, context.canonical_store_path)?;
+    let actual_before_sha256 = sha256(&store.bytes);
+    if actual_before_sha256 != request.expected_store_sha256 {
+        return Err(ControlError::new(
+            "store_hash_mismatch",
+            "store SHA-256 does not match expectedStoreSha256",
+        ));
+    }
+    let candidate = build_model_effort_candidate(&store.bytes, &request)?;
+    let after_sha256 = sha256(&candidate.bytes);
+    let receipt = Receipt {
+        schema_version: MODEL_EFFORT_SCHEMA_VERSION,
+        status: if options.dry_run {
+            "dry_run".to_owned()
+        } else {
+            "applied".to_owned()
+        },
+        expected_store_sha256: String::new(),
+        actual_before_sha256,
+        after_sha256,
+        store_path: String::new(),
+        target_pubkeys: Vec::new(),
+        changed_fields: candidate.changed_fields,
+        changed_env_keys: Vec::new(),
+        parallelism: 0,
+        acp_command: String::new(),
+        mcp_command: String::new(),
+        agent_count: candidate.agent_count,
+        release_id: String::new(),
+        source_tree: String::new(),
+        manifest_sha256: String::new(),
+        acp_command_sha256: String::new(),
+        libexec_sha256: String::new(),
+        mcp_command_sha256: String::new(),
+        desired_model: Some(CANONICAL_MODEL.to_owned()),
+        medium_count: Some(CANONICAL_AGENT_COUNT - 1),
+        high_count: Some(1),
+    };
+    if options.dry_run {
+        return Ok(receipt);
+    }
+
+    let staged_store = stage_restricted_file(&options.store_path, &candidate.bytes)?;
+    ensure_model_effort_stopped(request.expected_desktop_pid, context)?;
     let current = read_secure_store(&options.store_path, context.canonical_store_path)?;
     if current.identity != store.identity || sha256(&current.bytes) != receipt.actual_before_sha256
     {
@@ -540,6 +734,89 @@ fn validate_request<'a>(
     validate_requested_artifact_contract(request, context)
 }
 
+fn validate_model_effort_request(
+    request: &ModelEffortRequest,
+    context: &ExecutionContext<'_>,
+) -> Result<(), ControlError> {
+    if request.schema_version != MODEL_EFFORT_SCHEMA_VERSION {
+        return Err(ControlError::new(
+            "unsupported_schema_version",
+            "schemaVersion must equal 2",
+        ));
+    }
+    if !is_lower_hex(&request.expected_store_sha256, 64) {
+        return Err(ControlError::new(
+            "invalid_expected_hash",
+            "expectedStoreSha256 must be 64 lowercase hexadecimal characters",
+        ));
+    }
+    if request.expected_agent_count != CANONICAL_AGENT_COUNT
+        || context.expected_agent_count != CANONICAL_AGENT_COUNT
+    {
+        return Err(ControlError::new(
+            "invalid_expected_agent_count",
+            "expectedAgentCount must equal the canonical fleet size of 9",
+        ));
+    }
+    if request.desired_model != CANONICAL_MODEL {
+        return Err(ControlError::new(
+            "invalid_desired_model",
+            "desiredModel must equal the canonical fleet model",
+        ));
+    }
+    if request.targets.len() != CANONICAL_AGENT_COUNT {
+        return Err(ControlError::new(
+            "invalid_target_count",
+            "targets must contain the complete canonical fleet of 9 identities",
+        ));
+    }
+
+    let canonical_efforts: HashMap<&str, &str> = CANONICAL_AGENT_EFFORTS.into_iter().collect();
+    let mut names = HashSet::with_capacity(request.targets.len());
+    let mut pubkeys = HashSet::with_capacity(request.targets.len());
+    for target in &request.targets {
+        if !is_lower_hex(&target.pubkey, 64) {
+            return Err(ControlError::new(
+                "invalid_target_pubkey",
+                "every target public key must be 64 lowercase hexadecimal characters",
+            ));
+        }
+        if !pubkeys.insert(target.pubkey.as_str()) {
+            return Err(ControlError::new(
+                "duplicate_target_pubkey",
+                "target public keys must be unique",
+            ));
+        }
+        if !names.insert(target.name.as_str()) {
+            return Err(ControlError::new(
+                "duplicate_target_name",
+                "canonical target names must appear exactly once",
+            ));
+        }
+        let expected_effort = canonical_efforts.get(target.name.as_str()).ok_or_else(|| {
+            ControlError::new(
+                "invalid_target_name",
+                "every target name must belong to the canonical nine-agent fleet",
+            )
+        })?;
+        if target.effort_level != *expected_effort {
+            return Err(ControlError::new(
+                "invalid_target_effort",
+                "every effortLevel must match the canonical agent profile",
+            ));
+        }
+    }
+    if names.len() != canonical_efforts.len()
+        || canonical_efforts.keys().any(|name| !names.contains(name))
+    {
+        return Err(ControlError::new(
+            "target_name_set_mismatch",
+            "targets must contain every canonical agent name exactly once",
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_desktop_stopped(
     expected_pid: Option<u32>,
     context: &ExecutionContext<'_>,
@@ -548,6 +825,14 @@ fn ensure_desktop_stopped(
     context
         .process_inspector
         .ensure_desktop_absent(context.desktop_executable)
+}
+
+fn ensure_model_effort_stopped(
+    expected_pid: Option<u32>,
+    context: &ExecutionContext<'_>,
+) -> Result<(), ControlError> {
+    ensure_desktop_stopped(expected_pid, context)?;
+    context.process_inspector.ensure_acp_absent()
 }
 
 #[cfg(unix)]
@@ -1209,6 +1494,257 @@ fn build_candidate(bytes: &[u8], request: &ControlRequest) -> Result<Candidate, 
         changed_env_keys,
         agent_count: keyed_indices.len(),
     })
+}
+
+fn build_model_effort_candidate(
+    bytes: &[u8],
+    request: &ModelEffortRequest,
+) -> Result<Candidate, ControlError> {
+    let original: Value = serde_json::from_slice(bytes).map_err(|_| {
+        ControlError::new(
+            "invalid_store_json",
+            "managed-agent store is not a valid JSON array",
+        )
+    })?;
+    let original_records = original.as_array().ok_or_else(|| {
+        ControlError::new(
+            "invalid_store_shape",
+            "managed-agent store must be a JSON array",
+        )
+    })?;
+    let mut keyed_indices: HashMap<&str, usize> = HashMap::new();
+    let mut keyless_indices = Vec::new();
+    for (index, record) in original_records.iter().enumerate() {
+        let object = record.as_object().ok_or_else(|| {
+            ControlError::new(
+                "invalid_store_record",
+                "every managed-agent store record must be a JSON object",
+            )
+        })?;
+        let pubkey = object
+            .get("pubkey")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ControlError::new(
+                    "invalid_store_pubkey",
+                    "every managed-agent store record must contain a string pubkey",
+                )
+            })?;
+        if pubkey.is_empty() {
+            keyless_indices.push(index);
+            continue;
+        }
+        if !is_lower_hex(pubkey, 64) {
+            return Err(ControlError::new(
+                "invalid_store_pubkey",
+                "every nonempty store public key must be 64 lowercase hexadecimal characters",
+            ));
+        }
+        if keyed_indices.insert(pubkey, index).is_some() {
+            return Err(ControlError::new(
+                "duplicate_store_pubkey",
+                "managed-agent store contains a duplicate nonempty public key",
+            ));
+        }
+    }
+    if keyed_indices.len() != CANONICAL_AGENT_COUNT {
+        return Err(ControlError::new(
+            "agent_count_mismatch",
+            "managed-agent identity count does not match the canonical fleet size",
+        ));
+    }
+    let targets_by_pubkey: HashMap<&str, &ModelEffortTarget> = request
+        .targets
+        .iter()
+        .map(|target| (target.pubkey.as_str(), target))
+        .collect();
+    let requested: HashSet<&str> = targets_by_pubkey.keys().copied().collect();
+    let stored: HashSet<&str> = keyed_indices.keys().copied().collect();
+    if requested != stored {
+        return Err(ControlError::new(
+            "target_set_mismatch",
+            "targets must exactly equal all nonempty store identities",
+        ));
+    }
+
+    let mut target_indices = Vec::with_capacity(CANONICAL_AGENT_COUNT);
+    let mut source_indices = Vec::with_capacity(CANONICAL_AGENT_COUNT);
+    let mut persona_ids = HashSet::with_capacity(CANONICAL_AGENT_COUNT);
+    for target in &request.targets {
+        let target_index = keyed_indices
+            .get(target.pubkey.as_str())
+            .copied()
+            .ok_or_else(diff_error)?;
+        let object = original_records[target_index]
+            .as_object()
+            .ok_or_else(diff_error)?;
+        if object.get("name").and_then(Value::as_str) != Some(target.name.as_str()) {
+            return Err(ControlError::new(
+                "target_name_mismatch",
+                "a target public key does not match its canonical agent name",
+            ));
+        }
+        let persona_id = object
+            .get("persona_id")
+            .and_then(Value::as_str)
+            .filter(|persona_id| !persona_id.is_empty())
+            .ok_or_else(|| {
+                ControlError::new(
+                    "missing_target_persona_id",
+                    "every target must link to a keyless source definition",
+                )
+            })?;
+        if !persona_ids.insert(persona_id) {
+            return Err(ControlError::new(
+                "duplicate_target_persona_id",
+                "target persona links must be one-to-one",
+            ));
+        }
+        let mut source_index = None;
+        for keyless_index in &keyless_indices {
+            let definition = original_records[*keyless_index]
+                .as_object()
+                .ok_or_else(diff_error)?;
+            if definition.get("slug").and_then(Value::as_str) != Some(persona_id) {
+                continue;
+            }
+            if source_index.replace(*keyless_index).is_some() {
+                return Err(ControlError::new(
+                    "duplicate_source_definition",
+                    "a target persona_id matches more than one keyless source definition",
+                ));
+            }
+        }
+        let source_index = source_index.ok_or_else(|| {
+            ControlError::new(
+                "source_definition_mismatch",
+                "a target persona_id does not match exactly one keyless source definition slug",
+            )
+        })?;
+        target_indices.push(target_index);
+        source_indices.push(source_index);
+    }
+
+    let mut candidate = original.clone();
+    {
+        let candidate_records = candidate.as_array_mut().ok_or_else(diff_error)?;
+        for ((target, target_index), source_index) in request
+            .targets
+            .iter()
+            .zip(&target_indices)
+            .zip(&source_indices)
+        {
+            let target_object = candidate_records[*target_index]
+                .as_object_mut()
+                .ok_or_else(diff_error)?;
+            target_object.insert(
+                "model".to_owned(),
+                Value::String(request.desired_model.clone()),
+            );
+            target_object.insert(
+                "effort_level".to_owned(),
+                Value::String(target.effort_level.clone()),
+            );
+            let source_object = candidate_records[*source_index]
+                .as_object_mut()
+                .ok_or_else(diff_error)?;
+            source_object.insert(
+                "model".to_owned(),
+                Value::String(request.desired_model.clone()),
+            );
+        }
+    }
+    validate_model_effort_diff(&original, &candidate, &target_indices, &source_indices)?;
+
+    let candidate_records = candidate.as_array().ok_or_else(diff_error)?;
+    let mut changed_fields = BTreeSet::new();
+    for index in &target_indices {
+        let before = original_records[*index]
+            .as_object()
+            .ok_or_else(diff_error)?;
+        let after = candidate_records[*index]
+            .as_object()
+            .ok_or_else(diff_error)?;
+        for field in ["effort_level", "model"] {
+            if before.get(field) != after.get(field) {
+                changed_fields.insert(field.to_owned());
+            }
+        }
+    }
+    for index in &source_indices {
+        let before = original_records[*index]
+            .as_object()
+            .ok_or_else(diff_error)?;
+        let after = candidate_records[*index]
+            .as_object()
+            .ok_or_else(diff_error)?;
+        if before.get("model") != after.get("model") {
+            changed_fields.insert("model".to_owned());
+        }
+    }
+    let mut candidate_bytes = serde_json::to_vec_pretty(&candidate).map_err(|_| {
+        ControlError::new(
+            "store_serialization_failed",
+            "failed to serialize validated managed-agent candidate",
+        )
+    })?;
+    if bytes.ends_with(b"\n") {
+        candidate_bytes.push(b'\n');
+    }
+    Ok(Candidate {
+        bytes: candidate_bytes,
+        changed_fields: changed_fields.into_iter().collect(),
+        changed_env_keys: Vec::new(),
+        agent_count: keyed_indices.len(),
+    })
+}
+
+fn validate_model_effort_diff(
+    original: &Value,
+    candidate: &Value,
+    target_indices: &[usize],
+    source_indices: &[usize],
+) -> Result<(), ControlError> {
+    let original_records = original.as_array().ok_or_else(diff_error)?;
+    let candidate_records = candidate.as_array().ok_or_else(diff_error)?;
+    if original_records.len() != candidate_records.len() {
+        return Err(diff_error());
+    }
+    let targets: HashSet<usize> = target_indices.iter().copied().collect();
+    let sources: HashSet<usize> = source_indices.iter().copied().collect();
+    if targets.len() != target_indices.len()
+        || sources.len() != source_indices.len()
+        || targets.iter().any(|index| sources.contains(index))
+    {
+        return Err(diff_error());
+    }
+    for (index, (before, after)) in original_records
+        .iter()
+        .zip(candidate_records.iter())
+        .enumerate()
+    {
+        if !targets.contains(&index) && !sources.contains(&index) {
+            if before != after {
+                return Err(diff_error());
+            }
+            continue;
+        }
+        let mut protected_before = before.as_object().ok_or_else(diff_error)?.clone();
+        let mut protected_after = after.as_object().ok_or_else(diff_error)?.clone();
+        let allowed_fields: &[&str] = if targets.contains(&index) {
+            &["model", "effort_level"]
+        } else {
+            &["model"]
+        };
+        for field in allowed_fields {
+            protected_before.remove(*field);
+            protected_after.remove(*field);
+        }
+        if protected_before != protected_after {
+            return Err(diff_error());
+        }
+    }
+    Ok(())
 }
 
 fn patch_record(

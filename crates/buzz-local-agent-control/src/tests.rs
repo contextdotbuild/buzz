@@ -249,6 +249,32 @@ impl Fixture {
         })
     }
 
+    fn model_effort_request(&self) -> Value {
+        let targets: Vec<Value> = CANONICAL_AGENT_EFFORTS
+            .iter()
+            .zip(&self.pubkeys)
+            .map(|((name, effort_level), pubkey)| {
+                json!({
+                    "name": name,
+                    "pubkey": pubkey,
+                    "effortLevel": effort_level
+                })
+            })
+            .collect();
+        json!({
+            "schemaVersion": MODEL_EFFORT_SCHEMA_VERSION,
+            "expectedStoreSha256": sha256(&self.store_bytes()),
+            "expectedAgentCount": CANONICAL_AGENT_COUNT,
+            "expectedDesktopPid": dead_pid(),
+            "targets": targets,
+            "desiredModel": CANONICAL_MODEL
+        })
+    }
+
+    fn prepare_model_effort_store(&self) {
+        write_store(&self.store, &model_effort_records(&self.pubkeys));
+    }
+
     fn context<'a>(&'a self, inspector: &'a dyn ProcessInspector) -> ExecutionContext<'a> {
         self.context_with(inspector, &self.owner)
     }
@@ -340,7 +366,9 @@ impl Fixture {
 #[derive(Default)]
 struct CountingInspector {
     calls: Cell<usize>,
+    acp_calls: Cell<usize>,
     fail_on_call: Option<usize>,
+    acp_fail_on_call: Option<usize>,
     mutate_on_call: Option<(usize, PathBuf, Vec<u8>, u32)>,
 }
 
@@ -348,7 +376,19 @@ impl CountingInspector {
     fn fail_on(call: usize) -> Self {
         Self {
             calls: Cell::new(0),
+            acp_calls: Cell::new(0),
             fail_on_call: Some(call),
+            acp_fail_on_call: None,
+            mutate_on_call: None,
+        }
+    }
+
+    fn fail_on_acp(call: usize) -> Self {
+        Self {
+            calls: Cell::new(0),
+            acp_calls: Cell::new(0),
+            fail_on_call: None,
+            acp_fail_on_call: Some(call),
             mutate_on_call: None,
         }
     }
@@ -356,7 +396,9 @@ impl CountingInspector {
     fn mutate_on(call: usize, path: PathBuf, bytes: Vec<u8>, mode: u32) -> Self {
         Self {
             calls: Cell::new(0),
+            acp_calls: Cell::new(0),
             fail_on_call: None,
+            acp_fail_on_call: None,
             mutate_on_call: Some((call, path, bytes, mode)),
         }
     }
@@ -375,6 +417,18 @@ impl ProcessInspector for CountingInspector {
             return Err(ControlError::new(
                 "desktop_process_alive",
                 "test Desktop process appeared at final fence",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_acp_absent(&self) -> Result<(), ControlError> {
+        let call = self.acp_calls.get() + 1;
+        self.acp_calls.set(call);
+        if self.acp_fail_on_call == Some(call) {
+            return Err(ControlError::new(
+                "acp_process_alive",
+                "test buzz-acp worker survived at final fence",
             ));
         }
         Ok(())
@@ -438,6 +492,37 @@ fn base_records(pubkeys: &[String]) -> Value {
         "unknown_definition_field": {"nested": true}
     }));
     Value::Array(records)
+}
+
+fn model_effort_records(pubkeys: &[String]) -> Value {
+    let base = base_records(pubkeys);
+    let base_records = base.as_array().expect("base records");
+    let mut definitions = Vec::with_capacity(base_records.len());
+    let mut instances = Vec::with_capacity(CANONICAL_AGENT_COUNT);
+    for (index, ((name, _), pubkey)) in CANONICAL_AGENT_EFFORTS.iter().zip(pubkeys).enumerate() {
+        let slug = format!("persona-{index}");
+        let mut definition = base_records[index * 2 + 1].clone();
+        definition["name"] = json!(name);
+        definition["display_name"] = json!(name);
+        definition["slug"] = json!(slug);
+        definition["persona_id"] = Value::Null;
+        definition["model"] = json!(format!("gpt-secret-definition-model-{index}"));
+        definitions.push(definition);
+
+        let mut instance = base_records[index * 2].clone();
+        instance["name"] = json!(name);
+        instance["pubkey"] = json!(pubkey);
+        instance["persona_id"] = json!(slug);
+        instance["effort_level"] = json!(format!("opaque-old-effort-{index}"));
+        instances.push(instance);
+    }
+    definitions.extend(instances);
+    definitions.extend(
+        base_records[CANONICAL_AGENT_COUNT * 2..]
+            .iter()
+            .cloned(),
+    );
+    Value::Array(definitions)
 }
 
 fn write_store(path: &Path, records: &Value) {
@@ -1198,4 +1283,490 @@ fn wrong_store_hash_and_live_expected_pid_leave_store_unchanged() {
         "desktop_pid_alive"
     );
     assert_eq!(pid_fixture.store_bytes(), pid_before);
+}
+
+#[test]
+fn schema_v1_receipt_and_model_effort_behavior_remain_unchanged() {
+    let fixture = Fixture::new();
+    let before = parse_store(&fixture);
+    let before_sha256 = sha256(&fixture.store_bytes());
+    let receipt = fixture
+        .execute(&fixture.request(), false, &CountingInspector::default())
+        .expect("apply schema v1 patch");
+    let after = parse_store(&fixture);
+    for (before_record, after_record) in before
+        .as_array()
+        .expect("before records")
+        .iter()
+        .zip(after.as_array().expect("after records"))
+    {
+        assert_eq!(before_record.get("model"), after_record.get("model"));
+        assert_eq!(
+            before_record.get("effort_level"),
+            after_record.get("effort_level")
+        );
+    }
+    let serialized = serde_json::to_value(&receipt).expect("serialize v1 receipt");
+    assert_eq!(
+        serialized,
+        json!({
+            "schemaVersion": 1,
+            "status": "applied",
+            "expectedStoreSha256": before_sha256,
+            "actualBeforeSha256": before_sha256,
+            "afterSha256": sha256(&fixture.store_bytes()),
+            "storePath": fixture.store.to_string_lossy(),
+            "targetPubkeys": fixture.pubkeys,
+            "changedFields": ["acp_command", "env_vars", "mcp_command"],
+            "changedEnvKeys": [
+                "BUZZ_ACP_HEARTBEAT_INTERVAL",
+                "BUZZ_ACP_HEARTBEAT_MODE",
+                "BUZZ_ACP_IDLE_POOL_SLEEP",
+                "BUZZ_ACP_LAZY_POOL"
+            ],
+            "parallelism": 10,
+            "acpCommand": fixture.wrapper.to_string_lossy(),
+            "mcpCommand": fixture.mcp.to_string_lossy(),
+            "agentCount": 9,
+            "releaseId": RELEASE_ID,
+            "sourceTree": SOURCE_TREE,
+            "manifestSha256": fixture.manifest_hash,
+            "acpCommandSha256": fixture.wrapper_hash,
+            "libexecSha256": fixture.libexec_hash,
+            "mcpCommandSha256": fixture.mcp_hash
+        })
+    );
+}
+
+#[test]
+fn schema_v2_applies_exact_model_effort_profile_and_preserves_opaque_data() {
+    let fixture = Fixture::new();
+    fixture.prepare_model_effort_store();
+    let before = parse_store(&fixture);
+    let inspector = CountingInspector::default();
+    let receipt = fixture
+        .execute(&fixture.model_effort_request(), false, &inspector)
+        .expect("apply schema v2 model/effort reset");
+    let after = parse_store(&fixture);
+    assert_eq!(inspector.calls.get(), 2, "both Desktop fences must run");
+    assert_eq!(inspector.acp_calls.get(), 2, "both ACP fences must run");
+    assert_eq!(
+        after.as_array().expect("after records").len(),
+        before.as_array().expect("before records").len()
+    );
+
+    let target_persona_ids: HashSet<&str> = before
+        .as_array()
+        .expect("before records")
+        .iter()
+        .filter(|record| record["pubkey"] != "")
+        .map(|record| {
+            record["persona_id"]
+                .as_str()
+                .expect("target persona id")
+        })
+        .collect();
+    let mut linked_source_slugs = HashSet::new();
+
+    for (before_record, after_record) in before
+        .as_array()
+        .expect("before records")
+        .iter()
+        .zip(after.as_array().expect("after records"))
+    {
+        if before_record["pubkey"] == "" {
+            let is_target_linked = before_record
+                .get("slug")
+                .and_then(Value::as_str)
+                .is_some_and(|slug| target_persona_ids.contains(slug));
+            if !is_target_linked {
+                assert_eq!(
+                    after_record, before_record,
+                    "unrelated keyless definition changed"
+                );
+                continue;
+            }
+            assert_eq!(after_record["model"], CANONICAL_MODEL);
+            assert_ne!(before_record["model"], after_record["model"]);
+            let mut protected_before = before_record.as_object().expect("before object").clone();
+            let mut protected_after = after_record.as_object().expect("after object").clone();
+            protected_before.remove("model");
+            protected_after.remove("model");
+            assert_eq!(
+                protected_after, protected_before,
+                "source definition opaque field changed"
+            );
+            continue;
+        }
+        let name = before_record["name"].as_str().expect("agent name");
+        let persona_id = before_record["persona_id"]
+            .as_str()
+            .expect("linked persona id");
+        assert!(
+            linked_source_slugs.insert(persona_id),
+            "source definition linked more than once"
+        );
+        let source = after
+            .as_array()
+            .expect("after records")
+            .iter()
+            .find(|record| record["pubkey"] == "" && record["slug"] == persona_id)
+            .expect("linked source definition");
+        assert_eq!(source["model"], CANONICAL_MODEL);
+        let expected_effort = CANONICAL_AGENT_EFFORTS
+            .iter()
+            .find_map(|(canonical_name, effort)| (*canonical_name == name).then_some(*effort))
+            .expect("canonical agent name");
+        assert_eq!(after_record["model"], CANONICAL_MODEL);
+        assert_eq!(after_record["effort_level"], expected_effort);
+        assert_ne!(before_record["model"], after_record["model"]);
+        assert_ne!(before_record["effort_level"], after_record["effort_level"]);
+
+        let mut protected_before = before_record.as_object().expect("before object").clone();
+        let mut protected_after = after_record.as_object().expect("after object").clone();
+        for field in ["model", "effort_level"] {
+            protected_before.remove(field);
+            protected_after.remove(field);
+        }
+        assert_eq!(protected_after, protected_before, "opaque field changed");
+    }
+    assert_eq!(linked_source_slugs.len(), CANONICAL_AGENT_COUNT);
+
+    assert_eq!(
+        receipt.changed_fields,
+        vec!["effort_level".to_owned(), "model".to_owned()]
+    );
+    assert_eq!(receipt.after_sha256, sha256(&fixture.store_bytes()));
+    let serialized = serde_json::to_value(&receipt).expect("serialize v2 receipt");
+    let keys: BTreeSet<&str> = serialized
+        .as_object()
+        .expect("v2 receipt object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from([
+            "schemaVersion",
+            "status",
+            "actualBeforeSha256",
+            "afterSha256",
+            "agentCount",
+            "changedFields",
+            "desiredModel",
+            "mediumCount",
+            "highCount",
+        ])
+    );
+    assert_eq!(serialized["schemaVersion"], MODEL_EFFORT_SCHEMA_VERSION);
+    assert_eq!(serialized["agentCount"], CANONICAL_AGENT_COUNT);
+    assert_eq!(serialized["desiredModel"], CANONICAL_MODEL);
+    assert_eq!(serialized["mediumCount"], 8);
+    assert_eq!(serialized["highCount"], 1);
+    let output = serde_json::to_string(&receipt).expect("serialize v2 output");
+    for forbidden in fixture.pubkeys.iter().map(String::as_str).chain([
+        "nsec1-secret",
+        "secret-auth",
+        "secret system prompt",
+        "ARBITRARY_SECRET",
+        "private_key_nsec",
+        "system_prompt",
+        "buzz-acp",
+        "buzz-dev-mcp",
+        "PM Bot",
+        "Koder",
+    ]) {
+        assert!(!output.contains(forbidden), "v2 receipt leaked {forbidden}");
+    }
+    for forbidden_path in [&fixture.store, &fixture.wrapper, &fixture.mcp] {
+        assert!(
+            !output.contains(forbidden_path.to_string_lossy().as_ref()),
+            "v2 receipt leaked a path"
+        );
+    }
+}
+
+#[test]
+fn schema_v2_rejects_wrong_model_and_effort_without_mutation() {
+    let model_fixture = Fixture::new();
+    model_fixture.prepare_model_effort_store();
+    let model_before = model_fixture.store_bytes();
+    let mut wrong_model = model_fixture.model_effort_request();
+    wrong_model["desiredModel"] = json!("gpt-5.6-sol");
+    assert_eq!(
+        error_code(model_fixture.execute(&wrong_model, false, &CountingInspector::default())),
+        "invalid_desired_model"
+    );
+    assert_eq!(model_fixture.store_bytes(), model_before);
+
+    let effort_fixture = Fixture::new();
+    effort_fixture.prepare_model_effort_store();
+    let effort_before = effort_fixture.store_bytes();
+    let mut wrong_effort = effort_fixture.model_effort_request();
+    wrong_effort["targets"][0]["effortLevel"] = json!("high");
+    assert_eq!(
+        error_code(effort_fixture.execute(&wrong_effort, false, &CountingInspector::default())),
+        "invalid_target_effort"
+    );
+    assert_eq!(effort_fixture.store_bytes(), effort_before);
+}
+
+#[test]
+fn schema_v2_rejects_wrong_name_binding_missing_and_extra_targets() {
+    let mapping_fixture = Fixture::new();
+    mapping_fixture.prepare_model_effort_store();
+    let mapping_before = mapping_fixture.store_bytes();
+    let mut wrong_mapping = mapping_fixture.model_effort_request();
+    let first_pubkey = wrong_mapping["targets"][0]["pubkey"].clone();
+    wrong_mapping["targets"][0]["pubkey"] = wrong_mapping["targets"][1]["pubkey"].clone();
+    wrong_mapping["targets"][1]["pubkey"] = first_pubkey;
+    assert_eq!(
+        error_code(mapping_fixture.execute(&wrong_mapping, false, &CountingInspector::default())),
+        "target_name_mismatch"
+    );
+    assert_eq!(mapping_fixture.store_bytes(), mapping_before);
+
+    let stored_name_fixture = Fixture::new();
+    stored_name_fixture.prepare_model_effort_store();
+    let mut wrong_stored_name = parse_store(&stored_name_fixture);
+    wrong_stored_name[CANONICAL_AGENT_COUNT]["name"] = json!("PM Bot renamed");
+    write_store(&stored_name_fixture.store, &wrong_stored_name);
+    let stored_name_before = stored_name_fixture.store_bytes();
+    let stored_name_request = stored_name_fixture.model_effort_request();
+    assert_eq!(
+        error_code(stored_name_fixture.execute(
+            &stored_name_request,
+            false,
+            &CountingInspector::default()
+        )),
+        "target_name_mismatch"
+    );
+    assert_eq!(stored_name_fixture.store_bytes(), stored_name_before);
+
+    let missing_fixture = Fixture::new();
+    missing_fixture.prepare_model_effort_store();
+    let missing_before = missing_fixture.store_bytes();
+    let mut missing = missing_fixture.model_effort_request();
+    missing["targets"]
+        .as_array_mut()
+        .expect("targets array")
+        .pop();
+    assert_eq!(
+        error_code(missing_fixture.execute(&missing, false, &CountingInspector::default())),
+        "invalid_target_count"
+    );
+    assert_eq!(missing_fixture.store_bytes(), missing_before);
+
+    let extra_fixture = Fixture::new();
+    extra_fixture.prepare_model_effort_store();
+    let extra_before = extra_fixture.store_bytes();
+    let mut extra = extra_fixture.model_effort_request();
+    let extra_target = extra["targets"][0].clone();
+    extra["targets"]
+        .as_array_mut()
+        .expect("targets array")
+        .push(extra_target);
+    assert_eq!(
+        error_code(extra_fixture.execute(&extra, false, &CountingInspector::default())),
+        "invalid_target_count"
+    );
+    assert_eq!(extra_fixture.store_bytes(), extra_before);
+}
+
+#[test]
+fn schema_v2_rejects_invalid_source_definition_mappings_without_mutation() {
+    let absent_fixture = Fixture::new();
+    absent_fixture.prepare_model_effort_store();
+    let mut absent = parse_store(&absent_fixture);
+    absent.as_array_mut().expect("records").remove(0);
+    write_store(&absent_fixture.store, &absent);
+    let absent_before = absent_fixture.store_bytes();
+    assert_eq!(
+        error_code(absent_fixture.execute(
+            &absent_fixture.model_effort_request(),
+            false,
+            &CountingInspector::default()
+        )),
+        "source_definition_mismatch"
+    );
+    assert_eq!(absent_fixture.store_bytes(), absent_before);
+
+    let duplicate_fixture = Fixture::new();
+    duplicate_fixture.prepare_model_effort_store();
+    let mut duplicate = parse_store(&duplicate_fixture);
+    duplicate[1]["slug"] = duplicate[0]["slug"].clone();
+    write_store(&duplicate_fixture.store, &duplicate);
+    let duplicate_before = duplicate_fixture.store_bytes();
+    assert_eq!(
+        error_code(duplicate_fixture.execute(
+            &duplicate_fixture.model_effort_request(),
+            false,
+            &CountingInspector::default()
+        )),
+        "duplicate_source_definition"
+    );
+    assert_eq!(duplicate_fixture.store_bytes(), duplicate_before);
+
+    let mismatch_fixture = Fixture::new();
+    mismatch_fixture.prepare_model_effort_store();
+    let mut mismatch = parse_store(&mismatch_fixture);
+    mismatch[CANONICAL_AGENT_COUNT]["persona_id"] = json!("persona-does-not-exist");
+    write_store(&mismatch_fixture.store, &mismatch);
+    let mismatch_before = mismatch_fixture.store_bytes();
+    assert_eq!(
+        error_code(mismatch_fixture.execute(
+            &mismatch_fixture.model_effort_request(),
+            false,
+            &CountingInspector::default()
+        )),
+        "source_definition_mismatch"
+    );
+    assert_eq!(mismatch_fixture.store_bytes(), mismatch_before);
+
+    let extra_fixture = Fixture::new();
+    extra_fixture.prepare_model_effort_store();
+    let mut extra = parse_store(&extra_fixture);
+    let extra_definition = json!({
+        "pubkey": "",
+        "slug": "persona-unrelated",
+        "name": "Unrelated definition",
+        "model": "gpt-unrelated-model",
+        "opaque": {"preserve": [3, 2, 1]}
+    });
+    let extra_index = extra.as_array().expect("records").len();
+    extra
+        .as_array_mut()
+        .expect("records")
+        .push(extra_definition.clone());
+    write_store(&extra_fixture.store, &extra);
+    extra_fixture
+        .execute(
+            &extra_fixture.model_effort_request(),
+            false,
+            &CountingInspector::default()
+        )
+        .expect("unrelated definition must not block schema v2");
+    let extra_after = parse_store(&extra_fixture);
+    assert_eq!(extra_after[extra_index], extra_definition);
+}
+
+#[test]
+fn schema_v2_rejects_malformed_pubkey_count_and_hash_without_mutation() {
+    let pubkey_fixture = Fixture::new();
+    pubkey_fixture.prepare_model_effort_store();
+    let pubkey_before = pubkey_fixture.store_bytes();
+    let mut wrong_pubkey = pubkey_fixture.model_effort_request();
+    wrong_pubkey["targets"][0]["pubkey"] = json!("f".repeat(64));
+    assert_eq!(
+        error_code(pubkey_fixture.execute(&wrong_pubkey, false, &CountingInspector::default())),
+        "target_set_mismatch"
+    );
+    assert_eq!(pubkey_fixture.store_bytes(), pubkey_before);
+
+    let malformed_fixture = Fixture::new();
+    malformed_fixture.prepare_model_effort_store();
+    let malformed_before = malformed_fixture.store_bytes();
+    let mut malformed = malformed_fixture.model_effort_request();
+    malformed["targets"][0]
+        .as_object_mut()
+        .expect("target object")
+        .remove("name");
+    assert_eq!(
+        error_code(malformed_fixture.execute(&malformed, false, &CountingInspector::default())),
+        "invalid_request_json"
+    );
+    assert_eq!(malformed_fixture.store_bytes(), malformed_before);
+
+    let count_fixture = Fixture::new();
+    count_fixture.prepare_model_effort_store();
+    let count_before = count_fixture.store_bytes();
+    let mut wrong_count = count_fixture.model_effort_request();
+    wrong_count["expectedAgentCount"] = json!(8);
+    assert_eq!(
+        error_code(count_fixture.execute(&wrong_count, false, &CountingInspector::default())),
+        "invalid_expected_agent_count"
+    );
+    assert_eq!(count_fixture.store_bytes(), count_before);
+
+    let hash_fixture = Fixture::new();
+    hash_fixture.prepare_model_effort_store();
+    let hash_before = hash_fixture.store_bytes();
+    let mut wrong_hash = hash_fixture.model_effort_request();
+    wrong_hash["expectedStoreSha256"] = json!("0".repeat(64));
+    assert_eq!(
+        error_code(hash_fixture.execute(&wrong_hash, false, &CountingInspector::default())),
+        "store_hash_mismatch"
+    );
+    assert_eq!(hash_fixture.store_bytes(), hash_before);
+}
+
+#[test]
+fn schema_v2_final_desktop_and_store_races_do_not_commit_candidate() {
+    let desktop_fixture = Fixture::new();
+    desktop_fixture.prepare_model_effort_store();
+    let desktop_before = desktop_fixture.store_bytes();
+    let desktop_request = desktop_fixture.model_effort_request();
+    let desktop_inspector = CountingInspector::fail_on(2);
+    assert_eq!(
+        error_code(desktop_fixture.execute(&desktop_request, false, &desktop_inspector)),
+        "desktop_process_alive"
+    );
+    assert_eq!(desktop_inspector.calls.get(), 2);
+    assert_eq!(desktop_inspector.acp_calls.get(), 1);
+    assert_eq!(desktop_fixture.store_bytes(), desktop_before);
+
+    let race_fixture = Fixture::new();
+    race_fixture.prepare_model_effort_store();
+    let race_request = race_fixture.model_effort_request();
+    let mut raced_store = parse_store(&race_fixture);
+    raced_store[0]["unknown_extension"]["racing_writer"] = json!(true);
+    let mut raced_bytes = serde_json::to_vec_pretty(&raced_store).expect("serialize raced store");
+    raced_bytes.push(b'\n');
+    let race_inspector =
+        CountingInspector::mutate_on(2, race_fixture.store.clone(), raced_bytes.clone(), 0o600);
+    assert_eq!(
+        error_code(race_fixture.execute(&race_request, false, &race_inspector)),
+        "store_changed_before_commit"
+    );
+    assert_eq!(race_inspector.calls.get(), 2);
+    assert_eq!(race_inspector.acp_calls.get(), 2);
+    assert_eq!(
+        race_fixture.store_bytes(),
+        raced_bytes,
+        "operator overwrote the racing store write"
+    );
+}
+
+#[test]
+fn schema_v2_final_acp_worker_fence_failure_leaves_store_unchanged() {
+    let fixture = Fixture::new();
+    fixture.prepare_model_effort_store();
+    let before = fixture.store_bytes();
+    let request = fixture.model_effort_request();
+    let inspector = CountingInspector::fail_on_acp(2);
+
+    assert_eq!(
+        error_code(fixture.execute(&request, false, &inspector)),
+        "acp_process_alive"
+    );
+    assert_eq!(inspector.calls.get(), 2, "both process fences must run");
+    assert_eq!(inspector.acp_calls.get(), 2, "both ACP fences must run");
+    assert_eq!(fixture.store_bytes(), before);
+}
+
+#[test]
+fn schema_v2_semantic_diff_rejects_any_opaque_change() {
+    let pubkeys = test_pubkeys();
+    let original = model_effort_records(&pubkeys);
+    let mut candidate = original.clone();
+    candidate[0]["unknown_definition_field"] = json!("changed-opaque-value");
+    let target_indices: Vec<usize> =
+        (CANONICAL_AGENT_COUNT..CANONICAL_AGENT_COUNT * 2).collect();
+    let source_indices: Vec<usize> = (0..CANONICAL_AGENT_COUNT).collect();
+    assert_eq!(
+        validate_model_effort_diff(&original, &candidate, &target_indices, &source_indices)
+            .expect_err("opaque change must fail")
+            .code,
+        "candidate_diff_rejected"
+    );
 }
