@@ -2710,6 +2710,28 @@ struct ReconcileInput {
     action_content: Option<String>,
 }
 
+fn expected_reconcile_receipt_author<'a>(
+    schedule: &'a Schedule,
+    input: &ReconcileInput,
+    current_assignee_pubkey: &'a str,
+) -> &'a str {
+    let matches_checkpoint = schedule.checkpoint.as_ref().is_some_and(|checkpoint| {
+        checkpoint.receipt == input.receipt && checkpoint.material_at == input.material_at
+    });
+    if !matches_checkpoint {
+        return current_assignee_pubkey;
+    }
+
+    schedule
+        .audit
+        .iter()
+        .rev()
+        .find(|entry| entry.receipt == input.receipt && entry.material_at == input.material_at)
+        .map_or(current_assignee_pubkey, |entry| {
+            entry.assignee_pubkey.as_str()
+        })
+}
+
 fn require_due_at(input: &ReconcileInput) -> Result<&str, CliError> {
     input.due_at.as_deref().ok_or_else(|| {
         CliError::Usage("--due-at is required for keep, wake, and redirect decisions".into())
@@ -3387,11 +3409,13 @@ async fn reconcile(
             "--material-at cannot be later than the reconciliation decision".into(),
         ));
     }
+    let expected_receipt_author =
+        expected_reconcile_receipt_author(&loaded.schedule, &input, &current_task.assignee_pubkey);
     verify_task_receipt(
         client,
         &loaded.schedule.channel_id,
         &loaded.schedule.thread_id,
-        &current_task.assignee_pubkey,
+        expected_receipt_author,
         &MaterialCheckpoint {
             receipt: input.receipt.clone(),
             material_at: input.material_at.clone(),
@@ -3687,6 +3711,114 @@ mod tests {
             schedule,
             revision: "1".repeat(64),
         }
+    }
+
+    fn sample_audit_entry(
+        assignee_pubkey: &str,
+        receipt: &str,
+        material_at: &str,
+    ) -> DecisionAudit {
+        DecisionAudit {
+            claim_token: "c".repeat(32),
+            decision: ScheduleDecision::Wake,
+            at: material_at.to_owned(),
+            assignee_pubkey: assignee_pubkey.to_owned(),
+            delegation_event_id: "d".repeat(64),
+            receipt: receipt.to_owned(),
+            material_at: material_at.to_owned(),
+            next_due_at: None,
+            replacement_pubkey: None,
+            replacement_delegation_event_id: None,
+            action_event_id: None,
+            action_content: None,
+        }
+    }
+
+    #[test]
+    fn expected_reconcile_receipt_author_uses_newest_prior_assignee_for_unchanged_hand_off() {
+        let now = DateTime::parse_from_rfc3339("2026-08-26T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut schedule = sample_schedule(now);
+        let receipt = format!("buzz-event:{}", "1".repeat(64));
+        let material_at = canonical_time(now - chrono::Duration::minutes(5));
+        let older_assignee = Keys::generate().public_key().to_hex();
+        let prior_assignee = Keys::generate().public_key().to_hex();
+        let current_assignee = Keys::generate().public_key().to_hex();
+        schedule.task.as_mut().unwrap().assignee_pubkey = current_assignee.clone();
+        schedule.checkpoint = Some(MaterialCheckpoint {
+            receipt: receipt.clone(),
+            material_at: material_at.clone(),
+        });
+        schedule.audit = vec![
+            sample_audit_entry(&older_assignee, &receipt, &material_at),
+            sample_audit_entry(&prior_assignee, &receipt, &material_at),
+        ];
+        let input = reconciliation(
+            ScheduleDecision::Wake,
+            &receipt,
+            now - chrono::Duration::minutes(5),
+            Some(now + chrono::Duration::minutes(15)),
+        );
+
+        assert_eq!(
+            expected_reconcile_receipt_author(&schedule, &input, &current_assignee),
+            prior_assignee
+        );
+    }
+
+    #[test]
+    fn expected_reconcile_receipt_author_uses_current_assignee_for_changed_receipt() {
+        let now = DateTime::parse_from_rfc3339("2026-08-26T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut schedule = sample_schedule(now);
+        let checkpoint_receipt = format!("buzz-event:{}", "1".repeat(64));
+        let changed_receipt = format!("buzz-event:{}", "2".repeat(64));
+        let material_at = canonical_time(now - chrono::Duration::minutes(5));
+        let prior_assignee = Keys::generate().public_key().to_hex();
+        let current_assignee = Keys::generate().public_key().to_hex();
+        schedule.checkpoint = Some(MaterialCheckpoint {
+            receipt: checkpoint_receipt.clone(),
+            material_at: material_at.clone(),
+        });
+        schedule.audit = vec![sample_audit_entry(
+            &prior_assignee,
+            &checkpoint_receipt,
+            &material_at,
+        )];
+        let input = reconciliation(
+            ScheduleDecision::Keep,
+            &changed_receipt,
+            now - chrono::Duration::minutes(5),
+            Some(now + chrono::Duration::minutes(15)),
+        );
+
+        assert_eq!(
+            expected_reconcile_receipt_author(&schedule, &input, &current_assignee),
+            current_assignee
+        );
+    }
+
+    #[test]
+    fn expected_reconcile_receipt_author_uses_current_assignee_without_matching_audit() {
+        let now = DateTime::parse_from_rfc3339("2026-08-26T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let schedule = sample_schedule(now);
+        let checkpoint = schedule.checkpoint.as_ref().unwrap();
+        let current_assignee = schedule.task.as_ref().unwrap().assignee_pubkey.clone();
+        let input = reconciliation(
+            ScheduleDecision::Wake,
+            &checkpoint.receipt,
+            parse_time(&checkpoint.material_at, "material-at").unwrap(),
+            Some(now + chrono::Duration::minutes(15)),
+        );
+
+        assert_eq!(
+            expected_reconcile_receipt_author(&schedule, &input, &current_assignee),
+            current_assignee
+        );
     }
 
     #[test]
