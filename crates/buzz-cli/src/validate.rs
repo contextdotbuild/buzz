@@ -82,7 +82,28 @@ pub fn validate_message_content(content: &str, has_files: bool) -> Result<(), Cl
             "message content must not be empty unless at least one file is attached".into(),
         ));
     }
+    if has_literal_newline_escapes(content) {
+        return Err(CliError::Usage(
+            "message content contains literal \"\\n\" instead of newlines (a quoted shell string \
+             keeps the backslash); pass real newlines via stdin: \
+             printf 'first\\n\\nsecond\\n' | buzz messages send ... --content -"
+                .into(),
+        ));
+    }
     Ok(())
+}
+
+/// True when `content` has no real newline but carries the two-character
+/// escape `\n` outside inline code and fenced code blocks — the signature of
+/// a message built with a quoted shell string instead of stdin. Recipients
+/// would see the backslash characters, so the send is rejected with a
+/// corrective hint rather than silently rewritten (rewriting would corrupt
+/// genuine code that mentions `\n`).
+pub fn has_literal_newline_escapes(content: &str) -> bool {
+    if content.contains('\n') {
+        return false;
+    }
+    buzz_sdk::mentions::strip_code_regions(content).contains("\\n")
 }
 
 /// Percent-encode for URL path segments and query parameter values.
@@ -300,6 +321,29 @@ mod tests {
                 .to_string()
                 .contains("message content must not be empty"));
         }
+    }
+
+    #[test]
+    fn validate_message_content_rejects_literal_newline_escapes() {
+        let err = validate_message_content("first\\n\\nsecond", false).unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)));
+        assert!(
+            err.to_string().contains("--content -"),
+            "hint must name the stdin path"
+        );
+    }
+
+    #[test]
+    fn literal_newline_escapes_inside_code_or_with_real_newlines_are_allowed() {
+        // Inline code and fenced blocks legitimately mention the escape.
+        assert!(!has_literal_newline_escapes("use `\\n` to break lines"));
+        assert!(!has_literal_newline_escapes("```\nprintf(\"a\\nb\");\n```"));
+        // A message that already carries real newlines is not a shell-escape mistake.
+        assert!(!has_literal_newline_escapes("first\nsecond \\n kept"));
+        // Plain prose without the escape is fine.
+        assert!(!has_literal_newline_escapes("hello world"));
+        // The mistake itself.
+        assert!(has_literal_newline_escapes("first\\n\\nsecond"));
     }
 
     #[test]

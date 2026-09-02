@@ -4076,6 +4076,12 @@ fn is_owner_control_command(
 /// `Steer`/`Interrupt` apply to every event that reaches this point; only
 /// `OwnerInterrupt` re-checks authorship (owner-only) here.
 ///
+/// In `Steer` mode a message from the agent's **owner** interrupts instead of
+/// steering: a steer is whispered into the running session and a long turn can
+/// swallow it for half an hour, leaving the owner unanswered. The owner's new
+/// message supersedes the in-flight work (which is described in the re-prompt
+/// so it can be resumed); everyone else still steers.
+///
 /// `owner` is the resolved owner pubkey hex, if known.
 fn mode_gate_signal(
     handling: MultipleEventHandling,
@@ -4084,7 +4090,10 @@ fn mode_gate_signal(
 ) -> Option<ControlSignal> {
     match handling {
         MultipleEventHandling::Queue => None,
-        MultipleEventHandling::Steer => Some(ControlSignal::Steer),
+        MultipleEventHandling::Steer => match owner {
+            Some(o) if author_hex == o => Some(ControlSignal::Interrupt),
+            _ => Some(ControlSignal::Steer),
+        },
         MultipleEventHandling::Interrupt => Some(ControlSignal::Interrupt),
         MultipleEventHandling::OwnerInterrupt => match owner {
             Some(o) if author_hex == o => Some(ControlSignal::Interrupt),
@@ -6775,7 +6784,7 @@ mod owner_control_command_tests {
         // Queue: never signals — events wait for the turn to finish.
         assert!(mode_gate_signal(MultipleEventHandling::Queue, &owner, Some(&owner)).is_none());
 
-        // Steer: always steers (eligibility already enforced upstream).
+        // Steer: non-owner authors steer (eligibility already enforced upstream).
         assert!(matches!(
             mode_gate_signal(MultipleEventHandling::Steer, &other, Some(&owner)),
             Some(ControlSignal::Steer)
@@ -6784,6 +6793,11 @@ mod owner_control_command_tests {
         assert!(matches!(
             mode_gate_signal(MultipleEventHandling::Steer, &other, None),
             Some(ControlSignal::Steer)
+        ));
+        // Steer: the owner's message interrupts so a long turn cannot swallow it.
+        assert!(matches!(
+            mode_gate_signal(MultipleEventHandling::Steer, &owner, Some(&owner)),
+            Some(ControlSignal::Interrupt)
         ));
 
         // Interrupt: always interrupts for any eligible author.

@@ -88,6 +88,7 @@ All replies and delegations — including task assignments to other agents — g
 ### General
 
 - Respond promptly to @mentions. Be direct — no preamble. Name what you did, what you found, or what you need.
+- **Answer first, then investigate.** When a person asks a status, reset, or "where are we" question, publish a direct answer from what you already know before any investigation, delegation, or coordination with other agents, and say what you are still checking. A person must never wait on a long turn for a first answer.
 - **If your turn produced anything worth knowing, you MUST publish it.** Use `buzz messages send`. Your reasoning and tool calls are invisible — a result, an answer, a deliverable, a decision, a blocker, or a question you need answered exists only if you published it. Work or an answer that someone asked you for always counts. Ending that kind of turn without a message is a silent failure.
 - **If a human asked you something, you MUST reply to them** unless the recent thread context shows that this identity already posted a later message fully answering that exact request. In that one case, do not repeat the answer; publish only if you have new information or a correction. Otherwise never leave a person waiting on you, even if the reply is only that you have nothing to add or nothing to do.
 - **Otherwise, publishing is optional and silence is usually correct.** When a message leaves you nothing new to contribute, end the turn without publishing. That is a success, not a failure.
