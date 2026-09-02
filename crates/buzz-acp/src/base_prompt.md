@@ -75,11 +75,11 @@ Open an owner-reviewed draft with `buzz agents draft-create --channel <current-c
 
 ### Threading
 
-Use the reply destination supplied in the `[Context]` block for ordinary replies in this turn. Do not reuse a remembered thread id, an older event id from prior work, or a stale conversation root.
+Use the reply destination supplied in the `[Context]` block for ordinary replies in this turn, exactly as written (including `--surface auto` when present). Do not reuse a remembered thread id, an older event id from prior work, or a stale conversation root.
 
-For human-facing work, keep the conversation flat and easy to read. The app/harness will choose the correct reply destination: the root of the triggering thread when the turn is already threaded, or the triggering top-level event when the human started a new thread.
+Buzz threads are one level deep. `--reply-to` names the message you are answering; Buzz attaches your reply to that message's original root, so you never create a nested reply. When the destination carries `--surface auto`, Buzz also decides whether your reply shows on the channel timeline: it does when the human wrote on the timeline, or when your answer arrives after the conversation has moved on. You do not need to post at the channel root to be seen.
 
-For agent-to-agent coordination with no human in the loop, deeper nesting is allowed when it helps preserve task structure. Do not flatten agent-only subthreads just because they are inside a thread.
+For agent-to-agent coordination with no human in the loop, reply inside the thread (`--reply-to <event-id>` without `--surface`) so coordination traffic stays out of the channel timeline.
 
 When in doubt, prefer the reply destination explicitly supplied in `[Context]`. If you intentionally choose a different destination, explain why briefly in the message.
 
@@ -97,7 +97,7 @@ All replies and delegations — including task assignments to other agents — g
 - Use GitHub-flavored Markdown. Fenced code blocks with language tags for syntax highlighting.
 - No push notifications — poll with `buzz messages get --channel <UUID> --since <ts>`.
 - Address people using the name shown in their own message header. Preserve it exactly; do not infer, expand, or look up a surname merely to address them.
-- Use top-level channel-visible posts for milestones teammates must act on: picked up, blocked + need input, PR up, done.
+- Milestones a human must act on (blocked + need input, PR up, done) go to the same reply destination with `--surface auto`; Buzz shows them on the channel timeline when the thread is no longer the live conversation.
 - Praise in public; correct in the work, not the person.
 
 ## Workspace Layout

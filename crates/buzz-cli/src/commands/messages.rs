@@ -8,6 +8,7 @@ use crate::validate::{
     infer_language, parse_event_id, parse_uuid, read_or_stdin, truncate_diff,
     validate_content_size, validate_hex64, validate_message_content, validate_uuid, MAX_DIFF_BYTES,
 };
+use crate::ReplySurface;
 use buzz_sdk::mentions::{
     extract_at_mentions_with_known, extract_nostr_uris, strip_code_regions, MENTION_CAP,
 };
@@ -93,6 +94,116 @@ fn thread_ref_from_event(event_id: &str, event: &serde_json::Value) -> Result<Th
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     thread_ref_from_parent_tags(parent_eid, event_id, &tags)
+}
+
+/// A reply target counts as "prompt" for `--surface auto` while it is at most
+/// this old. Inside that window, a reply to a message the human wrote inside a
+/// thread stays in the thread; past it, the answer is late and is surfaced on
+/// the channel timeline so it is not buried under an old root.
+pub const AUTO_SURFACE_PROMPT_WINDOW_SECS: u64 = 20 * 60;
+
+/// Collapse `--surface` and the legacy `--broadcast` flag into one surface.
+fn effective_surface(surface: Option<ReplySurface>, broadcast: bool) -> ReplySurface {
+    if broadcast {
+        ReplySurface::Channel
+    } else {
+        surface.unwrap_or(ReplySurface::Thread)
+    }
+}
+
+/// The `--surface auto` rule. Returns `true` when the reply should also be a
+/// channel-timeline row (NIP-CW broadcast).
+///
+/// - `target_is_top_level`: the requested `--reply-to` target is itself a
+///   top-level message, i.e. the human wrote on the channel timeline. The
+///   answer belongs there too.
+/// - `target_age_secs`: age of the requested target at send time. A reply to
+///   an in-thread message older than [`AUTO_SURFACE_PROMPT_WINDOW_SECS`] is a
+///   late update and is surfaced.
+/// - `root_is_live`: the thread root is still the channel's newest top-level
+///   conversation. When newer top-level messages exist the reply is surfaced
+///   so it appears where the reader is looking.
+pub fn auto_surface_broadcast(
+    target_is_top_level: bool,
+    target_age_secs: u64,
+    root_is_live: bool,
+) -> bool {
+    target_is_top_level || target_age_secs > AUTO_SURFACE_PROMPT_WINDOW_SECS || !root_is_live
+}
+
+/// True when the channel's newest top-level row belongs to thread `root_hex`:
+/// it is the root itself, or a broadcast reply whose depth-one root is it.
+/// `None` (no row at all) counts as live so an empty or unreadable head never
+/// forces a broadcast on its own.
+pub fn newest_row_belongs_to_root(newest: Option<&serde_json::Value>, root_hex: &str) -> bool {
+    let Some(newest) = newest else {
+        return true;
+    };
+    if newest.get("id").and_then(|v| v.as_str()) == Some(root_hex) {
+        return true;
+    }
+    let tags = newest
+        .get("tags")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    find_root_from_tags(&tags).as_deref() == Some(root_hex)
+}
+
+/// Fetch the channel's newest top-level timeline row (NIP-CW window head).
+async fn fetch_newest_top_level_row(
+    client: &BuzzClient,
+    channel_id: &str,
+) -> Result<Option<serde_json::Value>, CliError> {
+    let filter = serde_json::json!({
+        "#h": [channel_id],
+        "kinds": [9],
+        "top_level": true,
+        "limit": 1,
+    });
+    let raw = client.query(&filter).await?;
+    let events: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| CliError::Other(format!("failed to parse query response: {e}")))?;
+    Ok(events.as_array().and_then(|events| {
+        events
+            .iter()
+            .find(|event| event.get("kind").and_then(|k| k.as_u64()) == Some(9))
+            .cloned()
+    }))
+}
+
+/// Decide `--surface auto` for a reply whose requested target has already been
+/// fetched and collapsed to a depth-one `ThreadRef`.
+async fn resolve_auto_surface(
+    client: &BuzzClient,
+    channel_id: &str,
+    target_event_id: &str,
+    target: &serde_json::Value,
+    thread_ref: &ThreadRef,
+) -> Result<bool, CliError> {
+    let root_hex = thread_ref.root_event_id.to_hex();
+    let target_is_top_level = root_hex == target_event_id;
+    if target_is_top_level {
+        return Ok(true);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let target_created = target
+        .get("created_at")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(now);
+    let target_age_secs = now.saturating_sub(target_created);
+    if target_age_secs > AUTO_SURFACE_PROMPT_WINDOW_SECS {
+        return Ok(true);
+    }
+    let newest = fetch_newest_top_level_row(client, channel_id).await?;
+    let root_is_live = newest_row_belongs_to_root(newest.as_ref(), &root_hex);
+    Ok(auto_surface_broadcast(
+        target_is_top_level,
+        target_age_secs,
+        root_is_live,
+    ))
 }
 
 /// Resolve the channel UUID for an event by querying for it via POST /query.
@@ -606,6 +717,9 @@ pub struct SendMessageParams {
     pub content: String,
     pub kind: Option<u16>,
     pub reply_to: Option<String>,
+    /// Requested reply surface (`--surface`). `None` means `thread`.
+    pub surface: Option<ReplySurface>,
+    /// Legacy `--broadcast` flag; equivalent to `--surface channel`.
     pub broadcast: bool,
     pub files: Vec<String>,
     pub mentions: Vec<String>,
@@ -674,12 +788,22 @@ pub async fn cmd_send_message(
         format!("{}{media_content}", p.content)
     };
 
-    // Build thread ref if replying. `--reply-to` is the immediate parent; the
-    // thread root is derived from the parent's NIP-10 tags via the relay.
-    let thread_ref = if let Some(ref r) = p.reply_to {
-        Some(resolve_thread_ref(client, r).await?)
+    // Build thread ref if replying. `--reply-to` names the message being
+    // answered; the depth-one root is derived from its NIP-10 tags via the
+    // relay. The same fetched target drives the `--surface auto` decision.
+    let (thread_ref, broadcast) = if let Some(ref r) = p.reply_to {
+        let target = fetch_event(client, r).await?;
+        let thread_ref = thread_ref_from_event(r, &target)?;
+        let broadcast = match effective_surface(p.surface, p.broadcast) {
+            ReplySurface::Thread => false,
+            ReplySurface::Channel => true,
+            ReplySurface::Auto => {
+                resolve_auto_surface(client, &p.channel_id, r, &target, &thread_ref).await?
+            }
+        };
+        (Some(thread_ref), broadcast)
     } else {
-        None
+        (None, false)
     };
 
     let mention_refs: Vec<&str> = mention_pubkeys.iter().map(String::as_str).collect();
@@ -707,7 +831,7 @@ pub async fn cmd_send_message(
             &final_content,
             thread_ref.as_ref(),
             &mention_refs,
-            p.broadcast,
+            broadcast,
             &media_tags,
         )
         .map_err(|e| CliError::Other(format!("build_message failed: {e}")))?,
@@ -918,6 +1042,7 @@ pub async fn dispatch(
             content,
             kind,
             reply_to,
+            surface,
             broadcast,
             files,
             mentions,
@@ -929,6 +1054,7 @@ pub async fn dispatch(
                     content,
                     kind,
                     reply_to,
+                    surface,
                     broadcast,
                     files,
                     mentions,
@@ -1071,6 +1197,84 @@ mod tests {
     };
     use nostr::Keys;
     use serde_json::json;
+
+    use super::{
+        auto_surface_broadcast, effective_surface, newest_row_belongs_to_root, ReplySurface,
+        AUTO_SURFACE_PROMPT_WINDOW_SECS,
+    };
+
+    #[test]
+    fn surface_defaults_to_thread_and_broadcast_flag_means_channel() {
+        assert_eq!(effective_surface(None, false), ReplySurface::Thread);
+        assert_eq!(
+            effective_surface(Some(ReplySurface::Auto), false),
+            ReplySurface::Auto
+        );
+        // Legacy `--broadcast` wins over any `--surface` value.
+        assert_eq!(effective_surface(None, true), ReplySurface::Channel);
+        assert_eq!(
+            effective_surface(Some(ReplySurface::Thread), true),
+            ReplySurface::Channel
+        );
+    }
+
+    #[test]
+    fn auto_surface_top_level_target_is_always_broadcast() {
+        // The human wrote on the channel timeline: the answer belongs there.
+        assert!(auto_surface_broadcast(true, 0, true));
+        assert!(auto_surface_broadcast(true, 0, false));
+    }
+
+    #[test]
+    fn auto_surface_prompt_in_thread_reply_stays_in_thread() {
+        // Human wrote inside the live thread and the answer is prompt.
+        assert!(!auto_surface_broadcast(false, 60, true));
+        assert!(!auto_surface_broadcast(
+            false,
+            AUTO_SURFACE_PROMPT_WINDOW_SECS,
+            true
+        ));
+    }
+
+    #[test]
+    fn auto_surface_late_or_superseded_in_thread_reply_is_broadcast() {
+        // Late answer: the trigger is older than the prompt window.
+        assert!(auto_surface_broadcast(
+            false,
+            AUTO_SURFACE_PROMPT_WINDOW_SECS + 1,
+            true
+        ));
+        // Conversation moved on: newer top-level rows exist after the root.
+        assert!(auto_surface_broadcast(false, 60, false));
+    }
+
+    #[test]
+    fn newest_row_is_live_when_it_is_the_root_or_a_broadcast_reply_to_it() {
+        let root = "a".repeat(64);
+        let other = "b".repeat(64);
+        // Empty head: nothing newer, treat as live.
+        assert!(newest_row_belongs_to_root(None, &root));
+        // The root itself is the newest row.
+        let head = json!({ "id": root, "kind": 9, "tags": [["h", "c"]] });
+        assert!(newest_row_belongs_to_root(Some(&head), &root));
+        // A broadcast reply to the root is the newest row: still live.
+        let bcast = json!({
+            "id": other,
+            "kind": 9,
+            "tags": [["h", "c"], ["e", root, "", "reply"], ["broadcast", "1"]],
+        });
+        assert!(newest_row_belongs_to_root(Some(&bcast), &root));
+        // Some other top-level message is newest: the thread is superseded.
+        let newer = json!({ "id": other, "kind": 9, "tags": [["h", "c"]] });
+        assert!(!newest_row_belongs_to_root(Some(&newer), &root));
+        // A broadcast reply into a different thread is also newer.
+        let bcast_other = json!({
+            "id": "c".repeat(64),
+            "kind": 9,
+            "tags": [["h", "c"], ["e", other, "", "reply"], ["broadcast", "1"]],
+        });
+        assert!(!newest_row_belongs_to_root(Some(&bcast_other), &root));
+    }
 
     const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const ID_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

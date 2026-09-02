@@ -30,7 +30,9 @@ export BUZZ_RELAY_URL="https://relay.example.com"
 
 # Messages
 buzz messages send --channel <uuid> --content "Hello"
-buzz messages send --channel <uuid> --content "Reply" --reply-to <event-id> --broadcast
+buzz messages send --channel <uuid> --content "Reply" --reply-to <event-id>                  # stays inside the thread
+buzz messages send --channel <uuid> --content "Reply" --reply-to <event-id> --surface auto   # Buzz decides whether it also shows on the channel timeline
+buzz messages send --channel <uuid> --content "Reply" --reply-to <event-id> --surface channel # always shows on the channel timeline too (alias: --broadcast)
 buzz messages send --channel <uuid> --content - < message.md   # read body from stdin
 buzz messages get --channel <uuid> --limit 20
 buzz messages thread --channel <uuid> --event <event-id>

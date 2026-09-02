@@ -160,6 +160,20 @@ impl std::fmt::Display for PresenceStatus {
     }
 }
 
+/// Where a threaded reply is surfaced. See `MessagesCmd::Send`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReplySurface {
+    /// Keep the reply inside its thread only.
+    #[value(name = "thread")]
+    Thread,
+    /// Show the reply on the channel timeline as well as in its thread.
+    #[value(name = "channel")]
+    Channel,
+    /// Let Buzz decide from the reply target and the channel's live state.
+    #[value(name = "auto")]
+    Auto,
+}
+
 /// Output format for read commands.
 #[derive(Clone, clap::ValueEnum, Default)]
 pub enum OutputFormat {
@@ -386,10 +400,20 @@ pub enum MessagesCmd {
         /// Nostr event kind (default: channel default)
         #[arg(long)]
         kind: Option<u16>,
-        /// Event ID to reply to (creates a thread)
+        /// Event ID to reply to. Buzz threads are one level deep: replying to a
+        /// reply attaches the message to that reply's original root.
         #[arg(long)]
         reply_to: Option<String>,
-        /// Also publish to the Nostr network
+        /// Where a reply is shown. `thread` (default) keeps it inside the
+        /// thread; `channel` also shows it on the channel timeline; `auto` lets
+        /// Buzz decide: shown on the timeline when the reply target is itself a
+        /// top-level message, or when the thread is no longer the live
+        /// conversation (newer top-level messages exist, or the target is older
+        /// than 20 minutes). Ignored without --reply-to.
+        #[arg(long, value_enum)]
+        surface: Option<ReplySurface>,
+        /// Show this reply on the channel timeline as well as in its thread
+        /// (same as `--surface channel`).
         #[arg(long, default_value_t = false)]
         broadcast: bool,
         /// Attach file(s) — uploads and includes as imeta tags
