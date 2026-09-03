@@ -67,6 +67,7 @@ enum ScheduleDecision {
     Keep,
     Wake,
     Redirect,
+    Takeover,
     Completed,
 }
 
@@ -76,6 +77,7 @@ impl ScheduleDecision {
             Self::Keep => "kept",
             Self::Wake => "woken",
             Self::Redirect => "redirected",
+            Self::Takeover => "taken_over",
             Self::Completed => "completed",
         }
     }
@@ -87,6 +89,7 @@ impl From<ScheduleDecisionArg> for ScheduleDecision {
             ScheduleDecisionArg::Keep => Self::Keep,
             ScheduleDecisionArg::Wake => Self::Wake,
             ScheduleDecisionArg::Redirect => Self::Redirect,
+            ScheduleDecisionArg::Takeover => Self::Takeover,
             ScheduleDecisionArg::Complete => Self::Completed,
         }
     }
@@ -772,7 +775,7 @@ fn apply_task_state(task: &mut AssignedTaskOutput, event: &nostr::Event) {
     let states = tag_values(event, "task-status");
     let status = match states.as_slice() {
         ["woken"] => AssignedTaskStatus::Woken,
-        ["redirected"] => AssignedTaskStatus::Redirected,
+        ["redirected"] | ["taken_over"] => AssignedTaskStatus::Redirected,
         ["completed"] => AssignedTaskStatus::Completed,
         _ => return,
     };
@@ -1145,9 +1148,19 @@ fn advance_binding_in_registry(
         return Ok(true);
     }
     if current != expected_delegation_event_id {
-        return Err(CliError::Conflict(format!(
-            "schedule `{schedule_id}` task binding changed from `{expected_delegation_event_id}` to `{current}`"
-        )));
+        // The registry may run ahead of the record: an earlier prepared
+        // redirect of this same schedule advanced the binding and never
+        // finalized (the sidecar died, or the outbox event was later rejected).
+        // When every id involved is this schedule's own reservation, the head
+        // is stale rather than foreign, and the record must still have a legal
+        // move; advance from the stale head instead of locking the record.
+        let owned =
+            |id: &str| registry.by_delegation.get(id).map(String::as_str) == Some(schedule_id);
+        if !(owned(current) && owned(expected_delegation_event_id)) {
+            return Err(CliError::Conflict(format!(
+                "schedule `{schedule_id}` task binding changed from `{expected_delegation_event_id}` to `{current}`"
+            )));
+        }
     }
     if let Some(existing_schedule) = registry.by_delegation.get(replacement_delegation_event_id) {
         return Err(CliError::Conflict(format!(
@@ -1390,6 +1403,30 @@ fn validate_audit_shape(schedule: &Schedule, entry: &DecisionAudit) -> Result<()
                 ));
             }
         }
+        ScheduleDecision::Takeover => {
+            let Some(replacement) = &entry.replacement_pubkey else {
+                return Err(invalid_stored(&schedule.id, "takeover has no new assignee"));
+            };
+            let Some(event_id) = &entry.replacement_delegation_event_id else {
+                return Err(invalid_stored(
+                    &schedule.id,
+                    "takeover has no replacement delegation event",
+                ));
+            };
+            validate_pubkey(replacement, "replacement")?;
+            validate_thread_id(event_id)?;
+            if entry.next_due_at.is_none()
+                || replacement == &entry.assignee_pubkey
+                || event_id == &entry.delegation_event_id
+                || entry.action_event_id.as_deref() != Some(event_id)
+                || entry.action_content.is_none()
+            {
+                return Err(invalid_stored(
+                    &schedule.id,
+                    "takeover did not change both assignee and delegation event",
+                ));
+            }
+        }
         ScheduleDecision::Completed => {
             if entry.next_due_at.is_some()
                 || entry.replacement_pubkey.is_some()
@@ -1445,7 +1482,7 @@ fn validate_pending_action(schedule: &Schedule, pending: &PendingAction) -> Resu
         ));
     }
     match pending.decision {
-        ScheduleDecision::Wake | ScheduleDecision::Redirect => {
+        ScheduleDecision::Wake | ScheduleDecision::Redirect | ScheduleDecision::Takeover => {
             let due_at = pending.next_due_at.as_deref().ok_or_else(|| {
                 invalid_stored(&schedule.id, "pending recovery action has no next due time")
             })?;
@@ -1514,6 +1551,25 @@ fn validate_pending_action(schedule: &Schedule, pending: &PendingAction) -> Resu
                 &schedule.channel_id,
                 &schedule.thread_id,
                 &replacement_task,
+            )?;
+        }
+        ScheduleDecision::Takeover => {
+            let replacement = pending.replacement_pubkey.as_ref().ok_or_else(|| {
+                invalid_stored(&schedule.id, "pending takeover has no new assignee")
+            })?;
+            if replacement != &pending.event.pubkey.to_hex() {
+                return Err(invalid_stored(
+                    &schedule.id,
+                    "pending takeover must make the driver the assignee",
+                ));
+            }
+            validate_action_event_scope(
+                &pending.event,
+                &pending.event.pubkey,
+                &schedule.channel_id,
+                &schedule.thread_id,
+                &[pending.assignee_pubkey.as_str()],
+                false,
             )?;
         }
         ScheduleDecision::Completed => validate_action_event_scope(
@@ -1610,7 +1666,10 @@ fn validate_schedule(schedule: &Schedule) -> Result<(), CliError> {
                         ));
                     }
                 }
-                expected_assignee = if entry.decision == ScheduleDecision::Redirect {
+                expected_assignee = if matches!(
+                    entry.decision,
+                    ScheduleDecision::Redirect | ScheduleDecision::Takeover
+                ) {
                     Some((
                         entry.replacement_pubkey.as_deref().unwrap_or_default(),
                         entry
@@ -1635,12 +1694,15 @@ fn validate_schedule(schedule: &Schedule) -> Result<(), CliError> {
                     && checkpoint.material_at == last.material_at;
                 match phase {
                     FollowThroughPhase::Monitoring => {
-                        if last.decision != ScheduleDecision::Keep
-                            && last.decision != ScheduleDecision::Redirect
-                        {
+                        if !matches!(
+                            last.decision,
+                            ScheduleDecision::Keep
+                                | ScheduleDecision::Redirect
+                                | ScheduleDecision::Takeover
+                        ) {
                             return Err(invalid_stored(
                                 &schedule.id,
-                                "monitoring phase does not follow keep or redirect",
+                                "monitoring phase does not follow keep, redirect, or takeover",
                             ));
                         }
                         if !checkpoint_matches {
@@ -1896,16 +1958,16 @@ fn record_claim_write(
 fn require_live_claim<'a>(
     schedule: &'a Schedule,
     token: &str,
-    now: DateTime<Utc>,
+    _now: DateTime<Utc>,
 ) -> Result<&'a Claim, CliError> {
     match (&schedule.status, &schedule.claim) {
         (ScheduleStatus::Claimed, Some(claim)) if claim.token == token => {
-            if parse_time(&claim.lease_expires_at, "lease-expires-at")? <= now {
-                return Err(CliError::Conflict(format!(
-                    "schedule `{}` claim lease expired before the decision",
-                    schedule.id
-                )));
-            }
+            // An expired lease that nobody re-claimed still belongs to this
+            // claimant: the token is unique to it, and a different claimant
+            // would have replaced the claim (`is_due` reopens the record at
+            // expiry). Failing here only stranded slow but correct decisions
+            // and made the driver report a "blocker".
+            parse_time(&claim.lease_expires_at, "lease-expires-at")?;
             Ok(claim)
         }
         (ScheduleStatus::Claimed, Some(_)) => Err(CliError::Conflict(format!(
@@ -2764,7 +2826,9 @@ fn expected_reconcile_receipt_author<'a>(
 
 fn require_due_at(input: &ReconcileInput) -> Result<&str, CliError> {
     input.due_at.as_deref().ok_or_else(|| {
-        CliError::Usage("--due-at is required for keep, wake, and redirect decisions".into())
+        CliError::Usage(
+            "--due-at is required for keep, wake, redirect, and takeover decisions".into(),
+        )
     })
 }
 
@@ -2831,6 +2895,18 @@ fn validate_public_reconcile_shape(input: &ReconcileInput) -> Result<(), CliErro
             }
             if input.action_content.is_none() {
                 return Err(CliError::Usage("redirect requires --message".into()));
+            }
+        }
+        ScheduleDecision::Takeover => {
+            require_due_at(input)?;
+            if input.replacement_pubkey.is_some() {
+                return Err(CliError::Usage(
+                    "takeover never takes --replacement; the calling identity becomes the assignee"
+                        .into(),
+                ));
+            }
+            if input.action_content.is_none() {
+                return Err(CliError::Usage("takeover requires --message".into()));
             }
         }
         ScheduleDecision::Completed => {
@@ -2969,6 +3045,7 @@ fn build_action_event(
             .replacement_pubkey
             .as_deref()
             .ok_or_else(|| CliError::Usage("--replacement is required for redirect".into()))?],
+        ScheduleDecision::Takeover => vec![task.assignee_pubkey.as_str()],
         ScheduleDecision::Completed => Vec::new(),
         ScheduleDecision::Keep => {
             return Err(CliError::Usage(
@@ -3013,6 +3090,14 @@ fn build_action_event(
             )?;
         }
         ScheduleDecision::Wake => validate_action_event_scope(
+            &event,
+            &client.keys().public_key(),
+            &schedule.channel_id,
+            &schedule.thread_id,
+            &[task.assignee_pubkey.as_str()],
+            false,
+        )?,
+        ScheduleDecision::Takeover => validate_action_event_scope(
             &event,
             &client.keys().public_key(),
             &schedule.channel_id,
@@ -3154,12 +3239,10 @@ fn reconcile_schedule(
             reject_replacement(input)?;
             require_visible_action(input)?;
             let due_at = require_due_at(input)?;
-            if phase != FollowThroughPhase::Monitoring {
-                return Err(CliError::Conflict(
-                    "the same assignee was already woken for this unchanged checkpoint; the next unchanged decision must redirect"
-                        .into(),
-                ));
-            }
+            // A wake may repeat. The ledger records that the assignee was
+            // woken; it never forbids the driver from waking again, taking
+            // the work over, or naming a different doer. A state with no
+            // legal move is how work silently stalled.
             if schedule.checkpoint.is_some() && !checkpoint_matches(schedule, input) {
                 return Err(CliError::Conflict(
                     "a changed receipt cannot be classified as a wake; use keep for newer material progress"
@@ -3211,6 +3294,34 @@ fn reconcile_schedule(
             candidate.task = Some(TaskBinding {
                 assignee_pubkey: replacement.clone(),
                 delegation_event_id: replacement_event.clone(),
+                expected_result: task.expected_result.clone(),
+                evidence_locator: task.evidence_locator.clone(),
+            });
+            candidate.checkpoint = Some(checkpoint);
+            candidate.phase = Some(FollowThroughPhase::Monitoring);
+            candidate.due_at = due_at.to_owned();
+            candidate.status = ScheduleStatus::Pending;
+        }
+        ScheduleDecision::Takeover => {
+            let (action_event_id, _) = require_visible_action(input)?;
+            let due_at = require_due_at(input)?;
+            let replacement = input.replacement_pubkey.as_ref().ok_or_else(|| {
+                CliError::Other("takeover did not resolve the calling identity".into())
+            })?;
+            if replacement == &task.assignee_pubkey {
+                return Err(CliError::Conflict(
+                    "this identity is already the assignee; do the next step and keep or complete"
+                        .into(),
+                ));
+            }
+            if input.replacement_delegation_event_id.as_deref() != Some(action_event_id) {
+                return Err(CliError::Other(
+                    "prepared takeover is missing its generated delegation event".into(),
+                ));
+            }
+            candidate.task = Some(TaskBinding {
+                assignee_pubkey: replacement.clone(),
+                delegation_event_id: action_event_id.to_owned(),
                 expected_result: task.expected_result.clone(),
                 evidence_locator: task.evidence_locator.clone(),
             });
@@ -3272,6 +3383,33 @@ fn reconcile_schedule(
     Ok((candidate, false))
 }
 
+/// A prepared visible action belongs to the lease that prepared it. When that
+/// lease has been superseded by a fresh claim and the new claimant decides
+/// differently, the stale outbox entry is discarded instead of locking the
+/// record: it published nothing durable on its own, and a task record must
+/// always have a legal next move. A different request under the same lease
+/// is still a genuine conflict.
+fn discard_stale_pending_action(
+    schedule: &mut Schedule,
+    claim: &str,
+    input: &ReconcileInput,
+) -> Result<(), CliError> {
+    let Some(pending) = schedule.pending_action.as_ref() else {
+        return Ok(());
+    };
+    if pending_matches_request(pending, input) {
+        return Ok(());
+    }
+    if pending.prepared_claim_token == claim {
+        return Err(CliError::Conflict(format!(
+            "schedule `{}` already has a different prepared visible action",
+            schedule.id
+        )));
+    }
+    schedule.pending_action = None;
+    Ok(())
+}
+
 fn pending_matches_request(pending: &PendingAction, input: &ReconcileInput) -> bool {
     pending.decision == input.decision
         && pending.receipt == input.receipt
@@ -3288,8 +3426,11 @@ fn input_for_pending(pending: &PendingAction) -> ReconcileInput {
         material_at: pending.material_at.clone(),
         due_at: pending.next_due_at.clone(),
         replacement_pubkey: pending.replacement_pubkey.clone(),
-        replacement_delegation_event_id: (pending.decision == ScheduleDecision::Redirect)
-            .then(|| pending.event.id.to_hex()),
+        replacement_delegation_event_id: matches!(
+            pending.decision,
+            ScheduleDecision::Redirect | ScheduleDecision::Takeover
+        )
+        .then(|| pending.event.id.to_hex()),
         action_event_id: Some(pending.event.id.to_hex()),
         action_content: Some(pending.event.content.clone()),
     }
@@ -3310,7 +3451,10 @@ fn prepare_visible_action(
     let mut input = requested.clone();
     input.action_event_id = Some(event.id.to_hex());
     input.action_content = Some(event.content.clone());
-    if input.decision == ScheduleDecision::Redirect {
+    if matches!(
+        input.decision,
+        ScheduleDecision::Redirect | ScheduleDecision::Takeover
+    ) {
         input.replacement_delegation_event_id = Some(event.id.to_hex());
     }
     reconcile_schedule(schedule, token, now, &input, true)?;
@@ -3353,11 +3497,12 @@ async fn advance_pending_redirect_binding(
     owner: &nostr::PublicKey,
     schedule: &Schedule,
 ) -> Result<(), CliError> {
-    let Some(pending) = schedule
-        .pending_action
-        .as_ref()
-        .filter(|pending| pending.decision == ScheduleDecision::Redirect)
-    else {
+    let Some(pending) = schedule.pending_action.as_ref().filter(|pending| {
+        matches!(
+            pending.decision,
+            ScheduleDecision::Redirect | ScheduleDecision::Takeover
+        )
+    }) else {
         return Ok(());
     };
     advance_task_binding(
@@ -3413,7 +3558,7 @@ async fn reconcile(
 ) -> Result<(), CliError> {
     let requested_at = Utc::now();
     let material_at = parse_time(material_at, "material-at")?;
-    let input = ReconcileInput {
+    let mut input = ReconcileInput {
         decision: decision.into(),
         receipt: validate_receipt(receipt)?,
         material_at: canonical_time(material_at),
@@ -3428,17 +3573,18 @@ async fn reconcile(
         action_content: message.map(resolve_reconcile_message).transpose()?,
     };
     validate_public_reconcile_shape(&input)?;
+    let caller_pubkey = client.keys().public_key().to_hex();
+    if input.decision == ScheduleDecision::Takeover {
+        // The calling identity becomes the assignee; the CLI never accepts a
+        // caller-supplied replacement for a takeover.
+        input.replacement_pubkey = Some(caller_pubkey.clone());
+    }
     let (owner_pubkey, mut loaded) = load_one(client, owner, id).await?;
     if recorded_request_matches(&loaded.schedule, claim, &input)? {
         return print_one(&loaded.schedule, &loaded.revision, true);
     }
+    discard_stale_pending_action(&mut loaded.schedule, claim, &input)?;
     if let Some(pending) = loaded.schedule.pending_action.as_ref() {
-        if !pending_matches_request(pending, &input) {
-            return Err(CliError::Conflict(format!(
-                "schedule `{}` already has a different prepared visible action",
-                loaded.schedule.id
-            )));
-        }
         match (&loaded.schedule.status, &loaded.schedule.claim) {
             (ScheduleStatus::Claimed, Some(current)) if current.token == claim => {}
             _ => {
@@ -3472,8 +3618,15 @@ async fn reconcile(
             "--material-at cannot be later than the reconciliation decision".into(),
         ));
     }
-    let expected_receipt_author =
-        expected_reconcile_receipt_author(&loaded.schedule, &input, &current_task.assignee_pubkey);
+    // A takeover on a newer receipt is the driver's own material (its commit,
+    // document, or Buzz event); after the takeover the driver is the assignee.
+    let expected_receipt_author = if input.decision == ScheduleDecision::Takeover
+        && !checkpoint_matches(&loaded.schedule, &input)
+    {
+        caller_pubkey.as_str()
+    } else {
+        expected_reconcile_receipt_author(&loaded.schedule, &input, &current_task.assignee_pubkey)
+    };
     verify_task_receipt(
         client,
         &loaded.schedule.channel_id,
@@ -3491,6 +3644,7 @@ async fn reconcile(
     if recorded_request_matches(&loaded.schedule, claim, &input)? {
         return print_one(&loaded.schedule, &loaded.revision, true);
     }
+    discard_stale_pending_action(&mut loaded.schedule, claim, &input)?;
     if loaded.schedule.pending_action.is_some() {
         return Err(CliError::Conflict(format!(
             "schedule `{}` gained a pending action; retry from fresh state",
@@ -4317,7 +4471,7 @@ mod tests {
     }
 
     #[test]
-    fn one_wake_then_redirect_preserves_result_and_changes_only_assignee() {
+    fn wake_may_repeat_and_redirect_preserves_result_and_changes_only_assignee() {
         let now = DateTime::parse_from_rfc3339("2026-08-26T15:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -4346,12 +4500,11 @@ mod tests {
             now - chrono::Duration::minutes(5),
             Some(second_at + chrono::Duration::minutes(15)),
         );
-        let second_wake =
+        let (second_woken, _) =
             reconcile_schedule(&woken, &second_claim, second_at, &second_wake_input, true)
-                .unwrap_err();
-        assert!(second_wake
-            .to_string()
-            .contains("next unchanged decision must redirect"));
+                .expect("a wake may repeat; the ledger never leaves the driver without a move");
+        assert_eq!(second_woken.phase, Some(FollowThroughPhase::SameOwnerWoken));
+        assert_eq!(second_woken.audit.len(), 2);
 
         let replacement = Keys::generate().public_key().to_hex();
         let mut redirect = reconciliation(
@@ -4841,20 +4994,141 @@ mod tests {
             now - chrono::Duration::minutes(5),
             Some(now + chrono::Duration::minutes(11)),
         );
-        assert!(reconcile_schedule(
+        // A slow but correct decision under an expired, un-reclaimed lease still
+        // belongs to its claimant: only a different live claimant conflicts.
+        let (late, _) = reconcile_schedule(
             &schedule,
             &first,
             now + chrono::Duration::seconds(60),
             &wake,
             true,
         )
-        .unwrap_err()
-        .to_string()
-        .contains("claim lease expired"));
+        .expect("expired lease with the same token still decides");
+        assert_eq!(late.phase, Some(FollowThroughPhase::SameOwnerWoken));
         let second = claim_schedule(&mut schedule, now + chrono::Duration::seconds(60), 60)
             .unwrap()
             .unwrap();
         assert_ne!(first, second);
+        assert!(reconcile_schedule(
+            &schedule,
+            &first,
+            now + chrono::Duration::seconds(61),
+            &wake,
+            true,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("held by a different claim"));
+    }
+
+    #[test]
+    fn takeover_makes_the_caller_the_assignee_and_keeps_the_result() {
+        let now = DateTime::parse_from_rfc3339("2026-08-26T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut schedule = sample_schedule(now);
+        schedule.phase = Some(FollowThroughPhase::SameOwnerWoken);
+        let original = schedule.task.clone().unwrap();
+        let claim = claim_schedule(&mut schedule, now, DEFAULT_LEASE_SECONDS)
+            .unwrap()
+            .unwrap();
+        let driver = Keys::generate().public_key().to_hex();
+        let mut takeover = reconciliation(
+            ScheduleDecision::Takeover,
+            &format!("document-hash:{}", "1".repeat(64)),
+            now - chrono::Duration::minutes(5),
+            Some(now + chrono::Duration::minutes(12)),
+        );
+        takeover.replacement_pubkey = Some(driver.clone());
+        takeover.replacement_delegation_event_id = Some("e".repeat(64));
+        takeover.action_event_id = Some("e".repeat(64));
+        let (taken, _) = reconcile_schedule(&schedule, &claim, now, &takeover, true)
+            .expect("the driver may take the work over from any phase");
+        let task = taken.task.unwrap();
+        assert_eq!(task.assignee_pubkey, driver);
+        assert_eq!(task.delegation_event_id, "e".repeat(64));
+        assert_eq!(task.expected_result, original.expected_result);
+        assert_eq!(task.evidence_locator, original.evidence_locator);
+        assert_eq!(taken.phase, Some(FollowThroughPhase::Monitoring));
+        assert_eq!(taken.status, ScheduleStatus::Pending);
+        let audit = taken.audit.last().unwrap();
+        assert_eq!(audit.decision, ScheduleDecision::Takeover);
+        assert_eq!(audit.assignee_pubkey, original.assignee_pubkey);
+        assert_eq!(audit.replacement_pubkey.as_deref(), Some(driver.as_str()));
+
+        let mut already = takeover.clone();
+        already.replacement_pubkey = Some(original.assignee_pubkey.clone());
+        let error = reconcile_schedule(&schedule, &claim, now, &already, true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("already the assignee; do the next step"));
+    }
+
+    #[test]
+    fn stale_pending_action_from_a_superseded_lease_is_discarded() {
+        let now = DateTime::parse_from_rfc3339("2026-08-26T15:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let driver = Keys::generate();
+        let mut schedule = sample_schedule(now);
+        let assignee = schedule.task.as_ref().unwrap().assignee_pubkey.clone();
+        let first_claim = claim_schedule(&mut schedule, now, 60).unwrap().unwrap();
+        let mut wake = reconciliation(
+            ScheduleDecision::Wake,
+            &format!("document-hash:{}", "1".repeat(64)),
+            now - chrono::Duration::minutes(5),
+            Some(now + chrono::Duration::minutes(15)),
+        );
+        wake.action_content = Some("Please continue and report material progress.".into());
+        let event = scoped_event(
+            &driver,
+            KIND_STREAM_MESSAGE,
+            &schedule.channel_id,
+            &schedule.thread_id,
+            wake.action_content.as_deref().unwrap(),
+            &[&assignee],
+            now,
+        );
+        let (mut prepared, _) =
+            prepare_visible_action(&schedule, &first_claim, now, &wake, event).unwrap();
+
+        // Same lease, different request: a genuine conflict.
+        let mut competing = wake.clone();
+        competing.action_content = Some("A different instruction.".into());
+        let same_lease =
+            discard_stale_pending_action(&mut prepared, &first_claim, &competing).unwrap_err();
+        assert!(same_lease
+            .to_string()
+            .contains("already has a different prepared visible action"));
+        assert!(prepared.pending_action.is_some());
+
+        // The matching request under any lease keeps the outbox entry.
+        let second_at = now + chrono::Duration::seconds(60);
+        let second_claim = claim_schedule(&mut prepared, second_at, 60)
+            .unwrap()
+            .unwrap();
+        discard_stale_pending_action(&mut prepared, &second_claim, &wake).unwrap();
+        assert!(prepared.pending_action.is_some());
+
+        // A different decision under the superseding lease discards the stale entry
+        // and the record has a legal next move again.
+        let mut takeover = reconciliation(
+            ScheduleDecision::Takeover,
+            &format!("document-hash:{}", "1".repeat(64)),
+            now - chrono::Duration::minutes(5),
+            Some(second_at + chrono::Duration::minutes(12)),
+        );
+        takeover.replacement_pubkey = Some(driver.public_key().to_hex());
+        takeover.replacement_delegation_event_id = Some("e".repeat(64));
+        takeover.action_event_id = Some("e".repeat(64));
+        discard_stale_pending_action(&mut prepared, &second_claim, &takeover).unwrap();
+        assert!(prepared.pending_action.is_none());
+        let (taken, _) =
+            reconcile_schedule(&prepared, &second_claim, second_at, &takeover, true).unwrap();
+        assert_eq!(
+            taken.task.unwrap().assignee_pubkey,
+            driver.public_key().to_hex()
+        );
     }
 
     #[test]
@@ -5470,5 +5744,40 @@ mod tests {
         assert!(error.to_string().contains("cannot target this identity"));
         let upper = own.to_uppercase();
         assert!(reject_self_redirect(Some(&upper), &own).is_err());
+    }
+
+    #[test]
+    fn binding_registry_advances_from_a_stale_head_reserved_by_the_same_schedule() {
+        let old = "b".repeat(64);
+        let stale = "c".repeat(64);
+        let new = "e".repeat(64);
+        let mut registry = TaskBindingRegistry {
+            schema: 1,
+            by_delegation: BTreeMap::from([
+                (old.clone(), "same-id".to_owned()),
+                (stale.clone(), "same-id".to_owned()),
+            ]),
+            by_schedule: BTreeMap::from([("same-id".to_owned(), stale.clone())]),
+        };
+        // An interrupted prepared redirect left the registry at `stale` while the
+        // record still says `old`; the next decision advances anyway.
+        assert!(!advance_binding_in_registry(&mut registry, "same-id", &old, &new).unwrap());
+        assert_eq!(registry.by_schedule.get("same-id"), Some(&new));
+        assert_eq!(
+            registry.by_delegation.get(&new).map(String::as_str),
+            Some("same-id")
+        );
+
+        // A head that moved away from a delegation this schedule never reserved
+        // is a genuine conflict, not a stale head.
+        let unreserved = "f".repeat(64);
+        let mut other = TaskBindingRegistry {
+            schema: 1,
+            by_delegation: BTreeMap::from([(stale.clone(), "same-id".to_owned())]),
+            by_schedule: BTreeMap::from([("same-id".to_owned(), stale.clone())]),
+        };
+        let error =
+            advance_binding_in_registry(&mut other, "same-id", &unreserved, &new).unwrap_err();
+        assert!(error.to_string().contains("task binding changed"));
     }
 }

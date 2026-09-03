@@ -1865,10 +1865,13 @@ pub enum ScheduleStatusArg {
 pub enum ScheduleDecisionArg {
     /// A newer task-bound material receipt proves progress.
     Keep,
-    /// No newer receipt exists; wake the same owner once.
+    /// No newer receipt exists; wake the same owner with a concrete instruction. May repeat.
     Wake,
-    /// The receipt is still unchanged after the wake; use one replacement.
+    /// The receipt is still unchanged after a wake; hand the work to one different agent.
     Redirect,
+    /// The receipt is still unchanged after a wake; the calling identity becomes the assignee
+    /// and does the next step itself. Takes no `--replacement`.
+    Takeover,
     /// The exact expected result is complete.
     Complete,
 }
@@ -2066,13 +2069,13 @@ pub enum SchedulesCmd {
         /// RFC3339 timestamp of the receipt's material progress
         #[arg(long)]
         material_at: String,
-        /// Next wake time for keep, wake, or redirect decisions
+        /// Next wake time for keep, wake, redirect, or takeover decisions
         #[arg(long)]
         due_at: Option<String>,
         /// Different managed-agent pubkey required by a redirect decision
         #[arg(long)]
         replacement: Option<String>,
-        /// Visible wake, redirect delegation, or completion message. Required except for keep.
+        /// Visible wake, redirect delegation, takeover, or completion message. Required except for keep.
         /// Pass `-` to read the message from stdin (real newlines, no shell quoting),
         /// exactly like `buzz messages send --content -`.
         #[arg(long)]

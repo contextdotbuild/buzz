@@ -5254,12 +5254,15 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("generic `online` presence, an open session, or an unchanged dirty worktree is not progress"));
         assert!(prompt.contains("otherwise cause the next step now"));
         assert!(prompt.contains("do it in that heartbeat and record the new receipt"));
-        assert!(prompt.contains("**wake** the same assignee once with a concrete instruction"));
+        assert!(prompt.contains("**wake** the same assignee with a concrete instruction"));
+        assert!(prompt.contains("a wake may repeat"));
         assert!(prompt.contains("**redirect** to exactly one different agent"));
+        assert!(prompt.contains("**takeover** (`--decision takeover`, no `--replacement`)"));
+        assert!(prompt.contains("The ledger never blocks progress"));
         assert!(prompt.contains("Never redirect to yourself"));
         assert!(prompt.contains("never create a second record for the same outcome"));
         assert!(prompt.contains("never wait for the human to say \"continue\""));
-        assert!(prompt.contains("Wake, redirect, and complete require `--message`"));
+        assert!(prompt.contains("Wake, redirect, takeover, and complete require `--message`"));
         assert!(prompt.contains("through stdin with `--message -`"));
         assert!(prompt.contains("do not send a separate message first"));
         assert!(prompt.contains("`--due-at` 10 to 15 minutes ahead"));
@@ -5330,15 +5333,21 @@ fn schedule_heartbeat_prompt() -> String {
             - Otherwise cause the next step now. If you can do the next step yourself with the\n\
               authority you already have, do it during this heartbeat and record the new receipt\n\
               (keep with the fresh `--material-at`, or complete). If the assignee must do it,\n\
-              `--decision wake` the same assignee once with the unchanged receipt, `--material-at`,\n\
+              `--decision wake` the same assignee with the unchanged receipt, `--material-at`,\n\
               `--due-at` 10 to 15 minutes away, and a concrete `--message` saying exactly what to do\n\
-              next. If the exact receipt is still unchanged at the next check after that wake,\n\
-              `--decision redirect` to exactly one different agent with `--replacement` and a\n\
-              `--message` that is the new delegation: exactly one `Expected result: ...` line and\n\
-              exactly one `Evidence locator: ...` line matching the stored task. Never redirect to\n\
+              next; a wake may repeat. If the exact receipt is still unchanged at the next check\n\
+              after a wake, either `--decision redirect` to exactly one different agent with\n\
+              `--replacement` and a `--message` that is the new delegation with\n\
+              exactly one `Expected result: ...` line and exactly one `Evidence locator: ...` line\n\
+              matching the stored task, or `--decision takeover` (no `--replacement`) with the unchanged receipt\n\
+              and a `--message` saying what you will do, which makes you the assignee: then do the\n\
+              next step yourself in this same heartbeat. Never redirect to\n\
               yourself, never create a second record for the same outcome, and never wait for the\n\
-              human to say continue. The driver role never transfers; a newer material receipt\n\
-              resets the one-wake allowance.\n\
+              human to say continue. The driver role never transfers.\n\
+            - The ledger never blocks progress. A `conflict` or `user_error` from `reconcile` is\n\
+              stale record state or a malformed argument, never a blocker to report or to wait on:\n\
+              read the message, run `claim-due` again, and take the next legal action (wake,\n\
+              redirect, takeover, keep, or complete) in this same heartbeat.\n\
             - A genuine blocker that only the owner can resolve: publish the exact blocker and the\n\
               decision needed, once, with a recommended default, in the task's conversation, then\n\
               keep the record with that blocker as its receipt. A lack of recent chat is never a\n\
@@ -5436,15 +5445,20 @@ mod heartbeat_prompt_tests {
         assert!(prompt.contains("receipt cannot defer recovery"));
         assert!(prompt.contains("Otherwise cause the next step now"));
         assert!(prompt.contains("do it during this heartbeat and record the new receipt"));
-        assert!(prompt.contains("`--decision wake` the same assignee once"));
+        assert!(prompt.contains("`--decision wake` the same assignee with the unchanged receipt"));
+        assert!(prompt.contains("a wake may repeat"));
         assert!(prompt.contains("`--decision redirect` to exactly one different agent"));
+        assert!(prompt.contains("`--decision takeover` (no `--replacement`)"));
+        assert!(prompt.contains("makes you the assignee"));
+        assert!(prompt.contains("The ledger never blocks progress"));
+        assert!(prompt.contains("never a blocker to report or to wait on"));
         assert!(prompt.contains("`--replacement`"));
         assert!(prompt.contains("exactly one `Expected result: ...` line"));
         assert!(prompt.contains("exactly one `Evidence locator: ...` line"));
         assert!(prompt.contains("yourself, never create a second record for the same outcome"));
         assert!(prompt.contains("human to say continue"));
         assert!(prompt.contains("driver role never transfers"));
-        assert!(prompt.contains("resets the one-wake allowance"));
+        assert!(!prompt.contains("one-wake allowance"));
         assert!(prompt.contains("genuine blocker that only the owner can resolve"));
         assert!(prompt.contains("with a recommended default"));
         assert!(prompt.contains("`--message -`, the same convention as `--content -`"));
