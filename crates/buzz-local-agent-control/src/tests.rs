@@ -660,6 +660,7 @@ fn approved_inverse_is_deterministic_and_preserves_runtime_environment() {
             "BUZZ_ACP_HEARTBEAT_MODE",
             "BUZZ_ACP_LAZY_POOL",
             "BUZZ_ACP_IDLE_POOL_SLEEP",
+            "BUZZ_ACP_TURN_SEGMENT",
         ] {
             assert_eq!(
                 after_record["env_vars"][key], before_record["env_vars"][key],
@@ -737,7 +738,8 @@ fn production_forward_contract_is_exactly_the_approved_immutable_release() {
             ("BUZZ_ACP_HEARTBEAT_INTERVAL".to_owned(), "900".to_owned()),
             ("BUZZ_ACP_HEARTBEAT_MODE".to_owned(), "schedules".to_owned()),
             ("BUZZ_ACP_LAZY_POOL".to_owned(), "true".to_owned()),
-            ("BUZZ_ACP_IDLE_POOL_SLEEP".to_owned(), "300".to_owned())
+            ("BUZZ_ACP_IDLE_POOL_SLEEP".to_owned(), "300".to_owned()),
+            ("BUZZ_ACP_TURN_SEGMENT".to_owned(), "2700".to_owned())
         ])
     );
     assert!(forward.environment.env_unset().is_empty());
@@ -784,7 +786,8 @@ fn production_inverse_contract_is_exactly_the_approved_immutable_release() {
             ("BUZZ_ACP_HEARTBEAT_INTERVAL".to_owned(), "900".to_owned()),
             ("BUZZ_ACP_HEARTBEAT_MODE".to_owned(), "schedules".to_owned()),
             ("BUZZ_ACP_LAZY_POOL".to_owned(), "true".to_owned()),
-            ("BUZZ_ACP_IDLE_POOL_SLEEP".to_owned(), "300".to_owned())
+            ("BUZZ_ACP_IDLE_POOL_SLEEP".to_owned(), "300".to_owned()),
+            ("BUZZ_ACP_TURN_SEGMENT".to_owned(), "2700".to_owned())
         ])
     );
     assert!(inverse.environment.env_unset().is_empty());
@@ -1169,6 +1172,7 @@ fn receipt_is_redacted_and_lists_only_allowed_change_names() {
             "BUZZ_ACP_HEARTBEAT_MODE",
             "BUZZ_ACP_IDLE_POOL_SLEEP",
             "BUZZ_ACP_LAZY_POOL",
+            "BUZZ_ACP_TURN_SEGMENT",
         ]
     );
 }

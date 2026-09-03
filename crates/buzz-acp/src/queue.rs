@@ -70,6 +70,10 @@ pub enum CancelReason {
     /// and incorporate the message if relevant
     /// (`MultipleEventHandling::Steer`, the default mid-turn path).
     Steer,
+    /// The turn reached its wall-clock segment cap and was paused, not
+    /// failed. The same session is re-prompted so the agent can post a
+    /// checkpoint and **continue** where it stopped.
+    SegmentCap,
 }
 
 /// A batch of events to prompt the agent with.
@@ -1633,6 +1637,10 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     //    - `Steer` (default): a message arrived while the agent was working; it
     //      should *continue* its work and weave the message in if relevant.
     let has_cancelled = !batch.cancelled_events.is_empty();
+    // A segment-cap resume with no new events re-dispatches the original
+    // events unchanged; the closing note below still tells the agent this is
+    // a continuation, not a fresh request.
+    let segment_resume = matches!(batch.cancel_reason, Some(CancelReason::SegmentCap));
     let framing = MergeFraming::for_reason(batch.cancel_reason);
 
     // 4a. Cancelled events section.
@@ -1689,8 +1697,8 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     };
     sections.push(event_section);
 
-    // 4c. Closing note for cancel + re-prompt.
-    if has_cancelled {
+    // 4c. Closing note for cancel + re-prompt (or a segment-cap resume).
+    if has_cancelled || segment_resume {
         sections.push(framing.closing_note.to_string());
     }
 
@@ -1730,6 +1738,17 @@ impl MergeFraming {
                 closing_note: "Note: A new message arrived while you were working. Continue your \
                      in-progress work and incorporate the new message if it's relevant; if it's \
                      unrelated, you may briefly acknowledge it and carry on.",
+            },
+            Some(CancelReason::SegmentCap) => MergeFraming {
+                prior_header: "[What you were working on — paused at the turn segment cap]",
+                new_header_single: "[New message — arrived while you were working]",
+                new_header_multi_prefix: "[New messages — arrived while you were working",
+                closing_note:
+                    "Note: Your previous turn reached its time segment cap and was paused, \
+                     not failed. Your session, files, and in-progress work are intact. First post \
+                     one short checkpoint in this channel (done so far / next step / any blocker), \
+                     then continue exactly where you stopped. If new messages arrived, weave them \
+                     in; do not restart the work from scratch.",
             },
             Some(CancelReason::Interrupt) => MergeFraming {
                 prior_header: "[Previous request — interrupted before completion]",

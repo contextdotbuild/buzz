@@ -31,6 +31,10 @@ const RUNTIME_FENCE_LEASE_DURATION_SECS: u64 = 90;
 /// still prevents a replacement from taking over.
 const RUNTIME_FENCE_SHUTDOWN_MARGIN_SECS: u64 = 30;
 const RUNTIME_FENCE_CAS_ATTEMPTS: usize = 3;
+/// Delay between renewal retries after a transient relay failure. Retries
+/// continue until the safe shutdown deadline, so a multi-second relay blip
+/// no longer kills a healthy runtime while its lease is still valid.
+const RUNTIME_FENCE_RENEW_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 struct RuntimeFenceLease {
@@ -448,8 +452,31 @@ pub(crate) async fn acquire(
     bail!("could not acquire the durable runtime identity fence after bounded CAS retries")
 }
 
-async fn renew_once(rest: &RestClient, guard: &RuntimeFenceGuard) -> Result<u64> {
-    let current = fetch_head(rest, &guard.owner).await?;
+/// Why one renewal attempt did not extend the lease.
+#[derive(Debug)]
+enum RenewError {
+    /// The durable head no longer names this runtime, or another runtime
+    /// replaced it. Exclusivity is gone; the caller must revoke immediately.
+    Lost(String),
+    /// The relay could not be reached or did not answer. The lease itself is
+    /// still valid until it expires, so the caller may retry before the safe
+    /// shutdown deadline.
+    Transient(anyhow::Error),
+}
+
+impl std::fmt::Display for RenewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RenewError::Lost(reason) => write!(f, "{reason}"),
+            RenewError::Transient(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+async fn renew_once(rest: &RestClient, guard: &RuntimeFenceGuard) -> Result<u64, RenewError> {
+    let current = fetch_head(rest, &guard.owner)
+        .await
+        .map_err(RenewError::Transient)?;
     let revision = current.as_ref().map(|head| head.event.id.to_hex());
     let RenewalDecision::Write {
         lease,
@@ -463,16 +490,34 @@ async fn renew_once(rest: &RestClient, guard: &RuntimeFenceGuard) -> Result<u64>
         now_secs(),
     )
     else {
-        bail!("runtime identity fence was lost or expired");
+        return Err(RenewError::Lost(
+            "runtime identity fence was lost or expired".to_string(),
+        ));
     };
     let expected = ExpectedFenceHead::Event(expected_revision);
     if publish_lease(rest, &guard.owner, current.as_ref(), &lease, &expected)
-        .await?
+        .await
+        .map_err(RenewError::Transient)?
         .is_none()
     {
-        bail!("runtime identity fence renewal lost its atomic revision");
+        return Err(RenewError::Lost(
+            "runtime identity fence renewal lost its atomic revision".to_string(),
+        ));
     }
     Ok(lease.lease_expires_at)
+}
+
+/// How long to wait before the next renewal retry, or `None` when the safe
+/// shutdown deadline has already passed and the runtime must fail closed.
+fn renewal_retry_delay(
+    fail_closed_at: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> Option<Duration> {
+    let remaining = fail_closed_at.checked_duration_since(now)?;
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(remaining.min(RUNTIME_FENCE_RENEW_RETRY_DELAY))
 }
 
 pub(crate) async fn maintain(
@@ -496,32 +541,61 @@ pub(crate) async fn maintain(
             );
             return;
         }
-        match tokio::time::timeout_at(deadline, renew_once(&rest, &guard)).await {
-            Ok(Ok(lease_expires_at)) => {
-                let Some(fail_closed_at) =
-                    renewal_deadline(lease_expires_at, now_secs(), tokio::time::Instant::now())
-                else {
+        // Retry transient relay failures until the safe shutdown deadline.
+        // The lease is still exclusively ours until it expires, so a blip
+        // that clears within the window must not kill a healthy runtime.
+        loop {
+            let now = tokio::time::Instant::now();
+            match tokio::time::timeout_at(deadline, renew_once(&rest, &guard)).await {
+                Ok(Ok(lease_expires_at)) => {
+                    let Some(fail_closed_at) =
+                        renewal_deadline(lease_expires_at, now_secs(), tokio::time::Instant::now())
+                    else {
+                        report_loss(
+                            &guard,
+                            &loss_tx,
+                            "renewed runtime identity fence has no safe shutdown margin"
+                                .to_string(),
+                        );
+                        return;
+                    };
+                    guard.lease_expires_at = lease_expires_at;
+                    guard.fail_closed_at = fail_closed_at;
+                    break;
+                }
+                Ok(Err(RenewError::Lost(reason))) => {
+                    report_loss(&guard, &loss_tx, reason);
+                    return;
+                }
+                Ok(Err(RenewError::Transient(error))) => {
+                    let Some(delay) = renewal_retry_delay(deadline, tokio::time::Instant::now())
+                    else {
+                        report_loss(
+                            &guard,
+                            &loss_tx,
+                            format!(
+                                "runtime identity fence renewal kept failing until its safe shutdown deadline: {error}"
+                            ),
+                        );
+                        return;
+                    };
+                    tracing::warn!(
+                        %error,
+                        retry_in_secs = delay.as_secs(),
+                        remaining_secs = deadline.saturating_duration_since(now).as_secs(),
+                        "runtime identity fence renewal failed transiently — retrying before lease expiry"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(_) => {
                     report_loss(
                         &guard,
                         &loss_tx,
-                        "renewed runtime identity fence has no safe shutdown margin".to_string(),
+                        "runtime identity fence renewal exceeded its pre-expiry deadline"
+                            .to_string(),
                     );
                     return;
-                };
-                guard.lease_expires_at = lease_expires_at;
-                guard.fail_closed_at = fail_closed_at;
-            }
-            Ok(Err(error)) => {
-                report_loss(&guard, &loss_tx, error.to_string());
-                return;
-            }
-            Err(_) => {
-                report_loss(
-                    &guard,
-                    &loss_tx,
-                    "runtime identity fence renewal exceeded its pre-expiry deadline".to_string(),
-                );
-                return;
+                }
             }
         }
     }
@@ -751,5 +825,31 @@ mod tests {
         let _ = in_flight_prompt.await;
         let _ = blocked_main_loop.await;
         let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn transient_renewal_failures_retry_until_the_safe_shutdown_deadline() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + Duration::from_secs(27);
+        assert_eq!(
+            renewal_retry_delay(deadline, now),
+            Some(RUNTIME_FENCE_RENEW_RETRY_DELAY),
+            "a long remaining window retries at the standard delay"
+        );
+        assert_eq!(
+            renewal_retry_delay(deadline, now + Duration::from_secs(25)),
+            Some(Duration::from_secs(2)),
+            "the last retry is clamped to the remaining window"
+        );
+        assert_eq!(
+            renewal_retry_delay(deadline, deadline),
+            None,
+            "at the deadline the runtime fails closed instead of retrying"
+        );
+        assert_eq!(
+            renewal_retry_delay(deadline, deadline + Duration::from_secs(1)),
+            None,
+            "past the deadline the runtime fails closed"
+        );
     }
 }

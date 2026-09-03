@@ -94,6 +94,12 @@ pub enum AcpError {
     #[error("Hard turn timeout exceeded (silence {silence:?})")]
     HardTimeout { silence: std::time::Duration },
 
+    #[error("Turn segment cap reached ({0:?}) — pausing for a checkpoint")]
+    SegmentCap(std::time::Duration),
+
+    #[error("Turn ended without any agent output — treating as a failed turn")]
+    EmptyTurn,
+
     #[error("Agent did not stop within {0:?} after cancellation")]
     CancelDrainTimeout(std::time::Duration),
 
@@ -213,6 +219,15 @@ pub struct AcpClient {
     steer_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>>,
     /// Usage tracker for goose/buzz-agent's cumulative notification format.
     goose_usage: UsageTracker,
+    /// Whether the agent produced any session update during the current
+    /// turn. A turn that ends `end_turn` with no output at all is a provider
+    /// or adapter failure surfaced as success (for example an upstream 503),
+    /// and must be retried rather than silently accepted.
+    turn_saw_output: bool,
+    /// Optional soft cap on one turn's wall-clock length. Unlike the hard
+    /// deadline it is never renewed by a steer: when it fires the turn is
+    /// paused with a checkpoint and re-prompted in the same session.
+    turn_segment: Option<std::time::Duration>,
     /// Per-turn prompt-response usage and Claude's optional cumulative cost.
     standard_usage: StandardUsageTracker,
     /// Known adapter identity for prompt-response usage mapping.
@@ -590,6 +605,8 @@ impl AcpClient {
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            turn_saw_output: false,
+            turn_segment: None,
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
         })
@@ -839,8 +856,11 @@ impl AcpClient {
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
         let params = build_prompt_params(session_id, prompt_blocks);
-        let hard_deadline = tokio::time::Instant::now() + max_duration;
+        let turn_started = tokio::time::Instant::now();
+        let hard_deadline = turn_started + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
+        self.turn_saw_output = false;
+        let segment_deadline = self.turn_segment.map(|segment| turn_started + segment);
 
         // Mark the usage tracker as in-flight for this turn BEFORE sending the
         // prompt so that any setup notifications recorded earlier are not
@@ -873,6 +893,7 @@ impl AcpClient {
                 idle_timeout,
                 hard_deadline,
                 max_duration,
+                segment_deadline,
             )
             .await;
 
@@ -883,7 +904,9 @@ impl AcpClient {
                 self.last_prompt_id = None;
                 self.current_hard_deadline = None;
             }
-            Err(AcpError::IdleTimeout(_) | AcpError::HardTimeout { .. }) => {
+            Err(
+                AcpError::IdleTimeout(_) | AcpError::HardTimeout { .. } | AcpError::SegmentCap(_),
+            ) => {
                 // Leave last_prompt_id and current_hard_deadline set —
                 // caller will invoke cancel_with_cleanup.
             }
@@ -892,7 +915,21 @@ impl AcpClient {
                 self.current_hard_deadline = None;
             }
         }
-        self.parse_prompt_response(session_id, &result?)
+        let stop_reason = self.parse_prompt_response(session_id, &result?)?;
+        if matches!(stop_reason, StopReason::EndTurn) && !self.turn_saw_output {
+            // The adapter reported a clean end of turn but the agent never
+            // emitted a message, thought, tool call, or usage update. That is
+            // how an upstream provider failure (for example a 503 from the
+            // capacity proxy) surfaces through codex-acp: the transcript ends
+            // with an error and the harness would otherwise drop the request
+            // as handled. Surface it as a failed turn so the batch is retried.
+            tracing::warn!(
+                target: "acp::prompt",
+                "session/prompt ended with end_turn but no agent output — treating as failed turn"
+            );
+            return Err(AcpError::EmptyTurn);
+        }
+        Ok(stop_reason)
     }
 
     /// Send a `session/cancel` **notification** (no `id` field, no response expected).
@@ -936,6 +973,11 @@ impl AcpClient {
     /// for the supervisor's post-initialize log line.
     pub fn steering_supported(&self) -> bool {
         self.steering_supported
+    }
+
+    /// Configure the per-turn segment cap. `Duration::ZERO` disables it.
+    pub fn set_turn_segment(&mut self, segment: std::time::Duration) {
+        self.turn_segment = (!segment.is_zero()).then_some(segment);
     }
 
     /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an
@@ -1113,6 +1155,7 @@ impl AcpClient {
                 cleanup_idle,
                 hard_deadline,
                 remaining,
+                None,
             )
             .await?;
         self.parse_prompt_response(session_id, &result)
@@ -1376,6 +1419,7 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         hard_deadline: tokio::time::Instant,
         max_duration: std::time::Duration,
+        segment_deadline: Option<tokio::time::Instant>,
     ) -> Result<serde_json::Value, AcpError> {
         use tokio::time::Instant;
 
@@ -1406,12 +1450,20 @@ impl AcpClient {
         loop {
             // Determine which deadline fires first BEFORE sleeping — this is
             // the classification we'll use on timeout, immune to scheduler jitter.
+            // The segment cap is checked first: it is a soft pause that never
+            // moves with steers, so a steady stream of output cannot extend
+            // one turn past it.
+            let segment_fires_first = segment_deadline
+                .is_some_and(|segment| segment <= idle_deadline && segment <= hard_deadline);
             let idle_fires_first = idle_deadline < hard_deadline;
-            let next_deadline = if idle_fires_first {
-                idle_deadline
-            } else {
-                hard_deadline
-            };
+            let next_deadline =
+                if let (true, Some(segment)) = (segment_fires_first, segment_deadline) {
+                    segment
+                } else if idle_fires_first {
+                    idle_deadline
+                } else {
+                    hard_deadline
+                };
 
             // Pre-select deadline check — required by Max's review. Under
             // `biased`, a continuously-ready reader arm wins every poll and
@@ -1428,7 +1480,13 @@ impl AcpClient {
                     // normal dispatch handles redelivery).
                     let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                 }
-                if idle_fires_first {
+                if segment_fires_first {
+                    let segment = self.turn_segment.unwrap_or_default();
+                    tracing::warn!(
+                        "turn segment cap ({segment:?}) reached — pausing turn for a checkpoint"
+                    );
+                    return Err(AcpError::SegmentCap(segment));
+                } else if idle_fires_first {
                     tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
                     return Err(AcpError::IdleTimeout(idle_timeout));
                 } else {
@@ -1549,7 +1607,13 @@ impl AcpClient {
                     if let Some((_, _, ack_tx)) = pending_steer.take() {
                         let _ = ack_tx.send(crate::pool::SteerAck::PromptCompletedNeutral);
                     }
-                    if idle_fires_first {
+                    if segment_fires_first {
+                        let segment = self.turn_segment.unwrap_or_default();
+                        tracing::warn!(
+                            "turn segment cap ({segment:?}) reached — pausing turn for a checkpoint"
+                        );
+                        return Err(AcpError::SegmentCap(segment));
+                    } else if idle_fires_first {
                         tracing::warn!("idle timeout ({idle_timeout:?}) — no agent activity");
                         return Err(AcpError::IdleTimeout(idle_timeout));
                     } else {
@@ -1760,6 +1824,7 @@ impl AcpClient {
                                 }
                             }
                             "_goose/unstable/session/update" => {
+                                self.turn_saw_output = true;
                                 self.handle_goose_usage_update(&msg);
                             }
                             "session/request_permission" => {
@@ -1803,6 +1868,7 @@ impl AcpClient {
     /// leave it `None` and are steered via `_session/steering` instead, which
     /// needs no run id.
     fn handle_session_update(&mut self, msg: &serde_json::Value) -> bool {
+        self.turn_saw_output = true;
         let update = &msg["params"]["update"];
         let update_type = update
             .get("sessionUpdate")
@@ -3207,6 +3273,7 @@ mod tests {
                 std::time::Duration::from_millis(100),
                 hard_deadline,
                 max_dur,
+                None,
             )
             .await;
         assert!(
@@ -3228,6 +3295,7 @@ mod tests {
                 std::time::Duration::from_secs(60),
                 hard_deadline,
                 max_dur,
+                None,
             )
             .await;
         assert!(
@@ -3275,6 +3343,7 @@ mod tests {
                 std::time::Duration::from_millis(200),
                 hard_deadline,
                 max_dur,
+                None,
             )
             .await;
         let elapsed = start.elapsed();
@@ -3298,6 +3367,7 @@ mod tests {
                 std::time::Duration::from_secs(2),
                 hard_deadline,
                 max_dur,
+                None,
             )
             .await;
         assert!(result.is_ok());
@@ -3317,6 +3387,7 @@ mod tests {
                 std::time::Duration::from_secs(2),
                 hard_deadline,
                 max_dur,
+                None,
             )
             .await;
         assert!(matches!(result, Err(AcpError::AgentExited)));
@@ -3347,6 +3418,7 @@ mod tests {
                 std::time::Duration::from_secs(3),
                 hard_deadline,
                 max_dur,
+                None,
             )
             .await;
         assert!(result.is_ok(), "expected Ok response, got {result:?}");
@@ -3360,7 +3432,7 @@ mod tests {
         let max_dur = std::time::Duration::from_secs(10);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
         let result = client
-            .read_until_response_with_idle_timeout("test", 999, idle, hard_deadline, max_dur)
+            .read_until_response_with_idle_timeout("test", 999, idle, hard_deadline, max_dur, None)
             .await;
         assert!(
             matches!(result, Err(AcpError::IdleTimeout(_))),
@@ -3407,7 +3479,7 @@ mod tests {
         let idle = std::time::Duration::from_secs(60); // idle ≫ hard
         let start = std::time::Instant::now();
         let result = client
-            .read_until_response_with_idle_timeout("test", 999, idle, hard_deadline, hard)
+            .read_until_response_with_idle_timeout("test", 999, idle, hard_deadline, hard, None)
             .await;
         let elapsed = start.elapsed();
         assert!(
@@ -3472,6 +3544,7 @@ mod tests {
                 std::time::Duration::from_millis(100),
                 hard_deadline,
                 max_dur,
+                None,
             )
             .await;
         let elapsed = start.elapsed();
@@ -3508,6 +3581,7 @@ mod tests {
                 std::time::Duration::from_millis(200),
                 hard_deadline,
                 max_dur,
+                None,
             )
             .await;
         let elapsed = start.elapsed();
@@ -3937,7 +4011,14 @@ mod tests {
         let max_dur = std::time::Duration::from_secs(5);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
         let read_result = client
-            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline, max_dur)
+            .read_until_response_with_idle_timeout(
+                "sess-test",
+                999,
+                idle,
+                hard_deadline,
+                max_dur,
+                None,
+            )
             .await;
         send_task.await.expect("send_task should complete");
 
@@ -4005,7 +4086,14 @@ mod tests {
         let max_dur = std::time::Duration::from_secs(10);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
         let read_result = client
-            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline, max_dur)
+            .read_until_response_with_idle_timeout(
+                "sess-test",
+                999,
+                idle,
+                hard_deadline,
+                max_dur,
+                None,
+            )
             .await;
         send_task.await.expect("send_task should complete");
 
@@ -4074,7 +4162,14 @@ mod tests {
         let max_dur = std::time::Duration::from_secs(3);
         let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         let result = client
-            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline, max_dur)
+            .read_until_response_with_idle_timeout(
+                "sess-test",
+                999,
+                idle,
+                hard_deadline,
+                max_dur,
+                None,
+            )
             .await;
         send_task.await.expect("send_task should complete");
 
@@ -4148,7 +4243,14 @@ mod tests {
         let max_dur = std::time::Duration::from_secs(10);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
         let _ = client
-            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline, max_dur)
+            .read_until_response_with_idle_timeout(
+                "sess-test",
+                999,
+                idle,
+                hard_deadline,
+                max_dur,
+                None,
+            )
             .await;
         send_task.await.expect("send_task should complete");
 
@@ -4398,7 +4500,14 @@ mod tests {
         let max_dur = std::time::Duration::from_secs(3);
         let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         let result = client
-            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline, max_dur)
+            .read_until_response_with_idle_timeout(
+                "sess-test",
+                999,
+                idle,
+                hard_deadline,
+                max_dur,
+                None,
+            )
             .await;
         send_task.await.expect("send_task should complete");
 
@@ -4451,7 +4560,14 @@ mod tests {
         let max_dur = std::time::Duration::from_secs(3);
         let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         let result = client
-            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline, max_dur)
+            .read_until_response_with_idle_timeout(
+                "sess-test",
+                999,
+                idle,
+                hard_deadline,
+                max_dur,
+                None,
+            )
             .await;
         send_task.await.expect("send_task should complete");
 

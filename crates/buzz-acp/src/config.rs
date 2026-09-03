@@ -294,6 +294,15 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_MAX_TURN_DURATION", default_value_t = DEFAULT_MAX_TURN_DURATION_SECS)]
     pub max_turn_duration: u64,
 
+    /// Soft wall-clock cap per turn segment in seconds. `0` = disabled. When a
+    /// turn runs this long it is paused with `session/cancel` and re-prompted
+    /// in the same session with a checkpoint instruction, so long work becomes
+    /// a chain of visible, resumable segments instead of one opaque turn. A
+    /// mid-turn steer never extends it. Must be greater than `idle_timeout`
+    /// and less than `max_turn_duration` when enabled.
+    #[arg(long, env = "BUZZ_ACP_TURN_SEGMENT", default_value_t = 0)]
+    pub turn_segment: u64,
+
     /// Deprecated: alias for --idle-timeout. If both set, --idle-timeout wins.
     #[arg(long, env = "BUZZ_ACP_TURN_TIMEOUT", hide = true)]
     pub turn_timeout: Option<u64>,
@@ -550,6 +559,8 @@ pub struct Config {
     pub mcp_command: String,
     pub idle_timeout_secs: u64,
     pub max_turn_duration_secs: u64,
+    /// Soft per-turn segment cap in seconds; `0` disables it.
+    pub turn_segment_secs: u64,
     pub agents: u32,
     pub heartbeat_interval_secs: u64,
     pub heartbeat_mode: HeartbeatMode,
@@ -1059,6 +1070,20 @@ impl Config {
             )));
         }
 
+        // A segment cap only makes sense strictly between the idle timeout and
+        // the hard cap: below idle it would fire before silence is detectable,
+        // at or above the hard cap it could never fire.
+        let turn_segment_secs = args.turn_segment;
+        if turn_segment_secs != 0
+            && (turn_segment_secs <= idle_timeout_secs
+                || turn_segment_secs >= max_turn_duration_secs)
+        {
+            return Err(ConfigError::ConfigFile(format!(
+                "turn_segment ({}s) must be greater than idle_timeout ({}s) and less than max_turn_duration ({}s)",
+                turn_segment_secs, idle_timeout_secs, max_turn_duration_secs
+            )));
+        }
+
         let respond_to_allowlist = if args.respond_to == RespondTo::Allowlist {
             let raw = args.respond_to_allowlist.unwrap_or_default();
             if raw.is_empty() {
@@ -1127,6 +1152,7 @@ impl Config {
             mcp_command: args.mcp_command,
             idle_timeout_secs,
             max_turn_duration_secs,
+            turn_segment_secs,
             agents: args.agents,
             heartbeat_interval_secs: heartbeat_interval,
             heartbeat_mode: args.heartbeat_mode,
@@ -1193,7 +1219,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s heartbeat_mode={} subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s segment={}s agents={} heartbeat={}s heartbeat_mode={} subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1201,6 +1227,7 @@ impl Config {
             self.mcp_command,
             self.idle_timeout_secs,
             self.max_turn_duration_secs,
+            self.turn_segment_secs,
             self.agents,
             self.heartbeat_interval_secs,
             self.heartbeat_mode,
@@ -1510,6 +1537,7 @@ mod tests {
             mcp_command: "".into(),
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
+            turn_segment_secs: 0,
             agents: 1,
             heartbeat_interval_secs: 0,
             heartbeat_mode: HeartbeatMode::Feed,

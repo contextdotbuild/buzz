@@ -54,11 +54,12 @@ const ROLLBACK_TOOLCHAIN: &str = "rustc 1.95.0";
 const APPROVED_ARTIFACT_OWNER: &str = "timi";
 const APPROVED_ARTIFACT_MODE: &str = "0555";
 const CANONICAL_AGENT_COUNT: usize = 9;
-const ALLOWED_ENV_KEYS: [&str; 4] = [
+const ALLOWED_ENV_KEYS: [&str; 5] = [
     "BUZZ_ACP_HEARTBEAT_INTERVAL",
     "BUZZ_ACP_HEARTBEAT_MODE",
     "BUZZ_ACP_LAZY_POOL",
     "BUZZ_ACP_IDLE_POOL_SLEEP",
+    "BUZZ_ACP_TURN_SEGMENT",
 ];
 
 /// Command-line inputs after argument parsing.
@@ -649,6 +650,11 @@ impl EnvironmentContract {
             ("BUZZ_ACP_HEARTBEAT_MODE".to_owned(), "schedules".to_owned()),
             ("BUZZ_ACP_LAZY_POOL".to_owned(), "true".to_owned()),
             ("BUZZ_ACP_IDLE_POOL_SLEEP".to_owned(), "300".to_owned()),
+            // 45-minute soft segment cap: long turns pause for a checkpoint
+            // and resume in the same session instead of running opaque for
+            // hours. Sits strictly between the 900s idle timeout and the
+            // 7200s hard cap the runtime enforces.
+            ("BUZZ_ACP_TURN_SEGMENT".to_owned(), "2700".to_owned()),
         ])
     }
 

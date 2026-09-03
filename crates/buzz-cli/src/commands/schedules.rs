@@ -2768,6 +2768,24 @@ fn require_due_at(input: &ReconcileInput) -> Result<&str, CliError> {
     })
 }
 
+/// A driver may wake the current assignee or hand the task to a different
+/// agent, but never "redirect" it to itself: that records ownership churn in
+/// the audit while nobody does the next step. The driver already owns the
+/// outcome; when the assignee has stopped, it should do the next action or
+/// name a genuinely different doer.
+fn reject_self_redirect(
+    replacement_pubkey: Option<&str>,
+    own_pubkey: &str,
+) -> Result<(), CliError> {
+    match replacement_pubkey {
+        Some(replacement) if replacement.eq_ignore_ascii_case(own_pubkey) => Err(CliError::Usage(
+            "redirect cannot target this identity; do the next step yourself, wake the current assignee, or name a different assignee"
+                .into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn reject_replacement(input: &ReconcileInput) -> Result<(), CliError> {
     if input.replacement_pubkey.is_some() || input.replacement_delegation_event_id.is_some() {
         return Err(CliError::Usage(
@@ -2974,6 +2992,10 @@ fn build_action_event(
     let event = client.sign_event(builder)?;
     match input.decision {
         ScheduleDecision::Redirect => {
+            reject_self_redirect(
+                input.replacement_pubkey.as_deref(),
+                &client.keys().public_key().to_hex(),
+            )?;
             let replacement_task = TaskBinding {
                 assignee_pubkey: input.replacement_pubkey.clone().ok_or_else(|| {
                     CliError::Usage("--replacement is required for redirect".into())
@@ -5435,5 +5457,18 @@ mod tests {
             &owner.public_key(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn redirect_cannot_target_the_calling_identity() {
+        let own = "ab".repeat(32);
+        let other = "cd".repeat(32);
+        assert!(reject_self_redirect(None, &own).is_ok());
+        assert!(reject_self_redirect(Some(&other), &own).is_ok());
+        let error = reject_self_redirect(Some(&own), &own).expect_err("self redirect rejected");
+        assert!(matches!(error, CliError::Usage(_)));
+        assert!(error.to_string().contains("cannot target this identity"));
+        let upper = own.to_uppercase();
+        assert!(reject_self_redirect(Some(&upper), &own).is_err());
     }
 }

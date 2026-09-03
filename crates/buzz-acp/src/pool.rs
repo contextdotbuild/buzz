@@ -595,6 +595,9 @@ pub struct PromptContext {
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
     pub max_turn_duration: Duration,
+    /// Soft per-turn segment cap; `Duration::ZERO` disables it. See
+    /// [`AcpClient::set_turn_segment`].
+    pub turn_segment: Duration,
     /// Interval between per-turn `turn_liveness` observer pings. `Duration::ZERO`
     /// disables emission. This is the desktop crash-backstop signal — distinct
     /// from `heartbeat_prompt` (agent self-prompting).
@@ -2523,6 +2526,10 @@ pub async fn run_prompt_task(
         prompt_label(&source)
     );
 
+    // The segment cap is a per-turn soft pause; configure it on the client
+    // before every prompt so a respawned or rotated client inherits it.
+    agent.acp.set_turn_segment(ctx.turn_segment);
+
     // When control_rx is Some, wrap the prompt in select! so the main loop can
     // cancel it. Channel turns may also be interrupted or rotated. Managed
     // schedule heartbeats install a cancel-only sender so accepted foreground
@@ -2798,6 +2805,100 @@ pub async fn run_prompt_task(
                 requeue_batch_if_queue(&ctx, batch),
             );
         }
+        Err(AcpError::SegmentCap(segment)) => {
+            // Soft pause, not a failure: cancel the in-flight prompt but keep
+            // the session and its context. The batch is requeued as cancelled
+            // with `CancelReason::SegmentCap`, so the next dispatch re-prompts
+            // the same session with a checkpoint-and-continue note. The agent
+            // is healthy — no respawn, no retry penalty.
+            tracing::warn!(
+                target: "pool::prompt",
+                "turn segment cap ({}s) reached — pausing session {session_id} for a checkpoint",
+                segment.as_secs()
+            );
+            match agent
+                .acp
+                .cancel_with_cleanup(&session_id, ctx.idle_timeout)
+                .await
+            {
+                Ok(stop_reason) => {
+                    log_stop_reason(&source, &stop_reason);
+                    let usage = agent.acp.take_turn_usage();
+                    publish_agent_turn_metric(
+                        &ctx,
+                        usage,
+                        observer_channel_id,
+                        &session_id,
+                        &turn_id,
+                        Some(buzz_core::agent_turn_metric::StopReason::Cancelled),
+                    )
+                    .await;
+                    let retry_batch = requeue_batch_if_queue(&ctx, batch).map(|mut b| {
+                        b.cancel_reason = Some(CancelReason::SegmentCap);
+                        b
+                    });
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::Cancelled,
+                        retry_batch,
+                    );
+                }
+                Err(AcpError::AgentExited) => {
+                    tracing::error!(
+                        target: "pool::prompt",
+                        "agent {} exited during segment-cap cancel",
+                        agent.index
+                    );
+                    agent.state.invalidate_all();
+                    let usage = agent.acp.take_turn_usage();
+                    publish_agent_turn_metric(
+                        &ctx,
+                        usage,
+                        observer_channel_id,
+                        &session_id,
+                        &turn_id,
+                        Some(buzz_core::agent_turn_metric::StopReason::Error),
+                    )
+                    .await;
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::AgentExited,
+                        requeue_batch_if_queue(&ctx, batch),
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "pool::prompt",
+                        "segment-cap cancel_with_cleanup error: {e} — invalidating session"
+                    );
+                    agent.state.invalidate(&source);
+                    let usage = agent.acp.take_turn_usage();
+                    publish_agent_turn_metric(
+                        &ctx,
+                        usage,
+                        observer_channel_id,
+                        &session_id,
+                        &turn_id,
+                        Some(buzz_core::agent_turn_metric::StopReason::Error),
+                    )
+                    .await;
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::Timeout(TimeoutKind::Idle),
+                        requeue_batch_if_queue(&ctx, batch),
+                    );
+                }
+            }
+        }
         Err(AcpError::IdleTimeout(_)) => {
             tracing::warn!(
                 target: "pool::prompt",
@@ -2917,7 +3018,9 @@ pub async fn run_prompt_task(
             // AgentError means the agent caught a problem before mutating
             // session state (e.g. bad LLM response). The session is healthy —
             // don't invalidate it. Other errors may have corrupted state.
-            if !matches!(e, AcpError::AgentError { .. }) {
+            // EmptyTurn is a provider/adapter failure reported as success; the
+            // session itself is fine and the batch is retried with backoff.
+            if !matches!(e, AcpError::AgentError { .. } | AcpError::EmptyTurn) {
                 agent.state.invalidate(&source);
             }
             let usage = agent.acp.take_turn_usage();
@@ -6081,6 +6184,7 @@ while IFS= read -r line; do
   if [ "$count" -eq 1 ]; then
     printf '%s\n' '{{"jsonrpc":"2.0","id":0,"error":{{"code":-32000,"message":"retry me"}}}}'
   else
+    printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"s\",\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{{\"type\":\"text\",\"text\":\"ok\"}}}}}}}}"
     printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$((count - 1)),\"result\":{{\"stopReason\":\"end_turn\"}}}}"
   fi
 done"#
@@ -6177,6 +6281,7 @@ while IFS= read -r line; do
   if [ "$count" -eq 1 ]; then
     printf '%s\n' '{{"jsonrpc":"2.0","id":0,"error":{{"code":-32000,"message":"retry me"}}}}'
   else
+    printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"s\",\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{{\"type\":\"text\",\"text\":\"ok\"}}}}}}}}"
     printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$((count - 1)),\"result\":{{\"stopReason\":\"end_turn\"}}}}"
   fi
 done"#
@@ -6353,6 +6458,7 @@ done"#
             r#"count=0
 while IFS= read -r line; do
   printf '%s\n' "$line" >> '{quoted_capture}'
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"s\",\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{{\"type\":\"text\",\"text\":\"ok\"}}}}}}}}"
   printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$count,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
   count=$((count + 1))
 done"#
@@ -6508,6 +6614,7 @@ done"#
         let script = format!(
             r#"IFS= read -r line
 printf '%s\n' "$line" > '{quoted_capture}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"ok"}}}}}}}}'
 printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"#
         );
         let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
@@ -8040,6 +8147,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             initial_message: None,
             idle_timeout: Duration::from_secs(60),
             max_turn_duration: Duration::from_secs(120),
+            turn_segment: Duration::ZERO,
             turn_liveness_interval: Duration::ZERO,
             dedup_mode: DedupMode::Drop,
             system_prompt: None,
