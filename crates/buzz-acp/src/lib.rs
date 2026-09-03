@@ -5135,145 +5135,47 @@ fn dispatch_heartbeat(
 #[cfg(test)]
 mod agent_draft_prompt_tests {
     #[test]
-    fn shared_base_prompt_suppresses_only_an_exact_later_answer() {
+    fn shared_base_prompt_is_small_and_buzz_specific() {
         let prompt = include_str!("base_prompt.md");
-        assert!(
-            prompt.contains("already posted a later message fully answering that exact request")
-        );
-        assert!(prompt.contains("publish only if you have new information or a correction"));
+        assert!(prompt.len() < 7_808);
+        assert!(prompt.contains("Reply where the person asked you"));
+        assert!(prompt.contains("buzz messages send --channel <channel_id>"));
+        assert!(prompt.contains("--reply-to <triggering_event_id>"));
+        assert!(prompt.contains("threads one level deep"));
+        assert!(prompt.contains("channel from `[Context]`"));
     }
 
     #[test]
-    fn shared_base_prompt_teaches_portable_agent_drafts() {
-        let prompt = include_str!("base_prompt.md");
-        assert!(prompt.contains("buzz agents draft-create"));
-        assert!(prompt.contains("ask for at most two things"));
-        assert!(prompt.contains("what it should do day-to-day"));
-        assert!(prompt.contains("owner saves it"));
-        assert!(prompt.contains("Do not ask about runtime, provider, model, credentials"));
-    }
-
-    #[test]
-    fn shared_base_prompt_teaches_real_newlines_for_multiline_messages() {
+    fn shared_base_prompt_keeps_message_and_task_mechanics() {
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("pass real newline bytes through stdin"));
-        assert!(prompt.contains("single-quoted shell strings preserve `\\n` literally"));
-        assert!(prompt.contains("buzz messages send ... --content -"));
-        assert!(prompt.contains("empty or whitespace-only message content fails before publishing"));
-    }
-
-    #[test]
-    fn shared_base_prompt_teaches_repo_context_and_learning_loop() {
-        let prompt = include_str!("base_prompt.md");
-        assert!(prompt.contains("read its root `AGENTS.md`"));
-        assert!(prompt.contains("path-local `AGENTS.md`"));
-        assert!(
-            prompt.contains("product, architecture, and vision documents as design constraints")
-        );
-        assert!(prompt.contains("CI and live workflow evidence answer different questions"));
-        assert!(prompt.contains("record the invariant in the same session"));
-        assert!(prompt.contains("update the team's shared guidance"));
-    }
-
-    #[test]
-    fn shared_base_prompt_teaches_single_command_mentions_and_preflight() {
-        let prompt = include_str!("base_prompt.md");
-        assert!(prompt.contains("use the person's **exact display name as shown in Buzz**"));
-        assert!(prompt.contains("Do not expand a short display name, infer a surname"));
-        assert!(prompt.contains("Preserve it exactly; do not infer, expand, or look up a surname"));
+        assert!(prompt.contains("--content -"));
         assert!(prompt.contains("--mention <hex-or-npub>"));
-        assert!(prompt.contains("every presentation-only name that should notify"));
-        assert!(
-            prompt.contains("permits unresolved or ambiguous `@Name` text as presentation-only")
-        );
-        assert!(prompt.contains("success JSON's `mention_pubkeys`"));
-        assert!(prompt.contains("no follow-up verification command is needed"));
-        assert!(prompt.contains("stops before sending"));
-        assert!(prompt
-            .contains("add them explicitly with `buzz channels add-member` only when authorized"));
-        assert!(prompt.contains("never changes membership automatically"));
+        assert!(prompt.contains("every recipient who should be notified"));
+        assert!(prompt.contains("one `buzz schedules` record"));
+        assert!(prompt.contains("buzz schedules adopt --source-event"));
+        assert!(prompt.contains("buzz schedules reconcile"));
+        assert!(prompt.contains("`complete`, `keep`, `wake`, `redirect`, or `takeover`"));
+        assert!(prompt.contains("--message -"));
+        assert!(prompt.contains("paused at its segment cap"));
+        assert!(prompt.contains("done so far, next step, and any blocker"));
     }
 
     #[test]
-    fn shared_base_prompt_teaches_driver_neutral_delegation_follow_through() {
+    fn shared_base_prompt_drops_generic_delivery_ceremony() {
         let prompt = include_str!("base_prompt.md");
-        assert!(prompt.contains("Any agent may delegate work"));
-        assert!(prompt.contains("received the owner's initial request"));
-        assert!(prompt.contains("was appointed as driver to own the outcome"));
-        assert!(prompt.contains("initially appointed driver remains responsible"));
-        assert!(prompt.contains("downstream assignee does not become a competing driver"));
-        assert!(prompt.contains("merely by receiving a delegation"));
-        assert!(prompt.contains("exact user journey succeeds on the real surface"));
-        assert!(prompt.contains("live success receipt"));
-        assert!(prompt.contains("may replace the doer"));
-        assert!(prompt.contains("never transfers the driver role"));
-        assert!(prompt.contains("thinnest useful live outcome and its proof"));
-        assert!(prompt.contains("Inspect the available context first"));
-        assert!(prompt.contains("ask the requesting human"));
-        assert!(prompt.contains("one consolidated batch of questions"));
-        assert!(prompt.contains("each with a recommended default"));
-        assert!(prompt.contains("continue without further prompting"));
-        assert!(prompt.contains("never use the requesting human as a routine courier"));
-        assert!(prompt.contains("Shipping speed is the default"));
-        assert!(prompt.contains("company's current small scale"));
-        assert!(prompt.contains("Defer speculative generality"));
-        assert!(prompt.contains("redundant or non-required checks"));
-        assert!(prompt.contains("full test suite for the touched package"));
-        assert!(prompt.contains("proof of the accepted user journey"));
-        assert!(prompt.contains("concrete safety, authority, data, or recoverability boundary"));
-        assert!(prompt.contains("For a repair, regression, or reported failure"));
-        assert!(prompt.contains("prove the exact broken transition before implementation"));
-        assert!(
-            prompt.contains("do not require a nonexistent broken transition for greenfield work")
-        );
-        assert!(prompt.contains("one repair and one final review"));
-        assert!(prompt.contains("repeated `MUST_FIX` churn"));
-        assert!(prompt.contains("smaller complete live outcome"));
-        assert!(prompt.contains("not harden indefinitely"));
-        assert!(prompt.contains("supporting evidence, not completion"));
-        assert!(prompt.contains("material status update is welcome"));
-        assert!(prompt.contains("current driver or owner, and the next action"));
-        assert!(prompt.contains("never hands responsibility back"));
-        assert!(prompt.contains("continue automatically afterward"));
-        // One task record per conversation replaces the bind/keep/wake/redirect ritual.
-        assert!(prompt.contains("**One task record per conversation.**"));
-        assert!(prompt.contains("exactly one durable record in `buzz schedules`"));
-        assert!(prompt.contains("expected result, evidence locator, current assignee, last receipt, and next check time"));
-        assert!(prompt.contains("buzz schedules adopt --source-event"));
-        assert!(prompt
-            .contains("single-line markers `Expected result: ...` and `Evidence locator: ...`"));
-        assert!(prompt.contains("no pickup acknowledgement, no duplicate of an existing record"));
-        assert!(prompt.contains("no record for work another active owner is already producing"));
-        assert!(prompt.contains("name exactly one assignee, the expected result"));
-        assert!(prompt.contains("where the callback or evidence will appear"));
-        assert!(
-            prompt.contains("Every 15 minutes the heartbeat brings you back to each due record")
-        );
-        assert!(prompt.contains("take exactly one action with `buzz schedules reconcile`"));
-        assert!(prompt.contains("no more than 15 minutes old proves material progress"));
-        assert!(prompt.contains("generic `online` presence, an open session, or an unchanged dirty worktree is not progress"));
-        assert!(prompt.contains("otherwise cause the next step now"));
-        assert!(prompt.contains("do it in that heartbeat and record the new receipt"));
-        assert!(prompt.contains("**wake** the same assignee with a concrete instruction"));
-        assert!(prompt.contains("a wake may repeat"));
-        assert!(prompt.contains("**redirect** to exactly one different agent"));
-        assert!(prompt.contains("**takeover** (`--decision takeover`, no `--replacement`)"));
-        assert!(prompt.contains("The ledger never blocks progress"));
-        assert!(prompt.contains("Never redirect to yourself"));
-        assert!(prompt.contains("never create a second record for the same outcome"));
-        assert!(prompt.contains("never wait for the human to say \"continue\""));
-        assert!(prompt.contains("Wake, redirect, takeover, and complete require `--message`"));
-        assert!(prompt.contains("through stdin with `--message -`"));
-        assert!(prompt.contains("do not send a separate message first"));
-        assert!(prompt.contains("`--due-at` 10 to 15 minutes ahead"));
-        assert!(prompt.contains("`buzz schedules assigned`"));
-        assert!(prompt.contains("excludes tasks durably marked redirected or completed"));
-        assert!(prompt.contains("Legacy schema-1 items still use `buzz schedules complete` or `buzz schedules reschedule`"));
-        assert!(prompt.contains("A missing callback alone does not prove the work stopped"));
-        assert!(prompt.contains("lack of recent chat is never a blocker"));
-        assert!(prompt.contains("Do not publish routine acknowledgements"));
-        assert!(!prompt.contains("PM Bot is the driver"));
-        assert!(!prompt.contains("15 minutes after each delegation or recheck"));
+        for removed in [
+            "live success receipt",
+            "prove the exact broken transition before implementation",
+            "full test suite for the touched package",
+            "second opinion",
+            "self-review",
+            "review budget",
+            "one consolidated batch of questions",
+            "The ledger never blocks progress",
+        ] {
+            assert!(!prompt.contains(removed), "removed phrase remained: {removed}");
+        }
     }
 }
 
@@ -5303,88 +5205,27 @@ fn schedule_heartbeat_prompt() -> String {
     let now = chrono::Utc::now().to_rfc3339();
     format!(
         "[System: Follow-through heartbeat]\nTime: {now}\n\n\
-         You have NO incoming message, active channel context, or automatically injected core\n\
-         memory. This heartbeat brings you back to the work you already own. There is one task\n\
-         record per conversation; your job is to make each due record move.\n\n\
-         1. Run `buzz schedules claim-due --limit 1 --lease-seconds 300`. Claim one due item at a\n\
-            time and never hold more than one lease. After each item reaches its decision, run the\n\
-            command again until it returns `[]` or four claimed items have been processed. A\n\
-            relay-backed command may outlive the tool's first output window: if it returns a\n\
-            running-session handle, wait on that same handle until it completes; never abandon it,\n\
-            start a duplicate command, or treat empty partial output as `[]`.\n\
-         2. For the claimed item, read the conversation with\n\
-            `buzz messages thread --channel <channel_id> --event <thread_id>` and inspect only the\n\
-            evidence its locator names: the thread plus the named worktree, PR, document, or Corpus\n\
-            record. Follow the item's stored `check` before its `action`. A task whose checkpoint\n\
-            receipt begins `source-event:` is work this identity adopted itself: resume that work\n\
-            directly during this heartbeat and never publish a wake addressed to yourself.\n\
-         3. Decide with exactly one `buzz schedules reconcile`:\n\
-            - `--decision complete` when the expected result is live at the evidence locator. Give\n\
-              the exact result receipt, `--material-at`, and a material `--message`; omit\n\
-              `--due-at`. That command publishes the completion, so do not send it separately.\n\
-            - `--decision keep` only when a newer task-bound receipt proves material progress: a\n\
-              Buzz event, Codex/Cursor turn, commit or PR head, document hash, worktree\n\
-              fingerprint, or external job revision tied to this task, with a material timestamp\n\
-              no more than 15 minutes old. Generic online presence, an open session, an ended\n\
-              foreground command, or an unchanged dirty worktree is not progress, and a stale\n\
-              receipt cannot defer recovery merely because it is newer than the previous\n\
-              checkpoint. Keep has no `--message`, publishes nothing, and sets `--due-at` 10 to 15\n\
-              minutes away.\n\
-            - Otherwise cause the next step now. If you can do the next step yourself with the\n\
-              authority you already have, do it during this heartbeat and record the new receipt\n\
-              (keep with the fresh `--material-at`, or complete). If the assignee must do it,\n\
-              `--decision wake` the same assignee with the unchanged receipt, `--material-at`,\n\
-              `--due-at` 10 to 15 minutes away, and a concrete `--message` saying exactly what to do\n\
-              next; a wake may repeat. If the exact receipt is still unchanged at the next check\n\
-              after a wake, either `--decision redirect` to exactly one different agent with\n\
-              `--replacement` and a `--message` that is the new delegation with\n\
-              exactly one `Expected result: ...` line and exactly one `Evidence locator: ...` line\n\
-              matching the stored task, or `--decision takeover` (no `--replacement`) with the unchanged receipt\n\
-              and a `--message` saying what you will do, which makes you the assignee: then do the\n\
-              next step yourself in this same heartbeat. Never redirect to\n\
-              yourself, never create a second record for the same outcome, and never wait for the\n\
-              human to say continue. The driver role never transfers.\n\
-            - The ledger never blocks progress. A `conflict` or `user_error` from `reconcile` is\n\
-              stale record state or a malformed argument, never a blocker to report or to wait on:\n\
-              read the message, run `claim-due` again, and take the next legal action (wake,\n\
-              redirect, takeover, keep, or complete) in this same heartbeat.\n\
-            - A genuine blocker that only the owner can resolve: publish the exact blocker and the\n\
-              decision needed, once, with a recommended default, in the task's conversation, then\n\
-              keep the record with that blocker as its receipt. A lack of recent chat is never a\n\
-              blocker while the recorded evidence shows progress.\n\
-            For multiline `--message` text, pipe real newline bytes through stdin with\n\
-            `--message -`, the same convention as `--content -`; a quoted shell string keeps `\\n`\n\
-            literally and is rejected. Immediately before any visible wake, redirect, or complete\n\
-            reconciliation, re-read the target thread: if a newer message from this identity\n\
-            already covers this exact claimed obligation and result, do not publish it again, but\n\
-            never suppress a distinct required update. Material timestamps cannot be in the\n\
-            future. These transitions retain a durable decision audit.\n\
-         4. Legacy schema-1 items need no newly formatted delegation. Finish each claimed one with\n\
-            exactly one `buzz schedules complete` (when done or obsolete) or\n\
-            `buzz schedules reschedule` with a due time 10 to 15 minutes away, publishing only its\n\
-            stored safe coordination action after re-reading the thread so you do not duplicate an\n\
-            equivalent message. If the thread already holds a precise delegation naming one\n\
-            assignee plus exact `Expected result: ...` and `Evidence locator: ...` lines, you may\n\
-            instead upgrade it with `buzz schedules bind` and an immutable baseline receipt.\n\
-         5. After the due loop returned `[]`, or after four claimed items, run\n\
-            `buzz schedules assigned --limit 100` and continue at most one genuinely unfinished\n\
-            assignment addressed to this identity. Re-read its exact channel_id/thread_id and\n\
-            evidence_locator first; skip it when the thread already contains this identity's\n\
-            material result or blocker after the delegation, the expected result is already\n\
-            present, or the work is obsolete. Verify that no existing process, Codex/Cursor turn,\n\
-            or other owner is still actively producing that exact result, resume preserved work\n\
-            instead of starting it again, and publish only a material result or a genuine blocker\n\
-            in the assignment's conversation with the normal callback mention to its driver. Do\n\
-            not post a pickup, acknowledgement, or routine status.\n\
-         6. If both command results are `[]`, end immediately and publish nothing.\n\n\
-         Boundaries: do not approve a workflow or perform a customer, production, financial, or\n\
-         other external effect from this background heartbeat; a foreground turn carrying explicit\n\
-         authority owns such an action. Tests, commits, candidates, reviews, schedules, and\n\
-         deployments are evidence, not completion of the user journey. Do not query the mentions\n\
-         feed, scan channels, search the whole Corpus, or invent tasks; normal relay delivery owns\n\
-         new human messages, and an ordinary incoming-message turn owns any human question that\n\
-         arrived while this heartbeat was running. Never blindly replay an external effect whose\n\
-         outcome is unknown."
+         There is no incoming message or channel context. Resume only work already recorded for\n\
+         this identity.\n\n\
+         1. Run `buzz schedules claim-due --limit 1 --lease-seconds 300`. If it returns a running\n\
+            command handle, wait for that same command. If it returns `[]`, continue at step 4.\n\
+         2. Read the claimed conversation with\n\
+            `buzz messages thread --channel <channel_id> --event <thread_id>` and inspect only its\n\
+            named evidence. Continue the task itself when this identity owns the next step.\n\
+         3. Record one terminal decision with `buzz schedules reconcile`:\n\
+            - `--decision complete` with the result receipt, `--material-at`, and `--message`;\n\
+            - `--decision keep` with a current task receipt, `--material-at`, and `--due-at`;\n\
+            - or `--decision wake|redirect|takeover` to cause the recorded next step now.\n\
+            The command publishes visible decision messages. Do not send a duplicate. For multiline\n\
+            text, pipe real newline bytes to `--message -`. Never create a second task record.\n\
+            Then claim the next due item. Stop after four claimed items or `[]`.\n\
+         4. Run `buzz schedules assigned --limit 100`. Resume at most one unfinished assignment\n\
+            that is not already active elsewhere, in its recorded conversation and work location.\n\
+         5. If nothing is due or assigned, end immediately and publish nothing. Otherwise finish\n\
+            with a material result, a necessary handoff, or the task's recorded next check.\n\n\
+         A heartbeat never invents work or blindly repeats an external effect. It may inspect and\n\
+         coordinate recorded work; an external action still needs the authority that action\n\
+         requires."
     )
 }
 
@@ -5417,76 +5258,25 @@ mod heartbeat_prompt_tests {
     }
 
     #[test]
-    fn schedule_prompt_runs_one_task_record_per_conversation() {
+    fn schedule_prompt_is_small_and_resumes_recorded_work() {
         let prompt = schedule_heartbeat_prompt();
+        assert!(prompt.len() < 2_172);
         assert!(prompt.contains("[System: Follow-through heartbeat]"));
-        assert!(prompt.contains("brings you back to the work you already own"));
-        assert!(
-            prompt.contains("record per conversation; your job is to make each due record move")
-        );
-        // Claim loop is unchanged: one lease at a time, up to four items.
+        assert!(prompt.contains("Resume only work already recorded"));
         assert!(prompt.contains("buzz schedules claim-due --limit 1 --lease-seconds 300"));
-        assert!(prompt.contains("never hold more than one lease"));
-        assert!(prompt.contains("four claimed items have been processed"));
-        assert!(prompt.contains("treat empty partial output as `[]`"));
-        // Evidence read stays bounded to the named locator.
         assert!(prompt.contains("buzz messages thread --channel <channel_id> --event <thread_id>"));
-        assert!(prompt.contains("evidence its locator names"));
-        assert!(prompt.contains("stored `check` before its `action`"));
-        assert!(prompt.contains("source-event:"));
-        assert!(prompt.contains("never publish a wake addressed to yourself"));
-        // Exactly one reconcile decision, with the next-step rule.
-        assert!(prompt.contains("Decide with exactly one `buzz schedules reconcile`"));
-        assert!(prompt.contains("`--decision complete` when the expected result is live"));
-        assert!(prompt.contains("`--decision keep` only when a newer task-bound receipt"));
-        assert!(prompt.contains("no more than 15 minutes old"));
-        assert!(prompt.contains("Generic online presence"));
-        assert!(prompt.contains("unchanged dirty worktree is not progress"));
-        assert!(prompt.contains("receipt cannot defer recovery"));
-        assert!(prompt.contains("Otherwise cause the next step now"));
-        assert!(prompt.contains("do it during this heartbeat and record the new receipt"));
-        assert!(prompt.contains("`--decision wake` the same assignee with the unchanged receipt"));
-        assert!(prompt.contains("a wake may repeat"));
-        assert!(prompt.contains("`--decision redirect` to exactly one different agent"));
-        assert!(prompt.contains("`--decision takeover` (no `--replacement`)"));
-        assert!(prompt.contains("makes you the assignee"));
-        assert!(prompt.contains("The ledger never blocks progress"));
-        assert!(prompt.contains("never a blocker to report or to wait on"));
-        assert!(prompt.contains("`--replacement`"));
-        assert!(prompt.contains("exactly one `Expected result: ...` line"));
-        assert!(prompt.contains("exactly one `Evidence locator: ...` line"));
-        assert!(prompt.contains("yourself, never create a second record for the same outcome"));
-        assert!(prompt.contains("human to say continue"));
-        assert!(prompt.contains("driver role never transfers"));
-        assert!(!prompt.contains("one-wake allowance"));
-        assert!(prompt.contains("genuine blocker that only the owner can resolve"));
-        assert!(prompt.contains("with a recommended default"));
-        assert!(prompt.contains("`--message -`, the same convention as `--content -`"));
-        assert!(prompt.contains("re-read the target thread"));
-        assert!(prompt.contains("never suppress a distinct required update"));
-        assert!(prompt.contains("Material timestamps cannot be in the"));
-        // Legacy schema-1 items still close with one typed transition.
-        assert!(prompt.contains("Legacy schema-1 items need no newly formatted delegation"));
-        assert!(prompt.contains("buzz schedules complete"));
-        assert!(prompt.contains("buzz schedules reschedule"));
-        assert!(prompt.contains("buzz schedules bind"));
-        // Assigned work continues only after the due loop, without pickups.
+        assert!(prompt.contains("buzz schedules reconcile"));
+        assert!(prompt.contains("--decision complete"));
+        assert!(prompt.contains("--decision keep"));
+        assert!(prompt.contains("--decision wake|redirect|takeover"));
+        assert!(prompt.contains("--message -"));
         assert!(prompt.contains("buzz schedules assigned --limit 100"));
-        assert!(prompt.contains("at most one genuinely unfinished"));
-        assert!(prompt.contains("resume preserved work"));
-        assert!(prompt.contains("not post a pickup, acknowledgement, or routine status"));
         assert!(prompt.contains("end immediately and publish nothing"));
-        // Boundaries.
-        assert!(prompt.contains("do not approve a workflow"));
-        assert!(prompt.contains("authority owns such an action"));
-        assert!(prompt.contains("not completion of the user journey"));
-        assert!(prompt.contains("feed, scan channels, search the whole Corpus, or invent tasks"));
-        assert!(prompt.contains("ordinary incoming-message turn owns any human question"));
-        // The one-time bootstrap and catch-up ceremonies are gone.
-        assert!(!prompt.contains("buzz-outcome-driven-delivery-bootstrap-v1"));
-        assert!(!prompt.contains("buzz-follow-through-catch-up-v1"));
-        assert!(!prompt.contains("buzz feed get --types needs_action`"));
-        assert!(!prompt.contains("activation"));
+        assert!(prompt.contains("never invents work"));
+        assert!(!prompt.contains("live success receipt"));
+        assert!(!prompt.contains("review budget"));
+        assert!(!prompt.contains("one-time activation"));
+        assert!(!prompt.contains("proof before implementation"));
     }
 
     #[test]
