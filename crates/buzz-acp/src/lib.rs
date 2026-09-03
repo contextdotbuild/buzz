@@ -5173,6 +5173,7 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("`buzz schedules reconcile`"));
         assert!(prompt.contains("Wake, redirect, and complete each require `--message`"));
         assert!(prompt.contains("do not send a separate message first"));
+        assert!(prompt.contains("through stdin with `--message -`"));
         assert!(prompt.contains("The redirect `--message` is the new delegation"));
         assert!(prompt.contains("exactly one `Expected result: ...` line"));
         assert!(prompt.contains("exactly one `Evidence locator: ...` line"));
@@ -5332,7 +5333,9 @@ fn schedule_heartbeat_prompt() -> String {
             That redirect message is the new delegation: it must contain exactly one\n\
             `Expected result: ...` line and exactly one `Evidence locator: ...` line matching the\n\
             stored task. The reconcile command signs and publishes this visible action; do not send\n\
-            a separate delegation message first. Preserve the expected result and evidence locator. A newer material\n\
+            a separate delegation message first. For multiline `--message` text, pipe real newline\n\
+            bytes through stdin with `--message -`, the same convention as `--content -`; a quoted\n\
+            shell string keeps `\\n` literally and is rejected. Preserve the expected result and evidence locator. A newer material\n\
            receipt resets the one-wake allowance. Publish only the material recovery action or a\n\
            genuine blocker for this claimed obligation, through that reconciliation outbox.\n\
          7. Immediately before any visible wake, redirect, or complete reconciliation, re-read the\n\
@@ -5522,6 +5525,7 @@ mod heartbeat_prompt_tests {
         assert!(prompt.contains("exactly one `Evidence locator: ...` line"));
         assert!(prompt.contains("reconcile command signs and publishes this visible action"));
         assert!(prompt.contains("a separate delegation message first"));
+        assert!(prompt.contains("through stdin with `--message -`"));
         assert!(prompt.contains("one-wake allowance"));
         assert!(prompt.contains("Preserve the expected result and evidence locator"));
         assert!(prompt.contains("material recovery action"));

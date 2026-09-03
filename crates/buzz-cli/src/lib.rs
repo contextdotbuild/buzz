@@ -2073,6 +2073,8 @@ pub enum SchedulesCmd {
         #[arg(long)]
         replacement: Option<String>,
         /// Visible wake, redirect delegation, or completion message. Required except for keep.
+        /// Pass `-` to read the message from stdin (real newlines, no shell quoting),
+        /// exactly like `buzz messages send --content -`.
         #[arg(long)]
         message: Option<String>,
         /// Owner pubkey (hex). Overrides BUZZ_AUTH_TAG.

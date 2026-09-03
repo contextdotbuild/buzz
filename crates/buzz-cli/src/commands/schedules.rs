@@ -18,6 +18,7 @@ use crate::commands::mem::{
     get_stored_memory, list_stored_memories, put_stored_memory, ExpectedMemoryHead, StoredMemory,
 };
 use crate::error::CliError;
+use crate::validate::{has_literal_newline_escapes, read_or_stdin};
 use crate::{ScheduleDecisionArg, ScheduleStatusArg, SchedulesCmd};
 use buzz_core::engram::{self, Body};
 use buzz_core::kind::{KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_V2};
@@ -407,6 +408,33 @@ fn validate_text(raw: &str, field: &str) -> Result<String, CliError> {
         return Err(CliError::Usage(format!("--{field} cannot contain NUL")));
     }
     Ok(value.to_owned())
+}
+
+/// Resolve the `--message` flag of a visible wake, redirect, or complete
+/// reconciliation.
+///
+/// `-` reads the message from stdin, exactly like `buzz messages send
+/// --content -`, so multi-line action text never has to survive shell
+/// quoting. Before this, a caller that piped text and passed `--message -`
+/// published the literal string `-`, which clients render as an empty bullet.
+fn resolve_reconcile_message(raw: &str) -> Result<String, CliError> {
+    let content = read_or_stdin(raw)?;
+    validate_reconcile_message(&content)
+}
+
+/// Apply the ordinary message publication guard to reconcile action text: it
+/// must carry real content, and it must not smuggle literal `\n` escapes in
+/// place of newlines (the signature of a quoted shell string).
+fn validate_reconcile_message(content: &str) -> Result<String, CliError> {
+    if has_literal_newline_escapes(content) {
+        return Err(CliError::Usage(
+            "--message contains literal \"\\n\" instead of newlines (a quoted shell string \
+             keeps the backslash); pass real newlines via stdin: \
+             printf 'first\\n\\nsecond\\n' | buzz schedules reconcile ... --message -"
+                .into(),
+        ));
+    }
+    validate_text(content, "message")
 }
 
 fn validate_task_text(raw: &str, field: &str) -> Result<String, CliError> {
@@ -3375,9 +3403,7 @@ async fn reconcile(
             .transpose()?,
         replacement_delegation_event_id: None,
         action_event_id: None,
-        action_content: message
-            .map(|value| validate_text(value, "message"))
-            .transpose()?,
+        action_content: message.map(resolve_reconcile_message).transpose()?,
     };
     validate_public_reconcile_shape(&input)?;
     let (owner_pubkey, mut loaded) = load_one(client, owner, id).await?;
@@ -3665,6 +3691,32 @@ mod tests {
     use super::*;
     use buzz_core::engram::{build_event, validate_and_decrypt, Body};
     use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    #[test]
+    fn reconcile_message_keeps_real_multiline_text() {
+        let text = "@PM Bot Lane 2 is complete.\n\nReceipts: 816/816 files green.\n";
+        assert_eq!(
+            validate_reconcile_message(text).unwrap(),
+            text.trim().to_owned()
+        );
+    }
+
+    #[test]
+    fn reconcile_message_rejects_literal_newline_escapes() {
+        let err = validate_reconcile_message("first\\n\\nsecond").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("literal \"\\n\""), "{message}");
+        assert!(
+            message.contains("buzz schedules reconcile ... --message -"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn reconcile_message_rejects_empty_text() {
+        let err = validate_reconcile_message("   \n").unwrap_err();
+        assert!(err.to_string().contains("--message cannot be empty"));
+    }
 
     fn sample_legacy_schedule(now: DateTime<Utc>) -> Schedule {
         Schedule::from(LegacyScheduleV1 {
