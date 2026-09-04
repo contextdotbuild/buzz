@@ -15,6 +15,44 @@ const SOURCE_TREE: &str = "2222222222222222222222222222222222222222";
 const ROLLBACK_TEST_RELEASE_ID: &str = "3333333333333333333333333333333333333333";
 const ROLLBACK_TEST_SOURCE_TREE: &str = "4444444444444444444444444444444444444444";
 const ARTIFACT_MODE: &str = "0555";
+const TEST_PROMPT_SHA256S: [(&str, &str); CANONICAL_AGENT_COUNT] = [
+    (
+        "PM Bot",
+        "e79f795cd3083ce89922702cec89f56f3ab0307c7fe29aa2fbc4b05e5edf6bf3",
+    ),
+    (
+        "Mobile PM",
+        "4498ed022fde5df3f6bb9648428188dc71296b7884e3d350fd0d3e9b96c4265f",
+    ),
+    (
+        "Design Panda",
+        "a74172b03d096f07b647f752c8793eb5e81e3a3ff4f8d70fae1d948e260004cd",
+    ),
+    (
+        "Customer Comms Bot",
+        "881772ee30bd121814bad7fb550a2bb458fbfc549731fab076e7aacbc2905cdf",
+    ),
+    (
+        "Growth Bot",
+        "86897bbc14f188b102b12d78c0165eb3ed3351882d058ede4e783b04273150ee",
+    ),
+    (
+        "Raise Bot",
+        "3b5530f09ebc99a9f13b5936157c70d7033aebc873e0ff7a56b437e4ee832fdd",
+    ),
+    (
+        "Ops Bot",
+        "b72207c837efb29cfe08424da8ffc4f313d3e25d81f43ebdd6fb68bc480cb6cb",
+    ),
+    (
+        "Contessa",
+        "f60b1ac3bb11f167dcba1a85d7a5f31e80e72758b53b4223086828a119981d83",
+    ),
+    (
+        "Koder",
+        "9f82efdd427eba306e7677e6f6eec398ec0da598897da097b2182f44bbf748af",
+    ),
+];
 
 struct Fixture {
     _dir: TempDir,
@@ -253,11 +291,16 @@ impl Fixture {
         let targets: Vec<Value> = CANONICAL_AGENT_EFFORTS
             .iter()
             .zip(&self.pubkeys)
-            .map(|((name, effort_level), pubkey)| {
+            .enumerate()
+            .map(|(index, ((name, effort_level), pubkey))| {
+                let system_prompt = format!("approved replacement prompt for {name}");
                 json!({
                     "name": name,
                     "pubkey": pubkey,
-                    "effortLevel": effort_level
+                    "personaId": format!("persona-{index}"),
+                    "effortLevel": effort_level,
+                    "keyedSystemPrompt": system_prompt,
+                    "sourceSystemPrompt": system_prompt
                 })
             })
             .collect();
@@ -267,7 +310,20 @@ impl Fixture {
             "expectedAgentCount": CANONICAL_AGENT_COUNT,
             "expectedDesktopPid": dead_pid(),
             "targets": targets,
-            "desiredModel": CANONICAL_MODEL
+            "desiredModel": CANONICAL_MODEL,
+            "acpCommand": self.wrapper.to_string_lossy(),
+            "mcpCommand": self.mcp.to_string_lossy(),
+            "expectedReleaseId": RELEASE_ID,
+            "expectedSourceTree": SOURCE_TREE,
+            "expectedManifestSha256": self.manifest_hash,
+            "expectedAcpCommandSha256": self.wrapper_hash,
+            "expectedAcpCommandSize": self.wrapper_size,
+            "expectedLibexecSha256": self.libexec_hash,
+            "expectedLibexecSize": self.libexec_size,
+            "expectedMcpCommandSha256": self.mcp_hash,
+            "expectedMcpCommandSize": self.mcp_size,
+            "expectedArtifactOwner": self.owner,
+            "expectedArtifactMode": ARTIFACT_MODE
         })
     }
 
@@ -320,6 +376,7 @@ impl Fixture {
                 toolchain: "rustc 1.95.0",
                 environment: EnvironmentContract::Rollback,
             },
+            prompt_sha256s: &TEST_PROMPT_SHA256S,
             process_inspector: inspector,
         }
     }
@@ -517,11 +574,7 @@ fn model_effort_records(pubkeys: &[String]) -> Value {
         instances.push(instance);
     }
     definitions.extend(instances);
-    definitions.extend(
-        base_records[CANONICAL_AGENT_COUNT * 2..]
-            .iter()
-            .cloned(),
-    );
+    definitions.extend(base_records[CANONICAL_AGENT_COUNT * 2..].iter().cloned());
     Value::Array(definitions)
 }
 
@@ -787,15 +840,15 @@ fn production_forward_contract_is_exactly_the_approved_immutable_release() {
     let forward = production_forward_artifacts();
     assert_eq!(
         forward.release_id,
-        "1e2eabb806324b4bbc1403d58633b8760a36f015"
+        "829d31eb7748b3ed1a434248a44e5f3cce76a2a2"
     );
     assert_eq!(
         forward.source_tree,
-        "1c7210e9ea80e48d0bb400b2dc363e9acb2fe6ef"
+        "74e86b8e04cb26e448ece37f3323d74c2a91f992"
     );
     assert_eq!(
         forward.manifest_sha256,
-        "adf4587aa77ed5c35e21ae406163845e0265697e3503c83809f0c045a2925b82"
+        "f5286896fffad3a8c1e5b3d47da60fa50b67f8e1badb3b646041e16fe3c20c03"
     );
     assert_eq!(
         forward.command_sha256,
@@ -804,17 +857,17 @@ fn production_forward_contract_is_exactly_the_approved_immutable_release() {
     assert_eq!(forward.command_size, 184);
     assert_eq!(
         forward.libexec_sha256,
-        "0814252a3ff57cdc8b5116d478a2540609cbc28925e8b95bae7cd51d29a62492"
+        "ac466c5cc6b0b45d36f4e4cf26fca892811a9b0d007402a0376d1b9bebf5e6fa"
     );
-    assert_eq!(forward.libexec_size, 13_915_904);
+    assert_eq!(forward.libexec_size, 13_899_392);
     assert_eq!(forward.owner, "timi");
     assert_eq!(forward.mode, "0555");
     assert_eq!(forward.toolchain, "rustc 1.95.0");
     assert!(matches!(
         forward.mcp,
         McpContract::RuntimeArtifact {
-            sha256: "6e67dc3b8aa1d78a2907ec55400641113ded170e3eb7d7a84f2dc8bd95935b01",
-            size: 20_077_248
+            sha256: "a26650667fe927f8d2efaaa7fef57a1c030459f33bd1c65f06dd337e8119d666",
+            size: 20_110_272
         }
     ));
     assert_eq!(
@@ -835,15 +888,15 @@ fn production_inverse_contract_is_exactly_the_approved_immutable_release() {
     let inverse = production_rollback_artifacts();
     assert_eq!(
         inverse.release_id,
-        "c21731e00b4540599cbec138615ee18083874bdb"
+        "1e2eabb806324b4bbc1403d58633b8760a36f015"
     );
     assert_eq!(
         inverse.source_tree,
-        "69176cd1a21400223fe43a3e9a0e7b3fb8f8f95f"
+        "1c7210e9ea80e48d0bb400b2dc363e9acb2fe6ef"
     );
     assert_eq!(
         inverse.manifest_sha256,
-        "792cc5b2d2954c7c97a1ed009bc6c84e96bafa88c4d4d34ec509db070aa33760"
+        "adf4587aa77ed5c35e21ae406163845e0265697e3503c83809f0c045a2925b82"
     );
     assert_eq!(
         inverse.command_sha256,
@@ -852,7 +905,7 @@ fn production_inverse_contract_is_exactly_the_approved_immutable_release() {
     assert_eq!(inverse.command_size, 184);
     assert_eq!(
         inverse.libexec_sha256,
-        "fafa196e27475fcd5c36d1f44105068d97ff587c69945b0d5e6c31b2ec3a297c"
+        "0814252a3ff57cdc8b5116d478a2540609cbc28925e8b95bae7cd51d29a62492"
     );
     assert_eq!(inverse.libexec_size, 13_915_904);
     assert_eq!(inverse.owner, "timi");
@@ -861,8 +914,8 @@ fn production_inverse_contract_is_exactly_the_approved_immutable_release() {
     assert!(matches!(
         inverse.mcp,
         McpContract::RuntimeArtifact {
-            sha256: "f4a96c0a0236a5618ce3e3bbf377e26ee370b516727cab1cf54727be8a529f9b",
-            size: 20_076_608
+            sha256: "6e67dc3b8aa1d78a2907ec55400641113ded170e3eb7d7a84f2dc8bd95935b01",
+            size: 20_077_248
         }
     ));
     assert_eq!(
@@ -1322,7 +1375,8 @@ fn schema_v1_receipt_and_model_effort_behavior_remain_unchanged() {
                 "BUZZ_ACP_HEARTBEAT_INTERVAL",
                 "BUZZ_ACP_HEARTBEAT_MODE",
                 "BUZZ_ACP_IDLE_POOL_SLEEP",
-                "BUZZ_ACP_LAZY_POOL"
+                "BUZZ_ACP_LAZY_POOL",
+                "BUZZ_ACP_TURN_SEGMENT"
             ],
             "parallelism": 10,
             "acpCommand": fixture.wrapper.to_string_lossy(),
@@ -1360,11 +1414,7 @@ fn schema_v2_applies_exact_model_effort_profile_and_preserves_opaque_data() {
         .expect("before records")
         .iter()
         .filter(|record| record["pubkey"] != "")
-        .map(|record| {
-            record["persona_id"]
-                .as_str()
-                .expect("target persona id")
-        })
+        .map(|record| record["persona_id"].as_str().expect("target persona id"))
         .collect();
     let mut linked_source_slugs = HashSet::new();
 
@@ -1387,11 +1437,18 @@ fn schema_v2_applies_exact_model_effort_profile_and_preserves_opaque_data() {
                 continue;
             }
             assert_eq!(after_record["model"], CANONICAL_MODEL);
+            let name = before_record["name"].as_str().expect("source name");
+            assert_eq!(
+                after_record["system_prompt"],
+                format!("approved replacement prompt for {name}")
+            );
             assert_ne!(before_record["model"], after_record["model"]);
             let mut protected_before = before_record.as_object().expect("before object").clone();
             let mut protected_after = after_record.as_object().expect("after object").clone();
             protected_before.remove("model");
             protected_after.remove("model");
+            protected_before.remove("system_prompt");
+            protected_after.remove("system_prompt");
             assert_eq!(
                 protected_after, protected_before,
                 "source definition opaque field changed"
@@ -1419,12 +1476,31 @@ fn schema_v2_applies_exact_model_effort_profile_and_preserves_opaque_data() {
             .expect("canonical agent name");
         assert_eq!(after_record["model"], CANONICAL_MODEL);
         assert_eq!(after_record["effort_level"], expected_effort);
+        assert_eq!(
+            after_record["system_prompt"],
+            format!("approved replacement prompt for {name}")
+        );
+        assert_eq!(after_record["system_prompt"], source["system_prompt"]);
+        assert_eq!(
+            after_record["acp_command"].as_str(),
+            Some(fixture.wrapper.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            after_record["mcp_command"].as_str(),
+            Some(fixture.mcp.to_string_lossy().as_ref())
+        );
         assert_ne!(before_record["model"], after_record["model"]);
         assert_ne!(before_record["effort_level"], after_record["effort_level"]);
 
         let mut protected_before = before_record.as_object().expect("before object").clone();
         let mut protected_after = after_record.as_object().expect("after object").clone();
-        for field in ["model", "effort_level"] {
+        for field in [
+            "model",
+            "effort_level",
+            "system_prompt",
+            "acp_command",
+            "mcp_command",
+        ] {
             protected_before.remove(field);
             protected_after.remove(field);
         }
@@ -1434,7 +1510,13 @@ fn schema_v2_applies_exact_model_effort_profile_and_preserves_opaque_data() {
 
     assert_eq!(
         receipt.changed_fields,
-        vec!["effort_level".to_owned(), "model".to_owned()]
+        vec![
+            "acp_command".to_owned(),
+            "effort_level".to_owned(),
+            "mcp_command".to_owned(),
+            "model".to_owned(),
+            "system_prompt".to_owned(),
+        ]
     );
     assert_eq!(receipt.after_sha256, sha256(&fixture.store_bytes()));
     let serialized = serde_json::to_value(&receipt).expect("serialize v2 receipt");
@@ -1449,20 +1531,35 @@ fn schema_v2_applies_exact_model_effort_profile_and_preserves_opaque_data() {
         BTreeSet::from([
             "schemaVersion",
             "status",
+            "requestSha256",
+            "expectedStoreSha256",
             "actualBeforeSha256",
             "afterSha256",
             "agentCount",
+            "sourceCount",
             "changedFields",
             "desiredModel",
-            "mediumCount",
+            "effortLevel",
             "highCount",
+            "acpCommand",
+            "mcpCommand",
+            "releaseId",
+            "sourceTree",
+            "manifestSha256",
+            "acpCommandSha256",
+            "libexecSha256",
+            "mcpCommandSha256",
         ])
     );
     assert_eq!(serialized["schemaVersion"], MODEL_EFFORT_SCHEMA_VERSION);
     assert_eq!(serialized["agentCount"], CANONICAL_AGENT_COUNT);
     assert_eq!(serialized["desiredModel"], CANONICAL_MODEL);
-    assert_eq!(serialized["mediumCount"], 8);
-    assert_eq!(serialized["highCount"], 1);
+    assert_eq!(serialized["sourceCount"], CANONICAL_AGENT_COUNT);
+    assert_eq!(serialized["effortLevel"], CANONICAL_EFFORT);
+    assert_eq!(serialized["highCount"], CANONICAL_AGENT_COUNT);
+    assert!(serialized["requestSha256"]
+        .as_str()
+        .is_some_and(|hash| is_lower_hex(hash, 64)));
     let output = serde_json::to_string(&receipt).expect("serialize v2 output");
     for forbidden in fixture.pubkeys.iter().map(String::as_str).chain([
         "nsec1-secret",
@@ -1470,20 +1567,28 @@ fn schema_v2_applies_exact_model_effort_profile_and_preserves_opaque_data() {
         "secret system prompt",
         "ARBITRARY_SECRET",
         "private_key_nsec",
-        "system_prompt",
-        "buzz-acp",
-        "buzz-dev-mcp",
         "PM Bot",
         "Koder",
     ]) {
         assert!(!output.contains(forbidden), "v2 receipt leaked {forbidden}");
     }
-    for forbidden_path in [&fixture.store, &fixture.wrapper, &fixture.mcp] {
-        assert!(
-            !output.contains(forbidden_path.to_string_lossy().as_ref()),
-            "v2 receipt leaked a path"
-        );
-    }
+    assert!(!output.contains(fixture.store.to_string_lossy().as_ref()));
+}
+
+#[test]
+fn schema_v2_dry_run_skips_live_process_fences_and_does_not_write() {
+    let fixture = Fixture::new();
+    fixture.prepare_model_effort_store();
+    let before = fixture.store_bytes();
+    let inspector = CountingInspector::fail_on(1);
+    let receipt = fixture
+        .execute(&fixture.model_effort_request(), true, &inspector)
+        .expect("read-only dry-run while Buzz processes are live");
+
+    assert_eq!(receipt.status, "dry_run");
+    assert_eq!(inspector.calls.get(), 0);
+    assert_eq!(inspector.acp_calls.get(), 0);
+    assert_eq!(fixture.store_bytes(), before);
 }
 
 #[test]
@@ -1492,7 +1597,7 @@ fn schema_v2_rejects_wrong_model_and_effort_without_mutation() {
     model_fixture.prepare_model_effort_store();
     let model_before = model_fixture.store_bytes();
     let mut wrong_model = model_fixture.model_effort_request();
-    wrong_model["desiredModel"] = json!("gpt-5.6-sol");
+    wrong_model["desiredModel"] = json!("gpt-5.6-terra");
     assert_eq!(
         error_code(model_fixture.execute(&wrong_model, false, &CountingInspector::default())),
         "invalid_desired_model"
@@ -1503,12 +1608,69 @@ fn schema_v2_rejects_wrong_model_and_effort_without_mutation() {
     effort_fixture.prepare_model_effort_store();
     let effort_before = effort_fixture.store_bytes();
     let mut wrong_effort = effort_fixture.model_effort_request();
-    wrong_effort["targets"][0]["effortLevel"] = json!("high");
+    wrong_effort["targets"][0]["effortLevel"] = json!("medium");
     assert_eq!(
         error_code(effort_fixture.execute(&wrong_effort, false, &CountingInspector::default())),
         "invalid_target_effort"
     );
     assert_eq!(effort_fixture.store_bytes(), effort_before);
+}
+
+#[test]
+fn schema_v2_rejects_prompt_source_and_forward_runtime_drift_without_mutation() {
+    let prompt_fixture = Fixture::new();
+    prompt_fixture.prepare_model_effort_store();
+    let prompt_before = prompt_fixture.store_bytes();
+    let mut wrong_prompt = prompt_fixture.model_effort_request();
+    wrong_prompt["targets"][0]["keyedSystemPrompt"] = json!("unapproved replacement");
+    wrong_prompt["targets"][0]["sourceSystemPrompt"] = json!("unapproved replacement");
+    assert_eq!(
+        error_code(prompt_fixture.execute(&wrong_prompt, false, &CountingInspector::default())),
+        "prompt_hash_mismatch"
+    );
+    assert_eq!(prompt_fixture.store_bytes(), prompt_before);
+
+    let source_fixture = Fixture::new();
+    source_fixture.prepare_model_effort_store();
+    let mut wrong_source = parse_store(&source_fixture);
+    wrong_source[0]["name"] = json!("Wrong source identity");
+    write_store(&source_fixture.store, &wrong_source);
+    let source_before = source_fixture.store_bytes();
+    assert_eq!(
+        error_code(source_fixture.execute(
+            &source_fixture.model_effort_request(),
+            false,
+            &CountingInspector::default()
+        )),
+        "source_name_mismatch"
+    );
+    assert_eq!(source_fixture.store_bytes(), source_before);
+
+    let runtime_fixture = Fixture::new();
+    runtime_fixture.prepare_model_effort_store();
+    let runtime_before = runtime_fixture.store_bytes();
+    let rollback = runtime_fixture.rollback_request();
+    let mut wrong_runtime = runtime_fixture.model_effort_request();
+    for field in [
+        "acpCommand",
+        "mcpCommand",
+        "expectedReleaseId",
+        "expectedSourceTree",
+        "expectedManifestSha256",
+        "expectedAcpCommandSha256",
+        "expectedAcpCommandSize",
+        "expectedLibexecSha256",
+        "expectedLibexecSize",
+        "expectedMcpCommandSha256",
+        "expectedMcpCommandSize",
+    ] {
+        wrong_runtime[field] = rollback[field].clone();
+    }
+    assert_eq!(
+        error_code(runtime_fixture.execute(&wrong_runtime, false, &CountingInspector::default())),
+        "artifact_contract_mismatch"
+    );
+    assert_eq!(runtime_fixture.store_bytes(), runtime_before);
 }
 
 #[test]
@@ -1619,7 +1781,7 @@ fn schema_v2_rejects_invalid_source_definition_mappings_without_mutation() {
             false,
             &CountingInspector::default()
         )),
-        "source_definition_mismatch"
+        "target_persona_id_mismatch"
     );
     assert_eq!(mismatch_fixture.store_bytes(), mismatch_before);
 
@@ -1643,7 +1805,7 @@ fn schema_v2_rejects_invalid_source_definition_mappings_without_mutation() {
         .execute(
             &extra_fixture.model_effort_request(),
             false,
-            &CountingInspector::default()
+            &CountingInspector::default(),
         )
         .expect("unrelated definition must not block schema v2");
     let extra_after = parse_store(&extra_fixture);
@@ -1760,8 +1922,7 @@ fn schema_v2_semantic_diff_rejects_any_opaque_change() {
     let original = model_effort_records(&pubkeys);
     let mut candidate = original.clone();
     candidate[0]["unknown_definition_field"] = json!("changed-opaque-value");
-    let target_indices: Vec<usize> =
-        (CANONICAL_AGENT_COUNT..CANONICAL_AGENT_COUNT * 2).collect();
+    let target_indices: Vec<usize> = (CANONICAL_AGENT_COUNT..CANONICAL_AGENT_COUNT * 2).collect();
     let source_indices: Vec<usize> = (0..CANONICAL_AGENT_COUNT).collect();
     assert_eq!(
         validate_model_effort_diff(&original, &candidate, &target_indices, &source_indices)

@@ -2,9 +2,10 @@
 //!
 //! The binary edits the exact production `managed-agents.json` only while the
 //! caller's expected Desktop PID and independent process scans prove Buzz
-//! Desktop and every `buzz-acp` worker are stopped. Opaque records stay as JSON
-//! values so credentials, prompts, and arbitrary environment values never enter
-//! typed output fields.
+//! Desktop and every `buzz-acp` worker are stopped. Read-only dry-runs retain
+//! the same request, store, artifact, and diff validation without that process
+//! fence. Opaque records stay as JSON values so credentials and arbitrary
+//! environment values never enter typed output fields.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -26,47 +27,86 @@ const CANONICAL_STORE_PATH: &str =
     "/Users/timi/Library/Application Support/xyz.block.buzz.app/agents/managed-agents.json";
 const DESKTOP_EXECUTABLE_PATH: &str = "/Applications/Buzz.app/Contents/MacOS/buzz-desktop";
 const STORE_FILENAME: &str = "managed-agents.json";
-const FORWARD_RELEASE_ID: &str = "1e2eabb806324b4bbc1403d58633b8760a36f015";
-const FORWARD_SOURCE_TREE: &str = "1c7210e9ea80e48d0bb400b2dc363e9acb2fe6ef";
+const FORWARD_RELEASE_ID: &str = "829d31eb7748b3ed1a434248a44e5f3cce76a2a2";
+const FORWARD_SOURCE_TREE: &str = "74e86b8e04cb26e448ece37f3323d74c2a91f992";
 const FORWARD_MANIFEST_SHA256: &str =
-    "adf4587aa77ed5c35e21ae406163845e0265697e3503c83809f0c045a2925b82";
+    "f5286896fffad3a8c1e5b3d47da60fa50b67f8e1badb3b646041e16fe3c20c03";
 const FORWARD_COMMAND_SHA256: &str =
     "8d2720ddde69d25a0d21c28bdd1308cf524243d8cdb86781965a7ade98858745";
 const FORWARD_COMMAND_SIZE: u64 = 184;
 const FORWARD_LIBEXEC_SHA256: &str =
-    "0814252a3ff57cdc8b5116d478a2540609cbc28925e8b95bae7cd51d29a62492";
-const FORWARD_LIBEXEC_SIZE: u64 = 13_915_904;
-const FORWARD_MCP_SHA256: &str = "6e67dc3b8aa1d78a2907ec55400641113ded170e3eb7d7a84f2dc8bd95935b01";
-const FORWARD_MCP_SIZE: u64 = 20_077_248;
+    "ac466c5cc6b0b45d36f4e4cf26fca892811a9b0d007402a0376d1b9bebf5e6fa";
+const FORWARD_LIBEXEC_SIZE: u64 = 13_899_392;
+const FORWARD_MCP_SHA256: &str = "a26650667fe927f8d2efaaa7fef57a1c030459f33bd1c65f06dd337e8119d666";
+const FORWARD_MCP_SIZE: u64 = 20_110_272;
 const FORWARD_TOOLCHAIN: &str = "rustc 1.95.0";
-const ROLLBACK_RELEASE_ID: &str = "c21731e00b4540599cbec138615ee18083874bdb";
-const ROLLBACK_SOURCE_TREE: &str = "69176cd1a21400223fe43a3e9a0e7b3fb8f8f95f";
+const ROLLBACK_RELEASE_ID: &str = "1e2eabb806324b4bbc1403d58633b8760a36f015";
+const ROLLBACK_SOURCE_TREE: &str = "1c7210e9ea80e48d0bb400b2dc363e9acb2fe6ef";
 const ROLLBACK_MANIFEST_SHA256: &str =
-    "792cc5b2d2954c7c97a1ed009bc6c84e96bafa88c4d4d34ec509db070aa33760";
+    "adf4587aa77ed5c35e21ae406163845e0265697e3503c83809f0c045a2925b82";
 const ROLLBACK_COMMAND_SHA256: &str =
     "8d2720ddde69d25a0d21c28bdd1308cf524243d8cdb86781965a7ade98858745";
 const ROLLBACK_COMMAND_SIZE: u64 = 184;
 const ROLLBACK_LIBEXEC_SHA256: &str =
-    "fafa196e27475fcd5c36d1f44105068d97ff587c69945b0d5e6c31b2ec3a297c";
+    "0814252a3ff57cdc8b5116d478a2540609cbc28925e8b95bae7cd51d29a62492";
 const ROLLBACK_LIBEXEC_SIZE: u64 = 13_915_904;
 const ROLLBACK_MCP_SHA256: &str =
-    "f4a96c0a0236a5618ce3e3bbf377e26ee370b516727cab1cf54727be8a529f9b";
-const ROLLBACK_MCP_SIZE: u64 = 20_076_608;
+    "6e67dc3b8aa1d78a2907ec55400641113ded170e3eb7d7a84f2dc8bd95935b01";
+const ROLLBACK_MCP_SIZE: u64 = 20_077_248;
 const ROLLBACK_TOOLCHAIN: &str = "rustc 1.95.0";
 const APPROVED_ARTIFACT_OWNER: &str = "timi";
 const APPROVED_ARTIFACT_MODE: &str = "0555";
 const CANONICAL_AGENT_COUNT: usize = 9;
-const CANONICAL_MODEL: &str = "gpt-5.6-terra";
+const CANONICAL_MODEL: &str = "gpt-5.6-sol";
+const CANONICAL_EFFORT: &str = "high";
 const CANONICAL_AGENT_EFFORTS: [(&str, &str); CANONICAL_AGENT_COUNT] = [
-    ("PM Bot", "medium"),
-    ("Mobile PM", "medium"),
-    ("Design Panda", "medium"),
-    ("Customer Comms Bot", "medium"),
-    ("Growth Bot", "medium"),
-    ("Raise Bot", "medium"),
-    ("Ops Bot", "medium"),
-    ("Contessa", "medium"),
+    ("PM Bot", "high"),
+    ("Mobile PM", "high"),
+    ("Design Panda", "high"),
+    ("Customer Comms Bot", "high"),
+    ("Growth Bot", "high"),
+    ("Raise Bot", "high"),
+    ("Ops Bot", "high"),
+    ("Contessa", "high"),
     ("Koder", "high"),
+];
+const CANONICAL_PROMPT_SHA256S: [(&str, &str); CANONICAL_AGENT_COUNT] = [
+    (
+        "PM Bot",
+        "eea1cfdba81576390ae268470f6a95fa9faaf573f231543b7adf033342e0f7d6",
+    ),
+    (
+        "Mobile PM",
+        "81d3782f6171a7c72fa6e3a8f27b3b8e0b4e074f6527fed32232289b3d13c387",
+    ),
+    (
+        "Design Panda",
+        "5b9a60ce6900fad80b3e0904f226a3308df519a5c484f373d5127d78411e1a71",
+    ),
+    (
+        "Koder",
+        "1eaf37d5dd878760e4a34882749874160b2e884f4d4f639c018de69f7a3324e1",
+    ),
+    (
+        "Growth Bot",
+        "cbc81747507bc5b8dcaa953c635d25d305a36494741bebfb3355af5a51a8958a",
+    ),
+    (
+        "Customer Comms Bot",
+        "3779e43bd2017722c56a44f759c6fd284ccd98e020ce8d65ae85d0f2e4847e5a",
+    ),
+    (
+        "Raise Bot",
+        "da60a863a9fc021215bba59c90392d0d5f35505daea97eb890174e3e8a1a0ff1",
+    ),
+    (
+        "Ops Bot",
+        "1bf6d2a48222bab75edb5301adffa5accb8132fce8cff2af1310f18194abb39e",
+    ),
+    (
+        "Contessa",
+        "939e343c1d3c13827ecd7ab1b6a61010446b3e86c3412716c7089f940873202f",
+    ),
 ];
 const ALLOWED_ENV_KEYS: [&str; 5] = [
     "BUZZ_ACP_HEARTBEAT_INTERVAL",
@@ -126,6 +166,19 @@ struct ModelEffortRequest {
     expected_desktop_pid: Option<u32>,
     targets: Vec<ModelEffortTarget>,
     desired_model: String,
+    acp_command: String,
+    mcp_command: String,
+    expected_release_id: String,
+    expected_source_tree: String,
+    expected_manifest_sha256: String,
+    expected_acp_command_sha256: String,
+    expected_acp_command_size: u64,
+    expected_libexec_sha256: String,
+    expected_libexec_size: u64,
+    expected_mcp_command_sha256: String,
+    expected_mcp_command_size: u64,
+    expected_artifact_owner: String,
+    expected_artifact_mode: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,7 +186,10 @@ struct ModelEffortRequest {
 struct ModelEffortTarget {
     name: String,
     pubkey: String,
+    persona_id: String,
     effort_level: String,
+    keyed_system_prompt: String,
+    source_system_prompt: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +227,12 @@ pub struct Receipt {
     medium_count: Option<usize>,
     #[serde(default)]
     high_count: Option<usize>,
+    #[serde(default)]
+    desired_effort_level: Option<String>,
+    #[serde(default)]
+    source_count: Option<usize>,
+    #[serde(default)]
+    request_sha256: Option<String>,
 }
 
 impl Serialize for Receipt {
@@ -179,16 +241,27 @@ impl Serialize for Receipt {
         S: serde::Serializer,
     {
         if self.schema_version == MODEL_EFFORT_SCHEMA_VERSION {
-            let mut receipt = serializer.serialize_struct("Receipt", 9)?;
+            let mut receipt = serializer.serialize_struct("Receipt", 20)?;
             receipt.serialize_field("schemaVersion", &self.schema_version)?;
             receipt.serialize_field("status", &self.status)?;
+            receipt.serialize_field("requestSha256", &self.request_sha256)?;
+            receipt.serialize_field("expectedStoreSha256", &self.expected_store_sha256)?;
             receipt.serialize_field("actualBeforeSha256", &self.actual_before_sha256)?;
             receipt.serialize_field("afterSha256", &self.after_sha256)?;
             receipt.serialize_field("agentCount", &self.agent_count)?;
+            receipt.serialize_field("sourceCount", &self.source_count)?;
             receipt.serialize_field("changedFields", &self.changed_fields)?;
             receipt.serialize_field("desiredModel", &self.desired_model)?;
-            receipt.serialize_field("mediumCount", &self.medium_count)?;
+            receipt.serialize_field("effortLevel", &self.desired_effort_level)?;
             receipt.serialize_field("highCount", &self.high_count)?;
+            receipt.serialize_field("acpCommand", &self.acp_command)?;
+            receipt.serialize_field("mcpCommand", &self.mcp_command)?;
+            receipt.serialize_field("releaseId", &self.release_id)?;
+            receipt.serialize_field("sourceTree", &self.source_tree)?;
+            receipt.serialize_field("manifestSha256", &self.manifest_sha256)?;
+            receipt.serialize_field("acpCommandSha256", &self.acp_command_sha256)?;
+            receipt.serialize_field("libexecSha256", &self.libexec_sha256)?;
+            receipt.serialize_field("mcpCommandSha256", &self.mcp_command_sha256)?;
             return receipt.end();
         }
 
@@ -288,6 +361,7 @@ struct ExecutionContext<'a> {
     expected_agent_count: usize,
     forward_artifacts: ArtifactContract<'a>,
     rollback_artifacts: ArtifactContract<'a>,
+    prompt_sha256s: &'a [(&'a str, &'a str)],
     process_inspector: &'a dyn ProcessInspector,
 }
 
@@ -486,6 +560,7 @@ pub fn execute(options: CliOptions) -> Result<Receipt, ControlError> {
             expected_agent_count: CANONICAL_AGENT_COUNT,
             forward_artifacts: production_forward_artifacts(),
             rollback_artifacts: production_rollback_artifacts(),
+            prompt_sha256s: &CANONICAL_PROMPT_SHA256S,
             process_inspector: &inspector,
         },
     )
@@ -511,7 +586,7 @@ fn execute_with_context(
             )
             .with_schema_version(MODEL_EFFORT_SCHEMA_VERSION)
         })?;
-        return execute_model_effort(options, context, request)
+        return execute_model_effort(options, context, request, sha256(&request_bytes))
             .map_err(|error| error.with_schema_version(MODEL_EFFORT_SCHEMA_VERSION));
     }
     let request: ControlRequest = serde_json::from_slice(&request_bytes).map_err(|_| {
@@ -561,6 +636,9 @@ fn execute_with_context(
         desired_model: None,
         medium_count: None,
         high_count: None,
+        desired_effort_level: None,
+        source_count: None,
+        request_sha256: None,
     };
     if options.dry_run {
         return Ok(receipt);
@@ -585,9 +663,13 @@ fn execute_model_effort(
     options: CliOptions,
     context: &ExecutionContext<'_>,
     request: ModelEffortRequest,
+    request_sha256: String,
 ) -> Result<Receipt, ControlError> {
-    ensure_model_effort_stopped(request.expected_desktop_pid, context)?;
-    validate_model_effort_request(&request, context)?;
+    let runtime_request = validate_model_effort_request(&request, context)?;
+    validate_release_artifacts(&runtime_request, context, context.forward_artifacts)?;
+    if !options.dry_run {
+        ensure_model_effort_stopped(request.expected_desktop_pid, context)?;
+    }
 
     let store = read_secure_store(&options.store_path, context.canonical_store_path)?;
     let actual_before_sha256 = sha256(&store.bytes);
@@ -606,7 +688,7 @@ fn execute_model_effort(
         } else {
             "applied".to_owned()
         },
-        expected_store_sha256: String::new(),
+        expected_store_sha256: request.expected_store_sha256.clone(),
         actual_before_sha256,
         after_sha256,
         store_path: String::new(),
@@ -614,24 +696,28 @@ fn execute_model_effort(
         changed_fields: candidate.changed_fields,
         changed_env_keys: Vec::new(),
         parallelism: 0,
-        acp_command: String::new(),
-        mcp_command: String::new(),
+        acp_command: request.acp_command.clone(),
+        mcp_command: request.mcp_command.clone(),
         agent_count: candidate.agent_count,
-        release_id: String::new(),
-        source_tree: String::new(),
-        manifest_sha256: String::new(),
-        acp_command_sha256: String::new(),
-        libexec_sha256: String::new(),
-        mcp_command_sha256: String::new(),
+        release_id: request.expected_release_id.clone(),
+        source_tree: request.expected_source_tree.clone(),
+        manifest_sha256: request.expected_manifest_sha256.clone(),
+        acp_command_sha256: request.expected_acp_command_sha256.clone(),
+        libexec_sha256: request.expected_libexec_sha256.clone(),
+        mcp_command_sha256: request.expected_mcp_command_sha256.clone(),
         desired_model: Some(CANONICAL_MODEL.to_owned()),
-        medium_count: Some(CANONICAL_AGENT_COUNT - 1),
-        high_count: Some(1),
+        medium_count: Some(0),
+        high_count: Some(CANONICAL_AGENT_COUNT),
+        desired_effort_level: Some(CANONICAL_EFFORT.to_owned()),
+        source_count: Some(CANONICAL_AGENT_COUNT),
+        request_sha256: Some(request_sha256),
     };
     if options.dry_run {
         return Ok(receipt);
     }
 
     let staged_store = stage_restricted_file(&options.store_path, &candidate.bytes)?;
+    validate_release_artifacts(&runtime_request, context, context.forward_artifacts)?;
     ensure_model_effort_stopped(request.expected_desktop_pid, context)?;
     let current = read_secure_store(&options.store_path, context.canonical_store_path)?;
     if current.identity != store.identity || sha256(&current.bytes) != receipt.actual_before_sha256
@@ -737,7 +823,7 @@ fn validate_request<'a>(
 fn validate_model_effort_request(
     request: &ModelEffortRequest,
     context: &ExecutionContext<'_>,
-) -> Result<(), ControlError> {
+) -> Result<ControlRequest, ControlError> {
     if request.schema_version != MODEL_EFFORT_SCHEMA_VERSION {
         return Err(ControlError::new(
             "unsupported_schema_version",
@@ -772,8 +858,11 @@ fn validate_model_effort_request(
     }
 
     let canonical_efforts: HashMap<&str, &str> = CANONICAL_AGENT_EFFORTS.into_iter().collect();
+    let canonical_prompt_sha256s: HashMap<&str, &str> =
+        context.prompt_sha256s.iter().copied().collect();
     let mut names = HashSet::with_capacity(request.targets.len());
     let mut pubkeys = HashSet::with_capacity(request.targets.len());
+    let mut persona_ids = HashSet::with_capacity(request.targets.len());
     for target in &request.targets {
         if !is_lower_hex(&target.pubkey, 64) {
             return Err(ControlError::new(
@@ -805,6 +894,32 @@ fn validate_model_effort_request(
                 "every effortLevel must match the canonical agent profile",
             ));
         }
+        if target.persona_id.is_empty() || !persona_ids.insert(target.persona_id.as_str()) {
+            return Err(ControlError::new(
+                "invalid_target_persona_id",
+                "every personaId must be nonempty and unique",
+            ));
+        }
+        if target.keyed_system_prompt != target.source_system_prompt {
+            return Err(ControlError::new(
+                "prompt_copy_mismatch",
+                "keyed and linked source replacement prompts must be byte-identical",
+            ));
+        }
+        let expected_prompt_sha256 = canonical_prompt_sha256s
+            .get(target.name.as_str())
+            .ok_or_else(|| {
+                ControlError::new(
+                    "invalid_prompt_contract",
+                    "every canonical target must have one approved replacement prompt hash",
+                )
+            })?;
+        if sha256(target.keyed_system_prompt.as_bytes()) != **expected_prompt_sha256 {
+            return Err(ControlError::new(
+                "prompt_hash_mismatch",
+                "a replacement prompt does not match its approved identity-specific SHA-256",
+            ));
+        }
     }
     if names.len() != canonical_efforts.len()
         || canonical_efforts.keys().any(|name| !names.contains(name))
@@ -814,7 +929,51 @@ fn validate_model_effort_request(
             "targets must contain every canonical agent name exactly once",
         ));
     }
-    Ok(())
+    if canonical_prompt_sha256s.len() != CANONICAL_AGENT_COUNT {
+        return Err(ControlError::new(
+            "invalid_prompt_contract",
+            "the approved prompt hash contract must contain the canonical nine-agent fleet",
+        ));
+    }
+
+    let runtime_request = ControlRequest {
+        schema_version: SCHEMA_VERSION,
+        expected_store_sha256: request.expected_store_sha256.clone(),
+        expected_agent_count: request.expected_agent_count,
+        expected_desktop_pid: request.expected_desktop_pid,
+        target_pubkeys: request
+            .targets
+            .iter()
+            .map(|target| target.pubkey.clone())
+            .collect(),
+        acp_command: request.acp_command.clone(),
+        mcp_command: request.mcp_command.clone(),
+        expected_release_id: request.expected_release_id.clone(),
+        expected_source_tree: request.expected_source_tree.clone(),
+        expected_manifest_sha256: request.expected_manifest_sha256.clone(),
+        expected_acp_command_sha256: request.expected_acp_command_sha256.clone(),
+        expected_acp_command_size: request.expected_acp_command_size,
+        expected_libexec_sha256: request.expected_libexec_sha256.clone(),
+        expected_libexec_size: request.expected_libexec_size,
+        expected_mcp_command_sha256: request.expected_mcp_command_sha256.clone(),
+        expected_mcp_command_size: request.expected_mcp_command_size,
+        expected_artifact_owner: request.expected_artifact_owner.clone(),
+        expected_artifact_mode: request.expected_artifact_mode.clone(),
+        parallelism: REQUIRED_PARALLELISM,
+        env_set: EnvironmentContract::Forward.env_set(),
+        env_unset: EnvironmentContract::Forward.env_unset(),
+    };
+    if !request_matches_artifact_contract(
+        &runtime_request,
+        context.runtime_root,
+        context.forward_artifacts,
+    ) {
+        return Err(ControlError::new(
+            "artifact_contract_mismatch",
+            "schemaVersion 2 request does not match the approved forward runtime contract",
+        ));
+    }
+    Ok(runtime_request)
 }
 
 fn ensure_desktop_stopped(
@@ -1594,6 +1753,12 @@ fn build_model_effort_candidate(
                     "every target must link to a keyless source definition",
                 )
             })?;
+        if persona_id != target.persona_id {
+            return Err(ControlError::new(
+                "target_persona_id_mismatch",
+                "a target personaId does not match its stored keyed persona_id",
+            ));
+        }
         if !persona_ids.insert(persona_id) {
             return Err(ControlError::new(
                 "duplicate_target_persona_id",
@@ -1621,6 +1786,15 @@ fn build_model_effort_candidate(
                 "a target persona_id does not match exactly one keyless source definition slug",
             )
         })?;
+        let source_object = original_records[source_index]
+            .as_object()
+            .ok_or_else(diff_error)?;
+        if source_object.get("name").and_then(Value::as_str) != Some(target.name.as_str()) {
+            return Err(ControlError::new(
+                "source_name_mismatch",
+                "a linked keyless source definition does not match its canonical target name",
+            ));
+        }
         target_indices.push(target_index);
         source_indices.push(source_index);
     }
@@ -1645,12 +1819,28 @@ fn build_model_effort_candidate(
                 "effort_level".to_owned(),
                 Value::String(target.effort_level.clone()),
             );
+            target_object.insert(
+                "system_prompt".to_owned(),
+                Value::String(target.keyed_system_prompt.clone()),
+            );
+            target_object.insert(
+                "acp_command".to_owned(),
+                Value::String(request.acp_command.clone()),
+            );
+            target_object.insert(
+                "mcp_command".to_owned(),
+                Value::String(request.mcp_command.clone()),
+            );
             let source_object = candidate_records[*source_index]
                 .as_object_mut()
                 .ok_or_else(diff_error)?;
             source_object.insert(
                 "model".to_owned(),
                 Value::String(request.desired_model.clone()),
+            );
+            source_object.insert(
+                "system_prompt".to_owned(),
+                Value::String(target.source_system_prompt.clone()),
             );
         }
     }
@@ -1665,7 +1855,13 @@ fn build_model_effort_candidate(
         let after = candidate_records[*index]
             .as_object()
             .ok_or_else(diff_error)?;
-        for field in ["effort_level", "model"] {
+        for field in [
+            "acp_command",
+            "effort_level",
+            "mcp_command",
+            "model",
+            "system_prompt",
+        ] {
             if before.get(field) != after.get(field) {
                 changed_fields.insert(field.to_owned());
             }
@@ -1678,8 +1874,10 @@ fn build_model_effort_candidate(
         let after = candidate_records[*index]
             .as_object()
             .ok_or_else(diff_error)?;
-        if before.get("model") != after.get("model") {
-            changed_fields.insert("model".to_owned());
+        for field in ["model", "system_prompt"] {
+            if before.get(field) != after.get(field) {
+                changed_fields.insert(field.to_owned());
+            }
         }
     }
     let mut candidate_bytes = serde_json::to_vec_pretty(&candidate).map_err(|_| {
@@ -1732,9 +1930,15 @@ fn validate_model_effort_diff(
         let mut protected_before = before.as_object().ok_or_else(diff_error)?.clone();
         let mut protected_after = after.as_object().ok_or_else(diff_error)?.clone();
         let allowed_fields: &[&str] = if targets.contains(&index) {
-            &["model", "effort_level"]
+            &[
+                "model",
+                "effort_level",
+                "system_prompt",
+                "acp_command",
+                "mcp_command",
+            ]
         } else {
-            &["model"]
+            &["model", "system_prompt"]
         };
         for field in allowed_fields {
             protected_before.remove(*field);
