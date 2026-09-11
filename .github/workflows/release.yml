@@ -654,7 +654,7 @@ jobs:
 
   release-windows:
     name: Release Windows
-    runs-on: windows-latest
+    runs-on: blacksmith-2vcpu-windows-2025
     needs: setup
     timeout-minutes: 60
     permissions:

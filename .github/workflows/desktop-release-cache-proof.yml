@@ -118,7 +118,7 @@ jobs:
   windows:
     name: Prove Windows cache visibility
     if: github.repository == 'block/buzz'
-    runs-on: windows-latest
+    runs-on: blacksmith-2vcpu-windows-2025
     timeout-minutes: 15
     steps:
       - name: Require cache proof tag
