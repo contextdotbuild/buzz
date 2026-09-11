@@ -19,7 +19,7 @@ permissions:
 jobs:
   promote:
     if: github.repository == 'block/buzz'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     permissions:
       contents: write

@@ -4,8 +4,8 @@ name: Docker image
 # Normal tags contain stripped binaries; matching debug-* tags contain the same
 # optimized binaries with line-table debug information for native profilers.
 #
-# Strategy: each architecture builds on its native runner (ubuntu-24.04 for
-# amd64, ubuntu-24.04-arm for arm64), pushes to GHCR by digest, then a final
+# Strategy: each architecture builds on its native runner (blacksmith-2vcpu-ubuntu-2404 for
+# amd64, blacksmith-2vcpu-ubuntu-2404-arm for arm64), pushes to GHCR by digest, then a final
 # job stitches the per-arch digests into a single multi-arch manifest.
 # This avoids QEMU emulation (~10× slower for Rust) at zero cost on free
 # GitHub-hosted runners.
@@ -97,10 +97,10 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: blacksmith-2vcpu-ubuntu-2404
             arch: amd64
           - platform: linux/arm64
-            runner: ubuntu-24.04-arm
+            runner: blacksmith-2vcpu-ubuntu-2404-arm
             arch: arm64
 
     steps:
@@ -237,7 +237,7 @@ jobs:
   qualify:
     name: Qualify relay image source
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 70
     permissions:
       actions: read
@@ -312,7 +312,7 @@ jobs:
   merge:
     name: Merge ${{ matrix.variant }} multi-arch manifest
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: [build, qualify]
     timeout-minutes: 15
     permissions:
@@ -504,10 +504,10 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: blacksmith-2vcpu-ubuntu-2404
             arch: amd64
           - platform: linux/arm64
-            runner: ubuntu-24.04-arm
+            runner: blacksmith-2vcpu-ubuntu-2404-arm
             arch: arm64
     steps:
       - name: Checkout
@@ -572,7 +572,7 @@ jobs:
   push-gateway-merge:
     name: Publish public push gateway image
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: push-gateway-build
     timeout-minutes: 15
     permissions:
