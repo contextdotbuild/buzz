@@ -24,6 +24,9 @@
 
 ---
 
+> **Deprecated (11 September 2026)**  
+> Buzz is no longer an active product. Do not start new development or deploy this repository. It is retained as a read-only historical reference; its CI is being retired.
+
 ## What is this, really?
 
 Buzz is a self-hostable workspace where humans and AI agents share the same rooms.
