@@ -15,7 +15,7 @@ jobs:
   setup:
     name: Setup
     if: github.repository == 'block/buzz'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -52,7 +52,7 @@ jobs:
   release:
     name: Release
     if: github.repository == 'block/buzz'
-    runs-on: macos-latest
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     needs: setup
     timeout-minutes: 60
     permissions:
@@ -265,7 +265,7 @@ jobs:
   release-macos-x64:
     name: Release macOS (Intel)
     if: github.repository == 'block/buzz'
-    runs-on: macos-latest
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     needs: setup
     timeout-minutes: 60
     permissions:
@@ -426,7 +426,7 @@ jobs:
   release-linux:
     name: Release Linux
     if: github.repository == 'block/buzz'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     # Digest-pinned like the SHA-pinned actions below; Renovate keeps it fresh.
     container: ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea
     needs: setup
@@ -654,7 +654,7 @@ jobs:
 
   release-windows:
     name: Release Windows
-    runs-on: windows-latest
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     needs: setup
     timeout-minutes: 60
     permissions:
@@ -786,7 +786,7 @@ jobs:
       needs.release-linux.result == 'success' &&
       needs.release-windows.result == 'success' &&
       github.ref == format('refs/tags/desktop-v{0}', needs.setup.outputs.version)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     needs: [setup, release, release-macos-x64, release-linux, release-windows]
     timeout-minutes: 10
     permissions:

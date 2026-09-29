@@ -85,7 +85,7 @@ env:
 jobs:
   build:
     name: Build (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     timeout-minutes: 60
     permissions:
       contents: read
@@ -237,7 +237,7 @@ jobs:
   qualify:
     name: Qualify relay image source
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     timeout-minutes: 70
     permissions:
       actions: read
@@ -312,7 +312,7 @@ jobs:
   merge:
     name: Merge ${{ matrix.variant }} multi-arch manifest
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     needs: [build, qualify]
     timeout-minutes: 15
     permissions:
@@ -494,7 +494,7 @@ jobs:
 
   push-gateway-build:
     name: Build public push gateway (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     timeout-minutes: 60
     permissions:
       contents: read
@@ -572,7 +572,7 @@ jobs:
   push-gateway-merge:
     name: Publish public push gateway image
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     needs: push-gateway-build
     timeout-minutes: 15
     permissions:

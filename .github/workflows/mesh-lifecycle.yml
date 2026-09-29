@@ -46,7 +46,7 @@ env:
 jobs:
   lifecycle-smoke:
     name: Relay-Driven Mesh Lifecycle Smoke
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     timeout-minutes: 45
     permissions:
       contents: read

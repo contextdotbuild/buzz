@@ -19,7 +19,7 @@ permissions:
 jobs:
   promote:
     if: github.repository == 'block/buzz'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     timeout-minutes: 10
     permissions:
       contents: write

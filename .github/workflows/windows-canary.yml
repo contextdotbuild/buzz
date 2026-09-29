@@ -17,7 +17,7 @@ jobs:
   build:
     name: Build Windows canary
     if: github.repository == 'block/buzz'
-    runs-on: windows-latest
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     timeout-minutes: 60
     permissions:
       contents: read

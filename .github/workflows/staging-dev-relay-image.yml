@@ -25,7 +25,7 @@ env:
 jobs:
   resolve:
     name: Resolve target ref
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -125,7 +125,7 @@ jobs:
 
   build:
     name: Build staging relay runtime (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     needs: resolve
     timeout-minutes: 60
     permissions:
@@ -207,7 +207,7 @@ jobs:
 
   merge:
     name: Publish staging relay runtime manifest
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.CI_RUNNER || 'bo-ci' }}
     needs:
       - resolve
       - build
